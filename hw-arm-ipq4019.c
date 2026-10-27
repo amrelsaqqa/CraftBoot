@@ -447,6 +447,8 @@ static uint8_t qup_flash_byte(uint32_t off)
 
 static void qup_spi_opcode(IPQQupl *q, uint8_t op)
 {
+    uint8_t prev_op = q->opcode;
+
     q->opcode = op;
     q->addr_left = 0;
     q->dummy_left = 0;
@@ -458,14 +460,24 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
 
     if (env_true("QEMU_IPQ_SPI_LOG")) {
         qemu_log_mask(LOG_UNIMP, "spi-op 0x%02x (prev 0x%02x addr 0x%06x len %u)\n",
-                      op, q->opcode, q->last_addr, q->data_bytes);
+                      op, prev_op, q->last_addr, q->data_bytes);
     }
     q->data_bytes = 0;
 
     switch (op) {
-    case 0x03:                          /* READ */
-    case 0x13:                          /* READ4 */
+    case 0x03:                          /* READ: 24-bit address */
         q->addr_left = 3;
+        q->read_data = 1;
+        break;
+    case 0x13:                          /* READ4B: 32-bit address */
+        /*
+         * RouterBOOT picks this opcode whenever the offset does not fit in 24
+         * bits (see its flash_read() helper: it tests addr >> 24), so the
+         * address phase is four bytes, not three.  Getting this wrong shifts
+         * every read: the kernel scan at 0x01000400 turned into a read of
+         * 0x00010004 and never found the header.
+         */
+        q->addr_left = 4;
         q->read_data = 1;
         break;
     case 0x0b:                          /* FAST_READ */
@@ -527,6 +539,9 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
 
 static void qup_spi_byte(IPQQupl *q, uint8_t b)
 {
+    if (env_u32("QEMU_IPQ_SPI_LOG", 0) > 1) {
+        qemu_log_mask(LOG_UNIMP, "spi-byte %02x phase %d\n", b, q->phase);
+    }
     switch (q->phase) {
     case 0:
         qup_spi_opcode(q, b);
@@ -1771,19 +1786,24 @@ out:
  */
 static const char *ipq_machine_dtb(MachineState *machine)
 {
+    static char *consumed;
     const char *path = getenv("QEMU_IPQ_DTB");
 
-    if (!path && machine->dtb) {
-        path = machine->dtb;
+    if (path) {
+        return path;
+    }
+    if (machine->dtb) {
         /*
          * Consume it: this firmware has its own DTB in flash, and letting
          * arm_load_kernel() copy the description into guest RAM would land
          * on top of the image the boot loader is about to use.
          */
+        consumed = g_strdup(machine->dtb);
         g_free(machine->dtb);
         machine->dtb = NULL;
+        return consumed;
     }
-    return path;
+    return NULL;
 }
 
 static IPQMdio *add_mdio(MemoryRegion *parent, const char *dtb_path)
