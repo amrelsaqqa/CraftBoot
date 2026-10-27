@@ -87,7 +87,9 @@
 #include "system/address-spaces.h"
 #include "system/reset.h"
 #include "system/system.h"
+#include "system/device_tree.h"
 #include "cpu.h"
+#include <libfdt.h>
 
 #define IPQ_ROM_BASE      0x00000000u
 #define IPQ_ROM_SIZE      0x00040000u
@@ -1607,16 +1609,203 @@ static void mdio_parse_ports(IPQMdio *m, const char *spec)
     }
 }
 
-static IPQMdio *add_mdio(MemoryRegion *parent)
+/* ------------------------------------------------------------------ */
+/* Board ports from a device tree                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The PHYs on the MDIO bus are board data, and boards describe them in their
+ * device tree:
+ *
+ *     mdio@90000 {
+ *         compatible = "qcom,ipq4019-mdio";
+ *         ethernet-phy-package@0 {
+ *             ethernet-phy@0 { reg = <0>; };
+ *             ...
+ *             psgmii-phy@5  { reg = <5>; };
+ *         };
+ *     };
+ *
+ * so a DTB handed to the machine with -dtb (or QEMU_IPQ_DTB=...) is enough to
+ * populate the bus exactly as the board does.  The firmware still boots its
+ * own DTB from flash; the one given here only describes the hardware to the
+ * machine model, which is why it is consumed instead of being loaded into
+ * guest RAM.
+ */
+static int dtb_collect_phys(void *fdt, int node, IPQMdio *m, int *count)
+{
+    int sub;
+
+    for (sub = fdt_first_subnode(fdt, node); sub >= 0;
+         sub = fdt_next_subnode(fdt, sub)) {
+        const char *name = fdt_get_name(fdt, sub, NULL);
+        const fdt32_t *reg;
+        int len;
+
+        if (!name) {
+            continue;
+        }
+        if (strncmp(name, "ethernet-phy@", 13) != 0 &&
+            strncmp(name, "psgmii-phy@", 11) != 0 &&
+            strncmp(name, "phy@", 4) != 0) {
+            /* e.g. ethernet-phy-package@0: keep looking inside */
+            dtb_collect_phys(fdt, sub, m, count);
+            continue;
+        }
+        reg = fdt_getprop(fdt, sub, "reg", &len);
+        if (!reg || len < 4) {
+            continue;
+        }
+        mdio_add_phy(m, fdt32_to_cpu(reg[0]),
+                     env_u32("QEMU_IPQ_ETH_SPEED", 1000),
+                     env_u32("QEMU_IPQ_ETH_PHY_ID", IPQ_ETH_DEFAULT_PHY_ID),
+                     1);
+        (*count)++;
+    }
+    return *count;
+}
+
+static int dtb_find_ports(void *fdt, int node)
+{
+    int sub;
+
+    for (sub = fdt_first_subnode(fdt, node); sub >= 0;
+         sub = fdt_next_subnode(fdt, sub)) {
+        const char *name = fdt_get_name(fdt, sub, NULL);
+        int found;
+
+        if (name && !strcmp(name, "ports")) {
+            return sub;
+        }
+        found = dtb_find_ports(fdt, sub);
+        if (found >= 0) {
+            return found;
+        }
+    }
+    return -1;
+}
+
+/*
+ * Print the switch port map, including which PHY each port is wired to.  This
+ * is the "attach the ports the way the DTS says" evidence in the boot log; the
+ * packet path itself is not modelled yet, so nothing here affects booting.
+ */
+static void dtb_report_switch(void *fdt)
+{
+    int ports = dtb_find_ports(fdt, 0);
+    int port;
+
+    if (ports < 0) {
+        return;
+    }
+    for (port = fdt_first_subnode(fdt, ports); port >= 0;
+         port = fdt_next_subnode(fdt, port)) {
+        const char *name = fdt_get_name(fdt, port, NULL);
+        const fdt32_t *reg, *ph;
+        const char *label;
+        int len, phy = -1, phy_node;
+
+        if (!name || strncmp(name, "port@", 5) != 0) {
+            continue;
+        }
+        reg = fdt_getprop(fdt, port, "reg", &len);
+        label = fdt_getprop(fdt, port, "label", &len);
+        ph = fdt_getprop(fdt, port, "phy-handle", &len);
+        if (ph && len >= 4) {
+            phy_node = fdt_node_offset_by_phandle(fdt, fdt32_to_cpu(ph[0]));
+            if (phy_node >= 0) {
+                const fdt32_t *preg = fdt_getprop(fdt, phy_node, "reg", &len);
+
+                if (preg && len >= 4) {
+                    phy = fdt32_to_cpu(preg[0]);
+                }
+            }
+        } else if (fdt_subnode_offset(fdt, port, "fixed-link") >= 0) {
+            phy = -2;                   /* fixed link, no PHY */
+        }
+        printf("ipq4019: dtb port %d", reg ? (int)fdt32_to_cpu(reg[0]) : -1);
+        if (label) {
+            printf(" \"%s\"", label);
+        }
+        if (phy == -2) {
+            printf(" fixed-link\n");
+        } else if (phy >= 0) {
+            printf(" -> mdio phy %d\n", phy);
+        } else {
+            printf(" -> disconnected\n");
+        }
+    }
+}
+
+static void mdio_add_from_dtb(IPQMdio *m, const char *path)
+{
+    void *fdt;
+    int size = 0, mdio, count = 0;
+
+    fdt = load_device_tree(path, &size);
+    if (!fdt) {
+        warn_report("ipq4019: cannot read device tree '%s', using defaults",
+                    path);
+        return;
+    }
+    mdio = fdt_node_offset_by_compatible(fdt, -1, "qcom,ipq4019-mdio");
+    if (mdio < 0) {
+        mdio = fdt_path_offset(fdt, "/soc/mdio@90000");
+    }
+    if (mdio < 0) {
+        warn_report("ipq4019: no ipq4019 mdio node in '%s'", path);
+        goto out;
+    }
+    dtb_collect_phys(fdt, mdio, m, &count);
+    if (count) {
+        printf("ipq4019: %d mdio port(s) from %s\n", count, path);
+    }
+    dtb_report_switch(fdt);
+out:
+    g_free(fdt);
+}
+
+/*
+ * The board description may come from QEMU_IPQ_DTB (a DTB/DTS path, handy when
+ * the firmware image is passed with -kernel) or from -dtb.
+ */
+static const char *ipq_machine_dtb(MachineState *machine)
+{
+    const char *path = getenv("QEMU_IPQ_DTB");
+
+    if (!path && machine->dtb) {
+        path = machine->dtb;
+        /*
+         * Consume it: this firmware has its own DTB in flash, and letting
+         * arm_load_kernel() copy the description into guest RAM would land
+         * on top of the image the boot loader is about to use.
+         */
+        g_free(machine->dtb);
+        machine->dtb = NULL;
+    }
+    return path;
+}
+
+static IPQMdio *add_mdio(MemoryRegion *parent, const char *dtb_path)
 {
     IPQMdio *m = g_new0(IPQMdio, 1);
     const char *spec = getenv("QEMU_IPQ_ETH_PORTS");
     int i;
 
-    if (!spec) {
-        spec = IPQ_ETH_DEFAULT_PORTS;
+    /*
+     * Three sources, in order of precedence: an explicit port list, the board
+     * device tree, the built-in QCA8075 population.
+     */
+    if (spec) {
+        mdio_parse_ports(m, spec);
+    } else if (dtb_path) {
+        mdio_add_from_dtb(m, dtb_path);
+        if (!m->nphy) {
+            mdio_parse_ports(m, IPQ_ETH_DEFAULT_PORTS);
+        }
+    } else {
+        mdio_parse_ports(m, IPQ_ETH_DEFAULT_PORTS);
     }
-    mdio_parse_ports(m, spec);
 
     memory_region_init_io(&m->mr, NULL, &mdio_ops, m, "mdio", IPQ_MDIO_SIZE);
     memory_region_add_subregion(parent, IPQ_MDIO_BASE, &m->mr);
@@ -2111,7 +2300,7 @@ static void ipq4019_init(MachineState *machine)
     bootdev = add_mem(sysmem, 0x5e000, 0x1000, "bootdev");
     add_stub(sysmem, 0x5f000, 0xa1000, "soc-low2");
     /* Ethernet: MDIO master at 0x90000 (ports on it are board config). */
-    add_mdio(sysmem);
+    add_mdio(sysmem, ipq_machine_dtb(machine));
     /*
      * ESS switch register block (ports, PSGMII, PCS) and the EDMA engine.
      * Both are register files for now: the boot chain programs them and
