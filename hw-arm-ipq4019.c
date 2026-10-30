@@ -109,6 +109,13 @@
 #define IPQ_TLMM_SIZE     0x00300000u
 #define IPQ_GCC_BASE      0x01800000u
 #define IPQ_GCC_SIZE      0x00060000u
+/*
+ * Consecutive reads of one freshly-written clock register before its bit 0 is
+ * declared a completed command trigger rather than data (see IPQStub).  Must
+ * stay well below the shortest poll budget any stage uses: the kernel's
+ * update_config() in clk-rcg2.c gives up after 500 reads and warns.
+ */
+#define IPQ_SPIN_LIMIT    16
 #define IPQ_UART0_BASE    0x078af000u
 #define IPQ_UART1_BASE    0x078b0000u
 #define IPQ_QUP_BASE      0x078b5000u
@@ -150,11 +157,7 @@ typedef struct IPQStub {
     uint32_t *shadow;
     uint8_t *valid;
     uint32_t nregs;
-    /*
-     * Bits that never read back as written.  GCC's clock-branch registers use
-     * bit 0 as a write-only trigger: software sets it and then polls until it
-     * reads 0, which never happens with plain shadow storage.
-     */
+    /* Bits that do not read back as written (write-only fields). */
     uint32_t read_mask;
     /*
      * Value returned for registers that were never written.  A real Qualcomm
@@ -164,6 +167,32 @@ typedef struct IPQStub {
      * a few blocks keep the ~0 default.
      */
     uint32_t def_read;
+    /*
+     * Clock/reset blocks: bit 0 of the command registers is a "start the
+     * update" trigger.  Software sets it and then polls until it reads 0.
+     *
+     * It cannot be modelled by masking bit 0 of every read-back: the data
+     * registers of those same blocks keep bit 0 as real data (CFG_RCGR, whose
+     * bit 0 is the LSB of the divider).  Nor can a write of exactly 1 be
+     * treated as the trigger: SBL1's RCG helper does a read-modify-write and
+     * issues 0xffffffff (bit 0 set) on registers it never wrote before.
+     *
+     * So the write lands as written, and a tight poll loop is taken as proof
+     * that the bit is a trigger rather than data: after IPQ_SPIN_LIMIT
+     * consecutive reads of the same freshly-written register with bit 0 still
+     * set, the operation is declared complete and bit 0 reads back 0.
+     */
+    bool trig_bit0;
+    uint32_t spin_idx;
+    uint32_t spin;
+    /*
+     * GCC/APCS branch (CBCR) registers: bit 0 is the branch enable and bit 31
+     * is its read-only CLK_OFF status, which is the complement of the enable.
+     * The kernel's clk_branch2_check_halt() waits for CLK_OFF to *set* when it
+     * disables a branch and warns "status stuck at 'on'" if it never does, so
+     * an unwritten or masked bit 31 stalls every unused-clock disable.
+     */
+    bool cbc_status;
     /*
      * Status registers whose value is reported rather than stored: things the
      * guest waits for that this machine completes instantly (a PLL locking, a
@@ -228,15 +257,33 @@ static uint64_t stub_read(void *opaque, hwaddr off, unsigned size)
             v = stub_def_read(s);
         } else if (s->valid[idx]) {
             /*
-             * Written register.  read_mask models write-only bits: the clock
-             * blocks use bit 0 as a self-clearing trigger (software sets it and
-             * polls until it reads 0) and bit 31 as a busy flag that stays low,
-             * so neither reads back as stored.
+             * Written register.  read_mask models write-only bits: bit 31 of
+             * the clock blocks is a busy flag that hardware clears when the
+             * update finishes, so a write of 0x80000001 must not read back
+             * busy-forever (SBL1's helper spins with `blt` until it clears).
              */
             v = s->shadow[idx] & s->read_mask;
             tag = "";
         } else {
             v = stub_def_read(s);
+        }
+        /*
+         * Poll detector for the bit-0 command trigger: nothing else in the
+         * block can make progress while software spins on one register, so a
+         * long run of reads of the same just-written register means the bit is
+         * a trigger and the update has completed.
+         */
+        if (s->trig_bit0 && idx == s->spin_idx && idx < s->nregs &&
+            s->valid[idx] && !pinned) {
+            if (++s->spin >= IPQ_SPIN_LIMIT && (s->shadow[idx] & 1)) {
+                s->shadow[idx] &= ~1u;
+                s->spin = 0;
+                v = s->shadow[idx] & s->read_mask;
+            }
+        }
+        /* branch registers report CLK_OFF as the complement of the enable */
+        if (s->cbc_status && idx < s->nregs && s->valid[idx] && !pinned) {
+            v = (v & ~0x80000000u) | ((v & 1) ? 0 : 0x80000000u);
         }
     }
     if (env_true("QEMU_IPQ_TRACE")) {
@@ -258,6 +305,19 @@ static void stub_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
                       env_u32("QEMU_IPQ_TRACE", 0) > 1 ? trace_pc() : "");
     }
     if (s->nregs && idx < s->nregs) {
+        s->shadow[idx] = val;
+        s->valid[idx] = 1;
+    }
+    s->spin_idx = idx;
+    s->spin = 0;
+}
+
+/* Give a stub register the value the boot ROM / previous stage left in it. */
+static void stub_seed(IPQStub *s, uint32_t off, uint32_t val)
+{
+    uint32_t idx = off >> 2;
+
+    if (idx < s->nregs) {
         s->shadow[idx] = val;
         s->valid[idx] = 1;
     }
@@ -2369,7 +2429,6 @@ static void ipq4019_init(MachineState *machine)
      * registers (software sets it, then polls until it reads 0).  Unwritten
      * registers keep reading 0xffffffff, which the PLL lock polls want.
      */
-    add_stub_ex(sysmem, IPQ_GCC_BASE, IPQ_GCC_SIZE, "gcc", 0x7ffffffeu);
     {
         /*
          * GCC is the one block whose untouched registers must not read ~0:
@@ -2381,9 +2440,31 @@ static void ipq4019_init(MachineState *machine)
          * reset to 0, so answer 0.
          */
         IPQStub *gcc = add_stub_ex(sysmem, IPQ_GCC_BASE, IPQ_GCC_SIZE,
-                                   "gcc", 0x7ffffffeu);
+                                   "gcc", 0xffffffffu);
 
+        gcc->trig_bit0 = env_u32("QEMU_IPQ_TRIG_BIT0", 1) != 0;
+        gcc->cbc_status = env_u32("QEMU_IPQ_CBC_STATUS", 1) != 0;
         gcc->def_read = 0;
+        /*
+         * The PLLs are already running when SBL1 starts: on silicon the boot
+         * ROM programs them before it loads SBL1, and SBL1 only reprograms
+         * what it needs.  Starting the machine at SBL1 therefore means seeding
+         * that inherited state, otherwise every clock the kernel derives from
+         * a PLL reads 0 (and clk_set_rate() of the CPU clock fails -EINVAL,
+         * which the kernel turns into a BUG_ON in cpufreq_online()).
+         *
+         *   FEPLL   0x2f020  2 * fdbkdiv / refclkdiv * XO = 4 GHz VCO
+         *                    fdbkdiv 125, refclkdiv 3 -> fepll200 /20 = 200M,
+         *                    fepll500 /8 = 500M, fepll125 /32 = 125M
+         *   DDRPLLAPSS 0x2e020  same VCO field, plus the divider in bits 7:4:
+         *                    VCO 5376 MHz, cdiv 13 -> 5376*2/28 = 384 MHz
+         *                    that is the CPU clock SBL1 selects (CFG_RCGR
+         *                    0x101: parent DDRPLLAPSS, hid_div 1)
+         */
+        if (env_u32("QEMU_IPQ_PLL_SEED", 1)) {
+            stub_seed(gcc, 0x2f020, 0x037d0000u);
+            stub_seed(gcc, 0x2e020, 0x013800d0u);
+        }
         /*
          * 0x2e000..0x2e02f is the APSS/DDR PLL divider block
          * (gcc_apss_cpu_plldiv_clk in mainline: enable_reg 0x2e000 bit 0,
@@ -2417,7 +2498,13 @@ static void ipq4019_init(MachineState *machine)
      * reset registers, polled by the shared clk_set_rate() helper.  Only the
      * low register page needs shadow storage.
      */
-    add_stub_ex(sysmem, IPQ_QGIC_BASE, 0x20000, "apcs", 0x7ffffffeu);
+    {
+        IPQStub *apcs = add_stub_ex(sysmem, IPQ_QGIC_BASE, 0x20000, "apcs",
+                                    0xffffffffu);
+
+        apcs->trig_bit0 = env_u32("QEMU_IPQ_TRIG_BIT0", 1) != 0;
+        apcs->cbc_status = env_u32("QEMU_IPQ_CBC_STATUS", 1) != 0;
+    }
     /*
      * The rest of the APCS range is a decode-only stub, minus the 0xb021000
      * page which carries the free-running XO counter (see xo-timer below).
