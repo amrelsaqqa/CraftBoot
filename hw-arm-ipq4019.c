@@ -59,6 +59,7 @@
  *   QEMU_IPQ_BAM_VER     BAM version read back from +0x1000 (default 7)
  *   QEMU_IPQ_BAM_EVENT   PIPE_EVENT bits raised when a transfer completes
  *                        (default 0x100000)
+ *   QEMU_IPQ_TIMER_DBG=1 dump architected timer state once a second
  *   QEMU_IPQ_PSCI        smc (default) / hvc / none: EL3 stand-in used for
  *                        guest smc instructions (see ipq4019_init)
  *
@@ -117,6 +118,8 @@
 #define IPQ_QPIC_SIZE     0x00040000u
 #define IPQ_RAM_BASE      0x80000000u
 #define IPQ_QGIC_BASE     0x0b000000u
+/* QGIC2 line count: 256 SPIs (the ipq40xx DTS uses up to 0xff) + 32 PPIs */
+#define IPQ_GIC_NUM_IRQ   288u
 #define IPQ_FLASH_BASE    0x0e000000u
 #define IPQ_FLASH_SIZE    (64 * MiB)      /* address window */
 #define IPQ_FLASH_MIN     (1 * MiB)       /* smallest die modelled */
@@ -2138,6 +2141,38 @@ static void ipq4019_reset(void *opaque)
     }
 }
 
+/*
+ * Debug: print the architectural timer state once a second while the guest
+ * runs (QEMU_IPQ_TIMER_DBG=1).  Useful when a kernel boots but never takes a
+ * tick: it shows whether the timer was programmed, whether ISTATUS is set, and
+ * when QEMU intends to expire it.
+ */
+static QEMUTimer *ipq_timer_dbg;
+
+static void ipq4019_timer_dbg(void *opaque)
+{
+    ARMCPU *cpu = ARM_CPU(first_cpu);
+    CPUARMState *env = &cpu->env;
+    static const char *const names[] = { "phys", "virt", "hyp", "sec" };
+    int i;
+
+    printf("ipq4019-timer: cntfrq=%u cntvoff=%" PRIu64 " cnthctl=%" PRIx64
+           " daif=%02x irq_line=%x\n", cpu->gt_cntfrq_hz,
+           env->cp15.cntvoff_el2, env->cp15.cnthctl_el2,
+           (unsigned)env->daif, env->irq_line_state);
+    for (i = 0; i < ARRAY_SIZE(names); i++) {
+        ARMGenericTimer *gt = &env->cp15.c14_timer[i];
+
+        printf("  %s ctl=%03" PRIx64 " cval=%" PRIu64 " expire_ns=%" PRId64
+               "\n", names[i], gt->ctl, gt->cval,
+               timer_expire_time_ns(cpu->gt_timer[i]) -
+               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
+    fflush(stdout);
+    timer_mod_ns(ipq_timer_dbg,
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND);
+}
+
 static void ipq4019_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -2155,6 +2190,13 @@ static void ipq4019_init(MachineState *machine)
 
     for (i = 0; i < machine->smp.cpus; i++) {
         cpu_create(machine->cpu_type);
+    }
+
+    if (env_true("QEMU_IPQ_TIMER_DBG")) {
+        ipq_timer_dbg = timer_new_ns(QEMU_CLOCK_VIRTUAL, ipq4019_timer_dbg,
+                                     NULL);
+        timer_mod_ns(ipq_timer_dbg, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                     NANOSECONDS_PER_SECOND);
     }
 
     /*
@@ -2414,14 +2456,20 @@ static void ipq4019_init(MachineState *machine)
             int n;
 
             qdev_prop_set_uint32(gicdev, "num-cpu", machine->smp.cpus);
-            qdev_prop_set_uint32(gicdev, "num-irq", 288);
+            qdev_prop_set_uint32(gicdev, "num-irq", IPQ_GIC_NUM_IRQ);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(gicdev), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(gicdev), 0, IPQ_QGIC_BASE);
             sysbus_mmio_map(SYS_BUS_DEVICE(gicdev), 1, IPQ_QGIC_BASE + 0x2000);
 
             for (n = 0; n < machine->smp.cpus; n++) {
                 DeviceState *cpudev = DEVICE(qemu_get_cpu(n));
-                int base = n * GIC_INTERNAL;
+                /*
+                 * GIC input lines are laid out as [SPIs][32 PPIs per CPU]
+                 * (see gic_init_irqs_and_mmio), so the first PPI of CPU n is
+                 * at (num_irq - 32) + n * 32, not at n * 32.
+                 */
+                int base = (IPQ_GIC_NUM_IRQ - GIC_INTERNAL) +
+                           n * GIC_INTERNAL;
                 unsigned k;
 
                 for (k = 0; k < NUM_GTIMERS; k++) {
@@ -2444,8 +2492,8 @@ static void ipq4019_init(MachineState *machine)
                                    n + 3 * machine->smp.cpus,
                                    qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
             }
-            printf("ipq4019: QGIC2 at 0x%08x (num-irq 288, %d cpu)\n",
-                   IPQ_QGIC_BASE, machine->smp.cpus);
+            printf("ipq4019: QGIC2 at 0x%08x (num-irq %u, %d cpu)\n",
+                   IPQ_QGIC_BASE, IPQ_GIC_NUM_IRQ, machine->smp.cpus);
         }
     }
     /* SoC revision / chip-id / strap registers SBL1 probes at low addresses */
