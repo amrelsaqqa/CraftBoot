@@ -59,6 +59,8 @@
  *   QEMU_IPQ_BAM_VER     BAM version read back from +0x1000 (default 7)
  *   QEMU_IPQ_BAM_EVENT   PIPE_EVENT bits raised when a transfer completes
  *                        (default 0x100000)
+ *   QEMU_IPQ_PSCI        smc (default) / hvc / none: EL3 stand-in used for
+ *                        guest smc instructions (see ipq4019_init)
  *
  * Status: SBL1 boots from the raw dump and hands over to QSEE.  It probes the
  * SPI NOR through the BLSP1 BAM, parses the partition table and the CDT, and
@@ -88,6 +90,12 @@
 #include "system/reset.h"
 #include "system/system.h"
 #include "system/device_tree.h"
+#include "hw/intc/arm_gic.h"
+#include "hw/intc/arm_gic_common.h"
+#include "hw/qdev-properties.h"
+#include "hw/sysbus.h"
+#include "target/arm/cpu-qom.h"
+#include "target/arm/gtimer.h"
 #include "cpu.h"
 #include <libfdt.h>
 
@@ -1882,14 +1890,35 @@ static void uart_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 
     if (env_true("QEMU_IPQ_TRACE")) {
         qemu_log_mask(LOG_UNIMP, "%s: write off 0x%03" HWADDR_PRIx
-                      " <- 0x%08" PRIx64 "%s\n", u->name, off, val,
+                      " size %u <- 0x%08" PRIx64 "%s\n", u->name, off, size,
+                      val,
                       env_u32("QEMU_IPQ_TRACE", 0) > 1 ? trace_pc() : "");
     }
-    /* TF (UARTDM) lives at 0x70..0x7c and 0x100, one byte per word */
-    if ((off >= 0x70 && off < 0x80) || off == 0x100) {
-        uint8_t c = val;
+    /*
+     * TF (UARTDM) lives at 0x70..0x7f and 0x100: it is a 4-byte-wide staging
+     * register, and the msm_serial driver packs up to four characters into a
+     * single 32-bit store (low byte first), padding a partial group with
+     * NULs -- e.g. 0x2020205b is "[   ".  Emit every byte of the store and
+     * drop the NUL padding, so the log is what the wire actually carries.
+     * earlycon drives the same register one character at a time.
+     */
+    if ((off >= 0x70 && off < 0x80) || (off >= 0x100 && off < 0x110)) {
+        uint8_t buf[4];
+        unsigned n = 0, k;
 
-        qemu_chr_fe_write_all(&u->chr, &c, 1);
+        if (size > sizeof(buf)) {
+            size = sizeof(buf);
+        }
+        for (k = 0; k < size; k++) {
+            uint8_t c = (val >> (8 * k)) & 0xff;
+
+            if (c) {
+                buf[n++] = c;
+            }
+        }
+        if (n) {
+            qemu_chr_fe_write_all(&u->chr, buf, n);
+        }
         return;
     }
     if (env_true("QEMU_IPQ_UART_LEGACY") && off < 4) {
@@ -2128,6 +2157,52 @@ static void ipq4019_init(MachineState *machine)
         cpu_create(machine->cpu_type);
     }
 
+    /*
+     * SMC conduit.
+     *
+     * On real ipq40xx hardware the QSEE/TZ monitor (loaded into 0x87e80000)
+     * owns EL3 and services every smc from SBL1, RouterBOOT and Linux.  This
+     * machine does not model the protection fabric QSEE needs, so nothing
+     * installs a monitor: HVBAR stays 0 and an smc from SVC takes the
+     * exception vector at 0x8, which is how the OpenWrt kernel dies with
+     * "Bad mode in prefetch abort handler" at pc == 0x8 in MON mode.
+     *
+     * QEMU has an EL3 stand-in for exactly this situation: with
+     * cpu->psci_conduit = SMC, target/arm/tcg/psci.c consumes the smc and
+     * answers unknown function IDs with PSCI_RET_NOT_SUPPORTED instead of
+     * trapping.  Linux's qcom_scm client then sees a clean error return, and
+     * drivers that need the monitor fail to probe instead of taking the
+     * whole kernel down.
+     *
+     * Set it directly on the CPUs rather than through arm_load_kernel():
+     * this board boots raw firmware (info->is_linux == 0, boot_el == 3 for
+     * cortex-a7), and arm_boot.c deliberately disables the SMC conduit in
+     * that case.  The property is documented as settable after realize.
+     *
+     * QEMU_IPQ_PSCI: "smc" (default), "hvc" or "none".
+     */
+    {
+        const char *psci = getenv("QEMU_IPQ_PSCI");
+        uint32_t conduit = QEMU_PSCI_CONDUIT_SMC;
+
+        if (psci && !strcmp(psci, "none")) {
+            conduit = QEMU_PSCI_CONDUIT_DISABLED;
+        } else if (psci && !strcmp(psci, "hvc")) {
+            conduit = QEMU_PSCI_CONDUIT_HVC;
+        } else if (psci && strcmp(psci, "smc")) {
+            error_report("ipq4019: QEMU_IPQ_PSCI=%s must be smc, hvc or none",
+                         psci);
+            exit(1);
+        }
+        for (CPUState *cs = first_cpu; cs; cs = CPU_NEXT(cs)) {
+            object_property_set_int(OBJECT(cs), "psci-conduit",
+                                    conduit, &error_abort);
+        }
+        printf("ipq4019: psci conduit %s\n",
+               conduit == QEMU_PSCI_CONDUIT_SMC ? "smc" :
+               conduit == QEMU_PSCI_CONDUIT_HVC ? "hvc" : "disabled");
+    }
+
     memory_region_add_subregion(sysmem, IPQ_RAM_BASE, machine->ram);
 
     flash = add_mem(sysmem, IPQ_FLASH_BASE, IPQ_FLASH_SIZE, "flash");
@@ -2308,6 +2383,71 @@ static void ipq4019_init(MachineState *machine)
      */
     add_stub(sysmem, IPQ_QGIC_BASE + 0x20000, 0x1000, "apcs-hi");
     add_stub(sysmem, IPQ_QGIC_BASE + 0x22000, 0xfe0000 - 0x2000, "apcs-hi2");
+    /*
+     * QGIC2 interrupt controller.
+     *
+     * Everything above is a decode-only stub, which is fine for the boot
+     * chain (nothing there has interrupts enabled) but useless for Linux: a
+     * kernel with no GIC runs until the first msleep(), then idles forever
+     * waiting for a timer tick that never arrives.  The board DTS describes
+     * "qcom,msm-qgic2" at <0xb000000 0x1000 0xb002000 0x1000>, i.e. a plain
+     * GICv2 distributor plus CPU interface, so map QEMU's arm_gic there.
+     *
+     * These subregions are added after the stubs so they win the overlap.
+     *
+     * Interrupt wiring follows the DTS: the ipq40xx timer node asks for PPIs
+     * 2/3/4/1 (secure-phys, non-secure-phys, virt, hyp) rather than the
+     * architectural 13/14/11/10, so the generic timer outputs are routed to
+     * those INTIDs.  QEMU_IPQ_GIC=none keeps the old stub-only behaviour.
+     */
+    {
+        const char *gic_opt = getenv("QEMU_IPQ_GIC");
+
+        if (!(gic_opt && !strcmp(gic_opt, "none"))) {
+            static const int timer_intid[NUM_GTIMERS] = {
+                [GTIMER_PHYS] = 19,     /* PPI 3 */
+                [GTIMER_VIRT] = 20,     /* PPI 4 */
+                [GTIMER_HYP]  = 17,     /* PPI 1 */
+                [GTIMER_SEC]  = 18,     /* PPI 2 */
+            };
+            DeviceState *gicdev = qdev_new(TYPE_ARM_GIC);
+            int n;
+
+            qdev_prop_set_uint32(gicdev, "num-cpu", machine->smp.cpus);
+            qdev_prop_set_uint32(gicdev, "num-irq", 288);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(gicdev), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(gicdev), 0, IPQ_QGIC_BASE);
+            sysbus_mmio_map(SYS_BUS_DEVICE(gicdev), 1, IPQ_QGIC_BASE + 0x2000);
+
+            for (n = 0; n < machine->smp.cpus; n++) {
+                DeviceState *cpudev = DEVICE(qemu_get_cpu(n));
+                int base = n * GIC_INTERNAL;
+                unsigned k;
+
+                for (k = 0; k < NUM_GTIMERS; k++) {
+                    if (!timer_intid[k]) {
+                        continue;
+                    }
+                    qdev_connect_gpio_out(cpudev, k,
+                                          qdev_get_gpio_in(gicdev,
+                                                           base + timer_intid[k]));
+                }
+                sysbus_connect_irq(SYS_BUS_DEVICE(gicdev), n,
+                                   qdev_get_gpio_in(cpudev, ARM_CPU_IRQ));
+                sysbus_connect_irq(SYS_BUS_DEVICE(gicdev),
+                                   n + machine->smp.cpus,
+                                   qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+                sysbus_connect_irq(SYS_BUS_DEVICE(gicdev),
+                                   n + 2 * machine->smp.cpus,
+                                   qdev_get_gpio_in(cpudev, ARM_CPU_VIRQ));
+                sysbus_connect_irq(SYS_BUS_DEVICE(gicdev),
+                                   n + 3 * machine->smp.cpus,
+                                   qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
+            }
+            printf("ipq4019: QGIC2 at 0x%08x (num-irq 288, %d cpu)\n",
+                   IPQ_QGIC_BASE, machine->smp.cpus);
+        }
+    }
     /* SoC revision / chip-id / strap registers SBL1 probes at low addresses */
     add_stub(sysmem, 0x40000, 0x1c000, "soc-low");
     /*
