@@ -1233,7 +1233,18 @@ typedef struct IPQRegFile {
     MemoryRegion mr;
     uint32_t *regs;
     uint32_t nregs;
-    unsigned dbg;                   /* log writes when QEMU_IPQ_ESS_LOG is set */
+    unsigned dbg;                   /* log accesses when QEMU_IPQ_ESS_LOG is set */
+    /*
+     * Registers holding a "busy" bit that hardware clears as soon as the
+     * operation the write started has finished.  Software sets the bit and
+     * then polls for it to read back 0; storing it verbatim makes every such
+     * poll time out (the switch's MIB flush and ATU/VTU lookups do this).
+     */
+    struct {
+        hwaddr off;
+        uint32_t mask;
+    } clr[8];
+    int nclr;
 } IPQRegFile;
 
 static uint64_t regfile_read(void *opaque, hwaddr off, unsigned size)
@@ -1246,6 +1257,11 @@ static uint64_t regfile_read(void *opaque, hwaddr off, unsigned size)
         hwaddr o = off + i;
         uint32_t w = r->regs[(o >> 2) % r->nregs];
         v |= (uint64_t)((w >> ((o & 3) * 8)) & 0xff) << (i * 8);
+    }
+    if (r->dbg) {
+        qemu_log_mask(LOG_UNIMP, "%s: read  0x%05" HWADDR_PRIx
+                      " -> 0x%08" PRIx64 "%s\n",
+                      memory_region_name(&r->mr), off, v, trace_pc());
     }
     return v;
 }
@@ -1261,6 +1277,11 @@ static void regfile_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         unsigned sh = (o & 3) * 8;
         *w = (*w & ~(0xffu << sh)) | (((val >> (i * 8)) & 0xff) << sh);
     }
+    for (i = 0; i < r->nclr; i++) {
+        if ((off & ~3u) == r->clr[i].off) {
+            r->regs[r->clr[i].off >> 2] &= ~r->clr[i].mask;
+        }
+    }
     if (r->dbg) {
         qemu_log_mask(LOG_UNIMP, "%s: write 0x%05" HWADDR_PRIx
                       " <- 0x%08" PRIx64 "%s\n",
@@ -1275,6 +1296,15 @@ static const MemoryRegionOps regfile_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
+
+/* Declare a busy bit that clears itself once the write has taken effect. */
+static void regfile_clr_bit(IPQRegFile *r, hwaddr off, uint32_t mask)
+{
+    assert(r->nclr < ARRAY_SIZE(r->clr));
+    r->clr[r->nclr].off = off;
+    r->clr[r->nclr].mask = mask;
+    r->nclr++;
+}
 
 static IPQRegFile *add_regfile(MemoryRegion *parent, hwaddr base, hwaddr size,
                                const char *name)
@@ -2602,7 +2632,23 @@ static void ipq4019_init(MachineState *machine)
      * polls status bits, but no packet moves until EDMA descriptors are
      * modelled.
      */
-    add_regfile(sysmem, 0x0c000000, 0x00080000, "ess");
+    {
+        IPQRegFile *ess = add_regfile(sysmem, 0x0c000000, 0x00080000, "ess");
+
+        /*
+         * QCA8K_REG_MASK_CTRL (offset 0): device id in bits 15:8, revision in
+         * bits 7:0.  The switch inside the IPQ4019 reports id 0x14, which is
+         * what qca8k_read_switch_id() insists on before it will bind -- with
+         * the register reading 0 the driver bails out with
+         * "Switch id detected 0 but expected 14" (both %x) and no DSA ports
+         * ever appear.
+         */
+        ess->regs[0] = 0x1402;
+        /* command registers whose busy bit clears when the op completes */
+        regfile_clr_bit(ess, 0x034, 1u << 17);      /* QCA8K_MIB_BUSY */
+        regfile_clr_bit(ess, 0x60c, 1u << 31);      /* QCA8K_ATU_FUNC_BUSY */
+        regfile_clr_bit(ess, 0x614, 1u << 31);      /* QCA8K_VTU_FUNC1_BUSY */
+    }
     add_regfile(sysmem, 0x0c080000, 0x00080000, "edma");
     /* TCSR: SoC revision, boot option and strap registers */
     add_stub(sysmem, 0x1900000, 0x100000, "tcsr");
