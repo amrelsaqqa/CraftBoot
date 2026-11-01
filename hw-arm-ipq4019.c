@@ -250,6 +250,16 @@ static const char *trace_pc(void)
     return buf;
 }
 
+/* Host milliseconds since QEMU started, for "when did that access happen". */
+static const char *trace_ms(void)
+{
+    static char buf[24];
+
+    snprintf(buf, sizeof(buf), " t=%" PRId64 "ms",
+             g_get_monotonic_time() / 1000);
+    return buf;
+}
+
 static uint64_t stub_read(void *opaque, hwaddr off, unsigned size)
 {
     IPQStub *s = opaque;
@@ -2616,6 +2626,19 @@ static void edma_update_irqs(IPQEdma *e)
     }
 }
 
+/* Hexdump into stderr, for the descriptor/frame reconnaissance knob. */
+static void edma_hexdump(const char *tag, const void *buf, unsigned n)
+{
+    const uint8_t *p = buf;
+    unsigned i;
+
+    fprintf(stderr, "edma: %s", tag);
+    for (i = 0; i < n; i++) {
+        fprintf(stderr, "%s%02x", (i % 16) ? " " : "\n   ", p[i]);
+    }
+    fprintf(stderr, "\n");
+}
+
 /* Walk the descriptors the driver just published and retire them. */
 static void edma_tx_kick(IPQEdma *e, unsigned q)
 {
@@ -2651,6 +2674,23 @@ static void edma_tx_kick(IPQEdma *e, unsigned q)
         dma_memory_read(&address_space_memory,
                         (hwaddr)base + (hwaddr)cons * IPQ_EDMA_TPD_SIZE,
                         tpd, sizeof(tpd), MEMTXATTRS_UNSPECIFIED);
+        if (env_u32("QEMU_IPQ_EDMA_LOG", 0) > 1) {
+            uint8_t frame[96];
+            uint32_t a8 = ldl_le_p(tpd + 8) & ~3u;
+            uint32_t a4 = ldl_le_p(tpd + 4) & ~3u;
+
+            edma_hexdump("tpd", tpd, sizeof(tpd));
+            if ((a4 >= 0x80000000u && a4 < 0x90000000u)) {
+                dma_memory_read(&address_space_memory, a4, frame, 64,
+                                MEMTXATTRS_UNSPECIFIED);
+                edma_hexdump("buf@+4", frame, 64);
+            }
+            if ((a8 >= 0x80000000u && a8 < 0x90000000u)) {
+                dma_memory_read(&address_space_memory, a8, frame, 64,
+                                MEMTXATTRS_UNSPECIFIED);
+                edma_hexdump("buf@+8", frame, 64);
+            }
+        }
         len = lduw_le_p(tpd + 4);
         e->tx_byte[q] += len;
         if (ldl_le_p(tpd + 8) & EDMA_TPD_EOP) {
@@ -2980,7 +3020,7 @@ static uint16_t phy_read_reg(IPQPhy *p, int reg)
         if (!p->link) {
             return p->reg[MII_PHYSTS];
         }
-        return 0x0400 |
+        return 0x0400 | 0x0800 |          /* link, speed/duplex resolved */
                (p->full_duplex ? 0x2000 : 0) |
                ((p->speed >= 1000 ? 2 : p->speed >= 100 ? 1 : 0) << 14);
     default:
@@ -3012,8 +3052,32 @@ static void phy_write_reg(IPQPhy *p, int reg, uint16_t val)
         return;
     }
     if (reg == MII_BMCR) {
-        p->speed = (val & 0x2000) ? 1000 : (val & 0x0040) ? 100 : 10;
-        p->full_duplex = (val & 0x0100) != 0;
+        /*
+         * RESET (bit 15) and RESTART_AUTONEG (bit 9) are self-clearing on
+         * silicon: the chip drops them as soon as the operation finishes.
+         * Keeping bit 9 set is not harmless -- genphy_update_link() reads
+         * BMCR first and, seeing "autonegotiation is being started",
+         * reports the link down *without reading BMSR at all*.  That is
+         * how every front-panel port stayed at carrier 0 while the PHY
+         * model happily answered "link up" to everything else.
+         */
+        val &= ~0xa200u;                /* 0x8000 RESET | 0x0200 ANRESTART */
+
+        if (val & 0x1000) {
+            /*
+             * Autonegotiation enabled: the resolved result comes from the
+             * link partner advertisement (LPA 0x45e1) and the 1000BASE-T
+             * status registers, both of which say 1000 Mb/s full duplex.
+             */
+            p->speed = 1000;
+            p->full_duplex = true;
+        } else if (val & 0x2000) {
+            p->speed = 1000;
+            p->full_duplex = (val & 0x0100) != 0;
+        } else {
+            p->speed = (val & 0x0040) ? 100 : 10;
+            p->full_duplex = (val & 0x0100) != 0;
+        }
     }
     p->reg[reg & 0x1f] = val;
 }
@@ -3101,10 +3165,11 @@ static void mdio_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
                 m->rdata = phy_read_reg(p, reg);
             }
             if (env_true("QEMU_IPQ_TRACE")) {
-                qemu_log_mask(LOG_UNIMP, "mdio: %s phy %d reg %02x %s 0x%04x%s\n",
+                qemu_log_mask(LOG_UNIMP, "mdio: %s phy %d reg %02x %s 0x%04x%s%s\n",
                               (val & MDIO_CMD_WRITE) ? "wr" : "rd", phy_addr, reg,
                               (val & MDIO_CMD_WRITE) ? "<-" : "->",
                               (val & MDIO_CMD_WRITE) ? (m->wdata & 0xffff) : m->rdata,
+                              trace_ms(),
                               env_u32("QEMU_IPQ_TRACE", 0) > 1 ? trace_pc() : "");
             }
         }
