@@ -12,7 +12,7 @@
  *   0x0005e000  PBL boot-config / device-present block (see below)
  *   0x004a1000  qca-gcnt        (32-bit free running counter)
  *   0x004a2000  qca-qtimer      (56-bit udelay counter, same time base)
- *   0x004ab000  pshold          (stub)
+ *   0x004ab000  pshold          (reset register: dropping it resets the board)
  *   0x01000000  TLMM            (stub, shadowed)
  *   0x01800000  GCC             (stub, shadowed)
  *   0x01940000  TCSR            (stub)
@@ -327,17 +327,6 @@ static void stub_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     s->spin = 0;
 }
 
-/* Give a stub register the value the boot ROM / previous stage left in it. */
-static void stub_seed(IPQStub *s, uint32_t off, uint32_t val)
-{
-    uint32_t idx = off >> 2;
-
-    if (idx < s->nregs) {
-        s->shadow[idx] = val;
-        s->valid[idx] = 1;
-    }
-}
-
 static const MemoryRegionOps stub_ops = {
     .read = stub_read,
     .write = stub_write,
@@ -346,6 +335,9 @@ static const MemoryRegionOps stub_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 8 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
+
+/* Every stub register file, so a system reset can clear what software left */
+static GPtrArray *ipq_stub_list;
 
 static IPQStub *add_stub_ex(MemoryRegion *parent, hwaddr base, hwaddr size,
                             const char *name, uint32_t read_mask)
@@ -363,8 +355,58 @@ static IPQStub *add_stub_ex(MemoryRegion *parent, hwaddr base, hwaddr size,
     }
     memory_region_init_io(&s->mr, NULL, &stub_ops, s, name, size);
     memory_region_add_subregion(parent, base, &s->mr);
+    if (!ipq_stub_list) {
+        ipq_stub_list = g_ptr_array_new();
+    }
+    g_ptr_array_add(ipq_stub_list, s);
     return s;
 }
+
+/*
+ * PS_HOLD: how the guest restarts the board.
+ *
+ * The device tree hands Linux a `qcom,pshold` node at 0x4ab000.  The PMIC
+ * keeps the rails up while PS_HOLD is high, so software asks for a restart by
+ * dropping it -- the driver writes 0 and never comes back.  Model the register
+ * (reads return the last value, reset value 1) and turn a write that clears
+ * bit 0 into a machine reset, the same event the reset button causes.  Without
+ * it the kernel prints "Reboot failed -- System halted", and there is no way
+ * for the guest to ever check that its NOR writes survived a restart.
+ */
+typedef struct IPQPsHold {
+    uint32_t val;
+} IPQPsHold;
+
+static IPQPsHold *ipq_pshold;
+
+static uint64_t pshold_read(void *opaque, hwaddr off, unsigned size)
+{
+    IPQPsHold *s = opaque;
+
+    return s->val;
+}
+
+static void pshold_write(void *opaque, hwaddr off, uint64_t v, unsigned size)
+{
+    IPQPsHold *s = opaque;
+
+    if (env_true("QEMU_IPQ_PSHOLD_LOG")) {
+        qemu_log_mask(LOG_UNIMP, "pshold: write 0x%08x%s\n", (uint32_t)v,
+                      env_u32("QEMU_IPQ_TRACE", 0) > 1 ? trace_pc() : "");
+    }
+    s->val = v;
+    if (!(v & 1) && !env_true("QEMU_IPQ_NO_PSHOLD_RESET")) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
+
+static const MemoryRegionOps pshold_ops = {
+    .read = pshold_read,
+    .write = pshold_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
 
 static void add_stub(MemoryRegion *parent, hwaddr base, hwaddr size,
                      const char *name)
@@ -534,8 +576,13 @@ typedef struct IPQQupl {
     uint8_t rx_buf[8];      /* short replies: JEDEC id, status */
     int rx_len;
     int rx_pos;
-    uint8_t status;         /* SR1: bit0 busy, bit1 write-enable latch */
-    int write_sr;           /* next data byte lands in SR1 */
+    uint8_t status;         /* SR1: bit0 busy, bit1 WEL, 2-4 BP, 5 TB, 6 SEC */
+    uint8_t status2;        /* SR2: bit5 E_FAIL, bit6 P_FAIL (W25Q style) */
+    int write_sr;           /* status bytes still expected (0 = not WRSR) */
+    uint32_t pgm_addr;      /* next die offset a PP data byte programs */
+    uint32_t pgm_left;      /* bytes left before the page boundary */
+    int wip_pending;        /* the die still owes one "busy" status read */
+    int wr_kind;            /* NOR_WR_*: what the latched command will write */
     uint32_t data_bytes;    /* bytes shifted out of this command's reply */
     uint32_t last_addr;     /* decoded address of the previous command */
     /*
@@ -681,6 +728,138 @@ static uint8_t qup_flash_byte(uint32_t off)
     return ipq_flash->data[off];
 }
 
+/* ---- NOR die write path ------------------------------------------------ */
+
+#define NOR_PAGE_SIZE   256
+#define NOR_SECTOR_SIZE 0x1000          /* 0x20: 4 KiB sector erase */
+#define NOR_BLOCK32     0x8000          /* 0x52: 32 KiB block erase */
+#define NOR_BLOCK64     0x10000         /* 0xd8: 64 KiB block erase */
+
+/* SR2 failure flags (Winbond W25Q layout): the die reports a refused write */
+#define NOR_SR2_EFAIL   0x80
+#define NOR_SR2_PFAIL   0x40
+
+enum {
+    NOR_WR_NONE = 0,
+    NOR_WR_PP,                          /* page program, 256 B */
+    NOR_WR_SE4K,                        /* sector erase, 4 KiB */
+    NOR_WR_BE32,                        /* block erase, 32 KiB */
+    NOR_WR_BE64,                        /* block erase, 64 KiB */
+    NOR_WR_CE,                          /* chip erase */
+};
+
+/*
+ * Block protection as the die implements it: SR1 carries BP2..BP0 (bits 4:2),
+ * TB (bit 5) selects the top or the bottom of the die, SEC (bit 6) protects
+ * only the outermost 4 KiB sector, and BP=7 covers everything.  SR1 comes out
+ * of reset as 0 and SBL1 clears a protect bit during init, so nothing is
+ * protected in either dump -- but a bootloader that does protect a region has
+ * to see the write refused, which a real die reports as P_FAIL/E_FAIL in SR2.
+ */
+static bool nor_range_protected(IPQQupl *q, uint32_t off, uint32_t len)
+{
+    uint32_t die = ipq_flash_die_size;
+    uint32_t prot;
+    bool top = (q->status & 0x20) != 0;
+    unsigned bp = (q->status >> 2) & 7;
+
+    if (q->status & 0x40) {                 /* SEC */
+        prot = NOR_SECTOR_SIZE;
+    } else if (!bp) {
+        return false;
+    } else {
+        prot = (bp == 7) ? die : (NOR_SECTOR_SIZE << bp);
+        prot = MIN(prot, die);
+    }
+    return top ? off + len > die - prot : off < prot;
+}
+
+static void nor_erase(IPQQupl *q, uint32_t off, uint32_t len)
+{
+    if (!ipq_flash) {
+        return;
+    }
+    off &= ipq_flash_die_size - 1;
+    if (off >= ipq_flash->size) {
+        return;
+    }
+    len = MIN(len, (uint32_t)(ipq_flash->size - off));
+    if (nor_range_protected(q, off, len)) {
+        q->status2 |= NOR_SR2_EFAIL;
+        return;
+    }
+    memset(ipq_flash->data + off, 0xff, len);
+    if (env_true("QEMU_IPQ_SPI_LOG")) {
+        qemu_log_mask(LOG_UNIMP, "die: erase 0x%06x +0x%x\n",
+                      off, (unsigned)len);
+    }
+}
+
+static void nor_program_byte(IPQQupl *q, uint8_t b)
+{
+    uint32_t page;
+
+    if (!ipq_flash || !q->pgm_left || q->pgm_addr >= ipq_flash->size) {
+        return;
+    }
+    if (nor_range_protected(q, q->pgm_addr, 1)) {
+        q->status2 |= NOR_SR2_PFAIL;
+        return;
+    }
+    /* Programming can only clear bits; a set bit needs an erase first. */
+    ipq_flash->data[q->pgm_addr] &= b;
+    q->pgm_left--;
+    /* Past the 256-byte page the die wraps instead of spilling into the next */
+    page = q->pgm_addr & ~(NOR_PAGE_SIZE - 1);
+    q->pgm_addr = page | ((q->pgm_addr + 1) & (NOR_PAGE_SIZE - 1));
+}
+
+/* The address phase of a write command just finished: start the operation. */
+static void nor_write_start(IPQQupl *q)
+{
+    uint32_t off = q->addr & (ipq_flash_die_size - 1);
+
+    if (!(q->status & 0x02)) {
+        /*
+         * No write-enable latch: a real die ignores the command silently,
+         * but say so, because a driver that forgot WREN is then the only
+         * explanation for the data that did not change.
+         */
+        if (env_true("QEMU_IPQ_SPI_LOG")) {
+            qemu_log_mask(LOG_UNIMP,
+                          "die: op 0x%02x at 0x%06x without WEL, ignored\n",
+                          q->opcode, off);
+        }
+        q->wr_kind = NOR_WR_NONE;
+        return;
+    }
+    switch (q->wr_kind) {
+    case NOR_WR_PP:
+        q->pgm_addr = off;
+        q->pgm_left = NOR_PAGE_SIZE - (off & (NOR_PAGE_SIZE - 1));
+        break;
+    case NOR_WR_SE4K:
+        nor_erase(q, off, NOR_SECTOR_SIZE);
+        break;
+    case NOR_WR_BE32:
+        nor_erase(q, off, NOR_BLOCK32);
+        break;
+    case NOR_WR_BE64:
+        nor_erase(q, off, NOR_BLOCK64);
+        break;
+    case NOR_WR_CE:
+        nor_erase(q, 0, ipq_flash_die_size);
+        break;
+    default:
+        break;
+    }
+    if (q->wr_kind != NOR_WR_PP) {
+        q->wr_kind = NOR_WR_NONE;
+    }
+    q->status &= ~0x02;             /* the latch is consumed by the operation */
+    q->wip_pending = 1;             /* one "busy" status read is owed */
+}
+
 static void qup_spi_opcode(IPQQupl *q, uint8_t op)
 {
     uint8_t prev_op = q->opcode;
@@ -689,6 +868,9 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
     q->addr_left = 0;
     q->dummy_left = 0;
     q->read_data = 0;
+    q->write_sr = 0;
+    q->pgm_left = 0;
+    q->wr_kind = NOR_WR_NONE;
     q->rx_len = 0;
     q->rx_pos = 0;
     q->rx_off = 0;
@@ -753,11 +935,21 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
         q->rx_len = 8;
         break;
     case 0x05:                          /* RDSR1 */
-        q->rx_buf[0] = q->status;
+        /*
+         * The die is fast enough to finish between commands, so it reports
+         * "busy" for exactly one read after a program/erase: a driver that
+         * polls SR1 has to go round the loop, and one that does not is not
+         * penalised by a status bit that never clears.
+         */
+        q->rx_buf[0] = q->status | (q->wip_pending ? 0x01 : 0);
+        q->wip_pending = 0;
         q->rx_len = 1;
         break;
     case 0x35:                          /* RDSR2 */
-    case 0x15:                          /* RDCR */
+        q->rx_buf[0] = q->status2;
+        q->rx_len = 1;
+        break;
+    case 0x15:                          /* RDCR / RDSR3 */
         q->rx_buf[0] = 0x00;
         q->rx_len = 1;
         break;
@@ -768,17 +960,35 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
     case 0x04:                          /* WRDI */
         q->status &= ~0x02;
         break;
-    case 0x01:                          /* WRSR: next data byte is SR1 */
+    case 0x01:                          /* WRSR: SR1 [, SR2 [, SR3]] */
     case 0x31:
-        q->write_sr = 1;
+        q->write_sr = 3;
         break;
-    case 0x02:                          /* PP */
-    case 0x20:                          /* SE */
+    case 0x02:                          /* PP, 256-byte page program */
+    case 0x12:                          /* PP with a 4-byte address */
+        q->addr_left = (op == 0x12) ? 4 : (q->addr4 ? 4 : 3);
+        q->wr_kind = NOR_WR_PP;
+        break;
+    case 0x20:                          /* SE: 4 KiB sector erase */
+    case 0x21:                          /* SE with a 4-byte address */
+        q->addr_left = (op == 0x21) ? 4 : (q->addr4 ? 4 : 3);
+        q->wr_kind = NOR_WR_SE4K;
+        break;
     case 0x52:                          /* BE32 */
+    case 0x5c:
+        q->addr_left = (op == 0x5c) ? 4 : (q->addr4 ? 4 : 3);
+        q->wr_kind = NOR_WR_BE32;
+        break;
     case 0xd8:                          /* BE64 */
-    case 0xc7:                          /* CE */
+    case 0xdc:
+        q->addr_left = (op == 0xdc) ? 4 : (q->addr4 ? 4 : 3);
+        q->wr_kind = NOR_WR_BE64;
+        break;
+    case 0xc7:                          /* CE, no address phase */
     case 0x60:
-        q->status &= ~0x02;             /* the latch is consumed by the op */
+        q->wr_kind = NOR_WR_CE;
+        q->addr = 0;
+        nor_write_start(q);
         break;
     default:
         /* unknown opcode: no data phase, accept and ignore */
@@ -808,6 +1018,9 @@ static void qup_spi_byte(IPQQupl *q, uint8_t b)
             q->rx_off = q->addr;
             q->last_addr = q->addr;
             q->phase = q->dummy_left ? 2 : 3;
+            if (q->wr_kind) {
+                nor_write_start(q);
+            }
             die_dbg_n = 0;
             if (die_dbg_on()) {
                 die_dbg_log("die: xact op=0x%02x addr=0x%08x pc=%08x\n",
@@ -827,13 +1040,21 @@ static void qup_spi_byte(IPQQupl *q, uint8_t b)
         break;
     default:
         /*
-         * Data/program phase.  Programming the die is not modelled, but the
-         * status register has to take the value: SBL1 clears a block-protect
-         * bit during init and then reads it back.
+         * Data phase.  Three things can be in flight: a status-register
+         * write (SBL1 clears a block-protect bit during init and reads it
+         * back), a page program, or nothing at all.
          */
         if (q->write_sr) {
-            q->status = b & ~0x02;      /* WEL self-clears */
-            q->write_sr = 0;
+            int idx = 3 - q->write_sr;
+
+            if (idx == 0) {
+                q->status = b & ~0x02;  /* WEL self-clears */
+            } else if (idx == 1) {
+                q->status2 = b;
+            }
+            q->write_sr--;
+        } else if (q->pgm_left) {
+            nor_program_byte(q, b);
         }
         break;
     }
@@ -1532,6 +1753,17 @@ typedef struct IPQBamPipe {
     uint32_t prod;
     uint32_t cons;
     uint64_t bytes;             /* total moved, for the SPI log */
+    /*
+     * The receive descriptor the engine is filling right now.  Real hardware
+     * keeps writing into the posted buffer as bytes arrive and only retires
+     * it when the buffer fills or the UART goes idle (the stale timeout), so
+     * one burst of console input completes one descriptor -- not one per
+     * chardev read.
+     */
+    uint32_t rx_desc_addr;
+    uint16_t rx_desc_len;
+    uint16_t rx_desc_got;
+    bool rx_desc_open;
 } IPQBamPipe;
 
 typedef struct IPQBam {
@@ -1654,7 +1886,11 @@ static void uart_bam_write(const uint8_t *buf, size_t n);
 static bool uart_bam_rx_armed(void);
 static size_t uart_bam_rx_pending(void);
 static size_t uart_bam_rx_pull(uint8_t *buf, size_t n);
+static void uart_bam_rx_account(size_t n);
 static void bam_uart_rx_kick(void);
+static void bam_uart_rx_idle(void);
+static void bam_uart_rx_input_ready(void);
+static void uart_rx_idle_arm(void);
 
 /* The BLSP1 BAM, so the UART model can kick the RX pipe when input lands. */
 static IPQBam *ipq_blsp1_bam;
@@ -1748,6 +1984,9 @@ static void bam_pipe_run(IPQBam *b, int n)
     if (p->client == BAM_CLIENT_UART_RX) {
         /* Move whatever console input is waiting into the posted buffer. */
         bam_uart_rx_move(b, n);
+        /* Input still sitting in the chardev queue (a burst longer than the
+         * receive FIFO) can now flow in as well. */
+        bam_uart_rx_input_ready();
         return;
     }
     while (p->cons != p->prod && guard++ < 4096) {
@@ -1808,21 +2047,48 @@ static void bam_pipe_run(IPQBam *b, int n)
 /*
  * Move pending console input into the RX pipe's posted descriptors.
  *
- * One descriptor is retired per call: the UART flushes its DMA FIFO after a
- * short idle period (the stale timeout), which is exactly when the engine
- * completes a receive descriptor on the board.  The driver reads
- * UARTDM_RX_TOTAL_SNAP to learn how many bytes arrived, then re-arms.
+ * The engine fills the descriptor it has posted and retires it when the buffer
+ * is full or when the UART reports that the line has gone idle (the stale
+ * timeout) -- the second case is how a driver learns about a short burst.  A
+ * pasted line therefore completes exactly one descriptor, which matters
+ * because msm_serial advances its tty data by `RX_TOTAL_SNAP - old_snap`;
+ * retiring per chardev read would split one line over two buffers and make
+ * that delta point at the wrong bytes.
  */
+static void bam_uart_rx_retire(IPQBam *b, IPQBamPipe *p)
+{
+    uint32_t d[2];
+
+    if (!p->rx_desc_open) {
+        return;
+    }
+    address_space_read(&address_space_memory, p->ring_base + p->cons,
+                       MEMTXATTRS_UNSPECIFIED, d, sizeof(d));
+    /* The engine writes the real length back into the descriptor. */
+    d[1] = (d[1] & 0xffff0000u) | p->rx_desc_got;
+    address_space_write(&address_space_memory, p->ring_base + p->cons,
+                        MEMTXATTRS_UNSPECIFIED, d, sizeof(d));
+    p->rx_desc_open = false;
+    p->rx_desc_got = 0;
+    p->cons += BAM_DESC_SIZE;
+    if (p->cons >= p->ring_size) {
+        p->cons = 0;
+    }
+    p->event |= env_u32("QEMU_IPQ_BAM_EVENT", BAM_EV_COMPLETE);
+    p->irq_stts |= BAM_P_IRQ_PRCSD_DESC | BAM_P_IRQ_TRNSFR_END;
+    bam_update_irq(b);
+}
+
 static bool bam_uart_rx_move(IPQBam *b, int n)
 {
     IPQBamPipe *p = &b->pipe[n];
     bool moved = false;
-    int guard = 0;
 
     UART_RX_LOG("bam rx move pipe=%d ctrl=%x base=%08x size=%x cons=%x "
-                "prod=%x armed=%d pending=%u\n", n, p->ctrl, p->ring_base,
-                p->ring_size, p->cons, p->prod, uart_bam_rx_armed(),
-                (unsigned)uart_bam_rx_pending());
+                "prod=%x armed=%d pending=%u open=%d got=%u\n", n, p->ctrl,
+                p->ring_base, p->ring_size, p->cons, p->prod,
+                uart_bam_rx_armed(), (unsigned)uart_bam_rx_pending(),
+                p->rx_desc_open, p->rx_desc_got);
     if (!(p->ctrl & BAM_CTRL_ENABLE) || !(p->ctrl & BAM_CTRL_DIR_BAM2SYS)) {
         return false;
     }
@@ -1830,51 +2096,85 @@ static bool bam_uart_rx_move(IPQBam *b, int n)
         return false;
     }
 
-    while (p->cons != p->prod && guard++ < 64) {
+    for (;;) {
         uint32_t d[2];
         uint8_t buf[256];
-        uint32_t addr;
-        uint16_t len, got;
+        size_t room, take, got;
 
-        if (p->cons + BAM_DESC_SIZE > p->ring_size) {
-            p->cons = 0;
-            continue;
+        if (!p->rx_desc_open) {
+            if (p->cons == p->prod) {
+                break;              /* the driver has not posted a buffer */
+            }
+            if (p->cons + BAM_DESC_SIZE > p->ring_size) {
+                p->cons = 0;
+                continue;
+            }
+            address_space_read(&address_space_memory, p->ring_base + p->cons,
+                               MEMTXATTRS_UNSPECIFIED, d, sizeof(d));
+            if (!(d[1] & 0xffffu)) {
+                break;
+            }
+            p->rx_desc_open = true;
+            p->rx_desc_addr = d[0];
+            p->rx_desc_len = d[1] & 0xffffu;
+            p->rx_desc_got = 0;
         }
-        address_space_read(&address_space_memory, p->ring_base + p->cons,
-                           MEMTXATTRS_UNSPECIFIED, d, sizeof(d));
-        addr = d[0];
-        len = d[1] & 0xffffu;
-        if (!len || !uart_bam_rx_pending()) {
-            break;              /* nothing arrived yet: leave it queued */
+        if (!uart_bam_rx_pending()) {
+            break;                  /* nothing arrived yet: leave it queued */
         }
-        got = uart_bam_rx_pull(buf, MIN((size_t)len, sizeof(buf)));
+        room = p->rx_desc_len - p->rx_desc_got;
+        take = MIN(room, sizeof(buf));
+        got = uart_bam_rx_pull(buf, take);
         if (!got) {
             break;
         }
-        address_space_write(&address_space_memory, addr,
+        address_space_write(&address_space_memory,
+                            p->rx_desc_addr + p->rx_desc_got,
                             MEMTXATTRS_UNSPECIFIED, buf, got);
-        UART_RX_LOG("bam rx: %u byte(s) '%c' -> guest %08x\n",
-                    (unsigned)got, got ? buf[0] : '?', addr);
-        /* The engine writes the real length back into the descriptor. */
-        d[1] = (d[1] & 0xffff0000u) | got;
-        address_space_write(&address_space_memory, p->ring_base + p->cons,
-                            MEMTXATTRS_UNSPECIFIED, d, sizeof(d));
-        p->cons += BAM_DESC_SIZE;
-        if (p->cons >= p->ring_size) {
-            p->cons = 0;
-        }
-        p->event |= env_u32("QEMU_IPQ_BAM_EVENT", BAM_EV_COMPLETE);
-        p->irq_stts |= BAM_P_IRQ_PRCSD_DESC | BAM_P_IRQ_TRNSFR_END;
+        uart_bam_rx_account(got);
+        p->rx_desc_got += got;
         moved = true;
-    }
-    if (moved) {
-        bam_update_irq(b);
-        if (env_true("QEMU_IPQ_BAM_LOG")) {
-            fprintf(stderr, "bam: uart-rx pipe=%d cons=%u prod=%u\n",
-                    n, p->cons, p->prod);
+        UART_RX_LOG("bam rx: %zu byte(s) '%c' -> guest %08x (got %u/%u)\n",
+                    got, buf[0], p->rx_desc_addr, p->rx_desc_got,
+                    p->rx_desc_len);
+        if (p->rx_desc_got >= p->rx_desc_len) {
+            bam_uart_rx_retire(b, p);   /* buffer full: hand it back now */
+            continue;
         }
+        /*
+         * Keep it open until the line goes idle, and make sure that idle
+         * timeout is actually running: the bytes may have arrived before the
+         * driver posted this buffer, in which case the timer has already
+         * fired once and would never retire the descriptor.
+         */
+        uart_rx_idle_arm();
+        break;
+    }
+    if (moved && env_true("QEMU_IPQ_BAM_LOG")) {
+        fprintf(stderr, "bam: uart-rx pipe=%d cons=%u prod=%u\n",
+                n, p->cons, p->prod);
     }
     return moved;
+}
+
+/* The line went idle: flush the FIFO and retire the open descriptor. */
+static void bam_uart_rx_idle(void)
+{
+    IPQBam *b = ipq_blsp1_bam;
+    int i;
+
+    if (!b) {
+        return;
+    }
+    for (i = 0; i < BAM_PIPE_COUNT; i++) {
+        if (b->pipe[i].client != BAM_CLIENT_UART_RX) {
+            continue;
+        }
+        bam_uart_rx_move(b, i);
+        if (b->pipe[i].rx_desc_open && b->pipe[i].rx_desc_got) {
+            bam_uart_rx_retire(b, &b->pipe[i]);
+        }
+    }
 }
 
 /* Called from the UART when console input has been sitting idle. */
@@ -1926,6 +2226,22 @@ static void bam_update_irq(IPQBam *b)
 static uint32_t bam_def_read(void)
 {
     return env_u32("QEMU_IPQ_BAM_DEF", 0xffffffffu);
+}
+
+/*
+ * The two identification registers are properties of the silicon, not state
+ * software leaves behind, so they are seeded whenever the block comes out of
+ * reset -- both at machine init and on every later system reset.  Without the
+ * seed the reads fall back to bam_def_read(), and SBL1's flash driver rejects
+ * the revision's step field (error 303d at boot_flash_init).
+ */
+static void bam_seed_id(IPQBam *b)
+{
+    b->shadow[0x1000 >> 2] = (env_u32("QEMU_IPQ_BAM_EES", 4) << 8) |
+                             env_u32("QEMU_IPQ_BAM_VER", 7);
+    b->valid[0x1000 >> 2] = 1;
+    b->shadow[0x1008 >> 2] = env_u32("QEMU_IPQ_BAM_PIPES", 12);
+    b->valid[0x1008 >> 2] = 1;
 }
 
 static uint64_t bam_read(void *opaque, hwaddr off, unsigned size)
@@ -2534,6 +2850,8 @@ typedef struct IPQMdio {
     IPQPhy phy[IPQ_MDIO_MAX_PHYS];
 } IPQMdio;
 
+static IPQMdio *ipq_mdio;        /* set by add_mdio(), reset with the SoC */
+
 static int mmd_find(IPQPhy *p, uint32_t key)
 {
     int i;
@@ -3068,6 +3386,7 @@ static IPQMdio *add_mdio(MemoryRegion *parent, const char *dtb_path)
         mdio_parse_ports(m, IPQ_ETH_DEFAULT_PORTS);
     }
 
+    ipq_mdio = m;
     memory_region_init_io(&m->mr, NULL, &mdio_ops, m, "mdio", IPQ_MDIO_SIZE);
     memory_region_add_subregion(parent, IPQ_MDIO_BASE, &m->mr);
 
@@ -3127,7 +3446,28 @@ typedef struct IPQUart {
     uint8_t rxbuf[64];
     unsigned rx_head;
     unsigned rx_count;
-    uint32_t rx_total;          /* bytes received since DMRX was reset */
+    /*
+     * Bytes the chardev has handed us but that have not reached the receive
+     * FIFO yet.  A chardev write is a burst -- a pasted line, a whole pty
+     * read -- while the die delivers one byte at a time at the baud rate, so
+     * queueing here is what keeps a burst longer than the 64-byte FIFO from
+     * being silently truncated at the FIFO boundary.
+     */
+    uint8_t rxq[512];
+    unsigned rxq_head;
+    unsigned rxq_count;
+    bool in_fill;
+    bool rx_again;
+    /*
+     * RX_TOTAL_SNAP counts the bytes the BAM receiver has written into the
+     * guest's DMA buffer since the buffer was posted, not the bytes sitting
+     * in the FIFO: msm_complete_rx_dma() takes `snap - old_snap_state` and
+     * feeds exactly that many bytes of the buffer to the tty.  Counting
+     * arrived-but-not-moved bytes makes it hand the tty stale bytes and drop
+     * the ones that arrive next (visible as characters vanishing out of the
+     * middle of a typed line).
+     */
+    uint32_t rx_total;          /* bytes moved to DRAM since DMRX/read */
     bool rx_stale;              /* partial word waiting for the timeout */
     QEMUTimer *stale_timer;
 } IPQUart;
@@ -3190,44 +3530,91 @@ static void uart_stale_expire(void *opaque)
 
     UART_RX_LOG("%s stale timer: rx_count=%u dmen=%x\n", u->name,
                 u->rx_count, u->dmen);
-    if (!u->rx_count) {
-        return;
-    }
     /*
      * In DMA mode the hardware flushes its receive FIFO to the BAM after the
      * idle timeout; that flush is what completes the driver's receive
      * descriptor.  No FIFO interrupt is raised -- RXLEV/RXSTALE are masked by
-     * the driver while DMA is in use.
+     * the driver while DMA is in use.  This runs even with an empty FIFO: the
+     * bytes are already inside the descriptor the engine is filling, and the
+     * idle timeout is what retires it.
      */
     if (u->dmen & UART_DMEN_RX_BAM_ENABLE) {
-        bam_uart_rx_kick();
+        bam_uart_rx_idle();
+        return;
+    }
+    if (!u->rx_count) {
         return;
     }
     u->rx_stale = true;
     uart_update_irq(u);
 }
 
-static void uart_rx_push(IPQUart *u, const uint8_t *buf, size_t n)
+static void uart_rx_fill(IPQUart *u)
 {
-    size_t i;
+    bool moved = false;
 
-    for (i = 0; i < n; i++) {
-        if (u->rx_count >= UART_RX_FIFO_SIZE) {
-            break;
-        }
-        u->rxbuf[(u->rx_head + u->rx_count) % UART_RX_FIFO_SIZE] = buf[i];
-        u->rx_count++;
-        u->rx_total++;
+    if (!u) {
+        return;
     }
-    if (u->rx_count % 4 || (u->dmen & UART_DMEN_RX_BAM_ENABLE)) {
-        /*
-         * A partial word can only be delivered through RXSTALE, and in DMA
-         * mode the idle timeout is what flushes the last batch to memory.
-         */
+    if (u->in_fill) {
+        u->rx_again = true;             /* called back from the BAM move */
+        return;
+    }
+    u->in_fill = true;
+
+again:
+    u->rx_again = false;
+    while (u->rxq_count && u->rx_count < UART_RX_FIFO_SIZE) {
+        u->rxbuf[(u->rx_head + u->rx_count) % UART_RX_FIFO_SIZE] =
+            u->rxq[u->rxq_head];
+        u->rxq_head = (u->rxq_head + 1) % (unsigned)sizeof(u->rxq);
+        u->rxq_count--;
+        u->rx_count++;
+        moved = true;
+    }
+    if (moved) {
+        if (u->rx_count % 4 || (u->dmen & UART_DMEN_RX_BAM_ENABLE)) {
+            /*
+             * A partial word can only be delivered through RXSTALE, and in
+             * DMA mode the idle timeout is what flushes the last batch to
+             * memory.
+             */
+            timer_mod(u->stale_timer,
+                      qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + UART_RX_STALE_US);
+        }
+        uart_update_irq(u);
+        if (u->dmen & UART_DMEN_RX_BAM_ENABLE) {
+            /*
+             * The BAM may have drained the FIFO into a posted descriptor,
+             * which leaves room for the rest of the queued burst.
+             */
+            bam_uart_rx_kick();
+        }
+    }
+    if (u->rx_again && u->rxq_count && u->rx_count < UART_RX_FIFO_SIZE) {
+        moved = false;
+        goto again;
+    }
+    u->in_fill = false;
+}
+
+static void uart_rx_room(IPQUart *u);
+
+/* Called by the BAM when the driver posts a receive buffer. */
+static void bam_uart_rx_input_ready(void)
+{
+    uart_rx_fill(ipq_console_uart);
+}
+
+/* Run the idle timeout that retires a partially filled receive descriptor. */
+static void uart_rx_idle_arm(void)
+{
+    IPQUart *u = ipq_console_uart;
+
+    if (u) {
         timer_mod(u->stale_timer,
                   qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + UART_RX_STALE_US);
     }
-    uart_update_irq(u);
 }
 
 static void uart_rx_pop_byte(IPQUart *u, uint8_t *out)
@@ -3244,6 +3631,8 @@ static void uart_rx_pop_byte(IPQUart *u, uint8_t *out)
         timer_del(u->stale_timer);
     }
     uart_update_irq(u);
+    uart_rx_fill(u);
+    uart_rx_room(u);
 }
 
 static void uart_rx_pop(IPQUart *u, uint8_t *out)
@@ -3264,13 +3653,37 @@ static void uart_rx_pop(IPQUart *u, uint8_t *out)
         timer_del(u->stale_timer);
     }
     uart_update_irq(u);
+    uart_rx_fill(u);
+    uart_rx_room(u);
 }
 
 static int uart_can_receive(void *opaque)
 {
     IPQUart *u = opaque;
 
-    return UART_RX_FIFO_SIZE - u->rx_count;
+    /*
+     * Report the whole queue, not the FIFO: the FIFO is drained by the BAM as
+     * the guest consumes, and limiting the chardev to 64 bytes per read is
+     * what used to cut long command lines in half.
+     */
+    return (int)sizeof(u->rxq) - (int)u->rxq_count;
+}
+
+/*
+ * Tell the chardev there is room again.
+ *
+ * The chardev backend reads at most can_receive() bytes per read (the pty and
+ * stdio backends size their read from qemu_chr_be_can_write()), and it only
+ * asks again after the frontend calls qemu_chr_fe_accept_input().  Without
+ * this the backend stops reading the moment the 64-byte receive FIFO fills,
+ * so a burst longer than 64 bytes -- one pasted command line -- is truncated
+ * exactly at the FIFO boundary and the rest never arrives.
+ */
+static void uart_rx_room(IPQUart *u)
+{
+    if (u->rx_count < UART_RX_FIFO_SIZE) {
+        qemu_chr_fe_accept_input(&u->chr);
+    }
 }
 
 /* ---- BAM receive side (see the BAM section for the caller) ---- */
@@ -3303,16 +3716,33 @@ static size_t uart_bam_rx_pull(uint8_t *buf, size_t n)
         u->rx_stale = false;
         timer_del(u->stale_timer);
     }
+    /* The BAM just emptied (part of) the FIFO: top it up from the queue and
+     * let the host hand us more. */
+    uart_rx_fill(u);
+    uart_rx_room(u);
     return i;
+}
+
+/* Bytes the BAM receiver just wrote into the posted descriptor. */
+static void uart_bam_rx_account(size_t n)
+{
+    if (ipq_console_uart) {
+        ipq_console_uart->rx_total += n;
+    }
 }
 
 static void uart_receive(void *opaque, const uint8_t *buf, int size)
 {
     IPQUart *u = opaque;
+    int i;
 
     UART_RX_LOG("%s chardev delivered %d byte(s), first=%02x\n",
                 u->name, size, size ? buf[0] : 0);
-    uart_rx_push(u, buf, size);
+    for (i = 0; i < size && u->rxq_count < sizeof(u->rxq); i++) {
+        u->rxq[(u->rxq_head + u->rxq_count) % sizeof(u->rxq)] = buf[i];
+        u->rxq_count++;
+    }
+    uart_rx_fill(u);
     /*
      * With the BAM armed there is no FIFO interrupt to raise: the engine has
      * to move the bytes into the posted descriptor and retire it, which is
@@ -3480,6 +3910,9 @@ static void uart_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     case 0x10:                  /* CR: reset/tx/rx enable commands */
         u->cr = val;
         if ((val >> 4 & 0xf) == 1) {        /* RESET_RX */
+            if (u->dmen & UART_DMEN_RX_BAM_ENABLE) {
+                bam_uart_rx_idle();
+            }
             u->rx_head = u->rx_count = 0;
             u->rx_stale = false;
             timer_del(u->stale_timer);
@@ -3719,11 +4152,116 @@ static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
     return true;
 }
 
+/*
+ * Power-on reset of the modelled hardware.
+ *
+ * A system reset drops the SoC's state, and the boot chain depends on it: the
+ * second SBL1 run re-probes the SPI controller and the BAM assuming they are
+ * in their reset state, so leaving Linux's leftovers in the QUP's FIFOs makes
+ * boot_flash_init fail with a die that is perfectly fine.  The one thing that
+ * must survive is the flash array itself -- that is the point of a reboot.
+ */
+static void ipq4019_dev_reset(void *opaque)
+{
+    int i;
+
+    if (env_true("QEMU_IPQ_NO_DEV_RESET")) {
+        return;
+    }
+
+    if (qup_spi && !env_true("QEMU_IPQ_NO_RESET_QUP")) {
+        IPQQupl *q = qup_spi;
+        uint8_t *resp = q->resp;
+        uint32_t resp_cap = q->resp_cap;
+        qemu_irq irq = q->irq;
+
+        memset((char *)q + offsetof(IPQQupl, phase), 0,
+               sizeof(*q) - offsetof(IPQQupl, phase));
+        q->resp = resp;
+        q->resp_cap = resp_cap;
+        q->irq = irq;
+        memset(q->shadow, 0, sizeof(q->shadow));
+    }
+
+    if (ipq_blsp1_bam && !env_true("QEMU_IPQ_NO_RESET_BAM")) {
+        IPQBam *b = ipq_blsp1_bam;
+
+        memset(b->shadow, 0, b->nregs * sizeof(uint32_t));
+        memset(b->valid, 0, b->nregs);
+        for (i = 0; i < BAM_PIPE_COUNT; i++) {
+            BAMClient client = b->pipe[i].client;
+
+            memset(&b->pipe[i], 0, sizeof(b->pipe[i]));
+            b->pipe[i].client = client;
+        }
+        bam_seed_id(b);
+    }
+
+    if (ipq_console_uart && !env_true("QEMU_IPQ_NO_RESET_UART")) {
+        IPQUart *u = ipq_console_uart;
+
+        timer_del(u->stale_timer);
+        u->mr1 = u->mr2 = u->imr = u->cr = 0;
+        u->tfwr = u->rfwr = u->dmrx = u->dmen = u->ncf_tx = 0;
+        u->rx_head = u->rx_count = 0;
+        u->rxq_head = u->rxq_count = 0;
+        u->rx_total = 0;
+        u->rx_stale = false;
+        uart_update_irq(u);
+    }
+
+    if (ipq_mdio && !env_true("QEMU_IPQ_NO_RESET_MDIO")) {
+        ipq_mdio->mode = ipq_mdio->addr = ipq_mdio->wdata = 0;
+        ipq_mdio->rdata = ipq_mdio->cmd = 0;
+        for (i = 0; i < ipq_mdio->nphy; i++) {
+            phy_reset_regs(&ipq_mdio->phy[i]);
+        }
+    }
+
+    if (ipq_edma && !env_true("QEMU_IPQ_NO_RESET_EDMA")) {
+        memset(ipq_edma->regs, 0,
+               ipq_edma->nregs * sizeof(uint32_t));
+        memset(ipq_edma->tx_pkt, 0, sizeof(ipq_edma->tx_pkt));
+        memset(ipq_edma->tx_byte, 0, sizeof(ipq_edma->tx_byte));
+        memset(ipq_edma->tx_level, 0, sizeof(ipq_edma->tx_level));
+    }
+
+    if (!env_true("QEMU_IPQ_NO_RESET_STUBS")) {
+        for (i = 0; ipq_stub_list && i < (int)ipq_stub_list->len; i++) {
+            IPQStub *st = g_ptr_array_index(ipq_stub_list, i);
+
+            if (st->nregs) {
+                memset(st->shadow, 0, st->nregs * sizeof(uint32_t));
+                memset(st->valid, 0, st->nregs);
+            }
+            st->spin = 0;
+        }
+    }
+
+    if (ipq_pshold) {
+        ipq_pshold->val = 1;            /* rails back up */
+    }
+}
+
 static void ipq4019_reset(void *opaque)
 {
     ARMCPU *cpu = opaque;
     CPUARMState *env = &cpu->env;
     uint32_t entry = ipq4019_elf_entry ?: env_u32("QEMU_IPQ_ENTRY", 0);
+
+    /*
+     * Reset the CPU itself first.
+     *
+     * CPU objects sit on no bus, so nothing resets them during a system reset
+     * unless somebody asks: arm_load_kernel() registers do_cpu_reset() (which
+     * calls cpu_reset()) only on the path that loads a kernel, and this board
+     * places the SBL1 ELF itself instead.  Without this, a guest reboot or a
+     * monitor system_reset left SCTLR/VBAR/CNTVOFF exactly as the kernel had
+     * them, so the CPU began executing SBL1 with the MMU on and the old
+     * exception vectors live -- which shows up as a kernel oops at the SBL1
+     * entry point instead of a fresh boot log.
+     */
+    cpu_reset(CPU(cpu));
 
     /*
      * The IPQ40xx boot ROM leaves the PMU cycle counter running; RouterBOOT's
@@ -3987,7 +4525,15 @@ static void ipq4019_init(MachineState *machine)
     }
 
     add_stub(sysmem, IPQ_PRNG_BASE, 0x1000, "prng");
-    add_stub(sysmem, IPQ_PSHOLD_BASE, 0x1000, "pshold");
+    {
+        IPQPsHold *ps = g_new0(IPQPsHold, 1);
+        MemoryRegion *mr = g_new0(MemoryRegion, 1);
+
+        ps->val = 1;                    /* rails held up out of reset */
+        ipq_pshold = ps;
+        memory_region_init_io(mr, NULL, &pshold_ops, ps, "pshold", 0x1000);
+        memory_region_add_subregion(sysmem, IPQ_PSHOLD_BASE, mr);
+    }
     add_stub(sysmem, 0x400000, 0x1000, "ddr-ctl");
     add_stub(sysmem, 0x4a0000, 0x1000, "timer-ctl");
     /*
@@ -4042,8 +4588,15 @@ static void ipq4019_init(MachineState *machine)
          *                    0x101: parent DDRPLLAPSS, hid_div 1)
          */
         if (env_u32("QEMU_IPQ_PLL_SEED", 1)) {
-            stub_seed(gcc, 0x2f020, 0x037d0000u);
-            stub_seed(gcc, 0x2e020, 0x013800d0u);
+            /*
+             * Pinned, not seeded: these registers describe what the boot ROM
+             * programmed and what the OTP says, so they read the same before
+             * and after a warm reset.  A reset handler that cleared them made
+             * the second boot's cpufreq probe hit the BUG_ON above, which is
+             * exactly the failure this seeding exists to avoid.
+             */
+            stub_pin(gcc, 0x2f020, 0x037d0000u);
+            stub_pin(gcc, 0x2e020, 0x013800d0u);
         }
         /*
          * 0x2e000..0x2e02f is the APSS/DDR PLL divider block
@@ -4077,11 +4630,7 @@ static void ipq4019_init(MachineState *machine)
     bam = add_bam(sysmem, IPQ_BLSP1_BAM_BASE, IPQ_BLSP1_BAM_SIZE, "blsp1-bam");
     bam_wire_pipes(bam);
     ipq_blsp1_bam = bam;
-    bam->shadow[0x1000 >> 2] = (env_u32("QEMU_IPQ_BAM_EES", 4) << 8) |
-                               env_u32("QEMU_IPQ_BAM_VER", 7);
-    bam->valid[0x1000 >> 2] = 1;
-    bam->shadow[0x1008 >> 2] = env_u32("QEMU_IPQ_BAM_PIPES", 12);
-    bam->valid[0x1008 >> 2] = 1;
+    bam_seed_id(bam);
     add_qupl(sysmem, IPQ_QUP_BASE, 0x1000, "qup-spi");
     add_stub(sysmem, IPQ_QPIC_BASE, IPQ_QPIC_SIZE, "qpic-nand");
     /*
@@ -4490,6 +5039,7 @@ static void ipq4019_init(MachineState *machine)
     for (CPUState *cs = first_cpu; cs; cs = CPU_NEXT(cs)) {
         qemu_register_reset(ipq4019_reset, ARM_CPU(cs));
     }
+    qemu_register_reset(ipq4019_dev_reset, NULL);
 }
 
 static void ipq4019_machine_init(MachineClass *mc)
