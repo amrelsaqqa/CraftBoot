@@ -83,6 +83,7 @@
 #include "qemu/error-report.h"
 #include "chardev/char-fe.h"
 #include "hw/boards.h"
+#include "hw/irq.h"
 #include "hw/core/cpu.h"
 #include "hw/loader.h"
 #include "hw/arm/boot.h"
@@ -458,21 +459,48 @@ static IPQMem *add_mem(MemoryRegion *parent, hwaddr base, uint64_t size,
  * The die contents are the flash window itself, so anything the boot chain
  * reads here is exactly the byte the dump has at that offset.
  */
+#define QUP_REG_CONFIG       0x000
 #define QUP_REG_STATE        0x004
-#define QUP_REG_OPERATIONAL  0x018
-#define QUP_REG_IO_CONTROL   0x304
-#define QUP_REG_ERROR_FLAGS  0x01c
+#define QUP_REG_IO_MODES     0x008
 #define QUP_REG_SW_RESET     0x00c
+#define QUP_REG_OPERATIONAL  0x018
+#define QUP_REG_ERROR_FLAGS  0x01c
+#define QUP_REG_OP_MASK      0x028
+#define QUP_REG_HW_VERSION   0x030
+#define QUP_REG_MX_OUTPUT    0x100
+#define QUP_REG_MX_WRITE     0x150
+#define QUP_REG_MX_INPUT     0x200
+#define QUP_REG_MX_READ      0x208
+#define QUP_REG_IO_CONTROL   0x304
 #define QUP_OUT_FIFO         0x110
 #define QUP_IN_FIFO          0x218
 
 /* QUP_IO_CONTROL: the driver holds chip select with FORCE_CS (qca_qup_spi.h) */
 #define QUP_IO_CONTROL_FORCE_CS 0x800
 
-/* QUP_OPERATIONAL bits this model has to answer */
-#define QUP_OP_IN_FIFO_FULL  0x08   /* input FIFO full (never) */
-#define QUP_OP_OUT_FIFO_FULL 0x40   /* output FIFO full (never) */
-#define QUP_OP_IN_AVAILABLE  0x20   /* data available in the input FIFO */
+/* QUP_STATE values (QUP_STATE_MASK is the low two bits) */
+#define QUP_STATE_RESET      0
+#define QUP_STATE_RUN        1
+#define QUP_STATE_CLEAR      2
+#define QUP_STATE_PAUSE      3
+
+/* QUP_IO_M_MODES: output mode in bits 11:10, input mode in 13:12 */
+#define QUP_IO_M_MODE_FIFO   0
+#define QUP_IO_M_MODE_BLOCK  1
+#define QUP_IO_M_MODE_DMOV   2
+#define QUP_IO_M_MODE_BAM    3
+
+/* QUP_OPERATIONAL bits (spi-qup.c names) */
+#define QUP_OP_OUT_FIFO_NOT_EMPTY 0x10
+#define QUP_OP_IN_FIFO_NOT_EMPTY  0x20
+#define QUP_OP_OUT_FIFO_FULL      0x40
+#define QUP_OP_IN_FIFO_FULL       0x80
+#define QUP_OP_OUT_SERVICE_FLAG   0x100
+#define QUP_OP_IN_SERVICE_FLAG    0x200
+#define QUP_OP_MAX_OUTPUT_DONE    0x400
+#define QUP_OP_MAX_INPUT_DONE     0x800
+#define QUP_OP_OUT_BLOCK_WRITE_REQ 0x1000
+#define QUP_OP_IN_BLOCK_READ_REQ   0x2000
 
 typedef struct IPQQupl {
     MemoryRegion mr;
@@ -484,7 +512,9 @@ typedef struct IPQQupl {
     uint32_t addr;
     int addr_left;
     int dummy_left;
-    int cs;                 /* die selected (QUP_IO_CONTROL FORCE_CS) */
+    int cs;                 /* die selected: cs_force || cs_gpio */
+    int cs_force;           /* QUP_IO_CONTROL FORCE_CS (QCA boot drivers) */
+    int cs_gpio;            /* cs-gpios pin driven through the TLMM */
     int read_data;          /* stream data out of the flash */
     uint32_t rx_off;        /* next flash offset of the data stream */
     uint8_t rx_buf[8];      /* short replies: JEDEC id, status */
@@ -494,12 +524,36 @@ typedef struct IPQQupl {
     int write_sr;           /* next data byte lands in SR1 */
     uint32_t data_bytes;    /* bytes shifted out of this command's reply */
     uint32_t last_addr;     /* decoded address of the previous command */
+    /*
+     * Die state, not controller state: once 0xB7 (Enter 4-Byte Address Mode)
+     * has been accepted the flash keeps using four address bytes for the
+     * standard opcodes until 0xE9, even across chip-select edges.  Linux's
+     * spi-nor does exactly this on a >16 MiB die and then issues plain 0x03
+     * with a 32-bit address, so decoding that as three bytes silently shifts
+     * every read by one byte (0x00180000 became 0x00001800).
+     */
+    int addr4;
 
     /* MISO queue: one entry per byte clocked out, popped by FIFO reads */
-    uint8_t resp[4096];
+    uint8_t *resp;
     int resp_head;
     int resp_len;
+    uint32_t resp_cap;
     uint64_t clocked;
+
+    /*
+     * QUP transfer engine, as the Linux driver drives it: MX_*_CNT programs
+     * how many SPI words this transfer carries, the state machine runs it,
+     * and QUP_OPERATIONAL reports the FIFO/done flags the ISR polls.
+     */
+    uint32_t state;             /* QUP_STATE_RESET/RUN/PAUSE */
+    uint32_t op_mask;           /* QUP_OPERATIONAL_MASK */
+    uint32_t tx_bytes;          /* bytes written to the output FIFO */
+    uint32_t rx_bytes;          /* bytes read from the input FIFO */
+    uint32_t clocks;            /* bytes clocked out in this transfer */
+    uint32_t max_in_done;       /* sticky MAX_INPUT_DONE */
+    uint32_t max_out_done;      /* sticky MAX_OUTPUT_DONE */
+    qemu_irq irq;               /* SPI 95, level high */
 } IPQQupl;
 
 static IPQMem *ipq_flash;
@@ -507,6 +561,101 @@ static uint32_t ipq_flash_die_size = IPQ_FLASH_DEFAULT;
 static uint8_t ipq_flash_jedec[4] = { 0xef, 0x40, 0x19, 0x00 };
 static int ipq_flash_jedec_len = 3;
 static IPQQupl *qup_spi;         /* the one QUP the BAM pipes are wired to */
+
+/*
+ * QEMU_IPQ_DIE_LOG=1: a one-line summary per chip-select transaction, on
+ * stderr (unbuffered, so a killed run still shows it).  This is how the
+ * machine proves what the die actually shifted out for a given SPI command.
+ */
+static uint8_t die_dbg_first[8];
+static uint32_t die_dbg_n;
+
+/*
+ * Raw write(2) to a dedicated file: no stdio buffering and no dependence on
+ * where QEMU has pointed stderr, so a run that is killed later still has the
+ * whole trace on disk.
+ */
+static bool die_dbg_on(void);
+
+static void die_dbg_log(const char *fmt, ...)
+{
+    static int fd = -1;
+    char buf[320];
+    int n;
+    va_list ap;
+
+    if (fd < 0) {
+        const char *path = getenv("QEMU_IPQ_DIE_LOG");
+
+        if (!path || !*path) {
+            fd = -2;
+            return;
+        }
+        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            fd = -2;
+            return;
+        }
+    }
+    if (fd < 0) {
+        return;
+    }
+    va_start(ap, fmt);
+    n = snprintf(buf, sizeof(buf), "[%9.3f] ",
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1e9);
+    if (n > 0 && n < (int)sizeof(buf)) {
+        int m = vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+
+        if (m > 0) {
+            n += m;
+        }
+    }
+    va_end(ap);
+    if (n > 0) {
+        ssize_t r = write(fd, buf, MIN((size_t)n, sizeof(buf) - 1));
+        (void)r;
+    }
+}
+
+/*
+ * Mirror of what the guest writes to the UART, timestamped on the same clock
+ * as the die transactions.  Without this there is no way to tell which flash
+ * access belongs to which kernel message.
+ */
+static void die_dbg_ser(uint8_t c)
+{
+    static char line[256];
+    static unsigned n;
+
+    if (!die_dbg_on()) {
+        return;
+    }
+    if (c == '\r') {
+        return;
+    }
+    if (c == '\n' || n >= sizeof(line) - 1) {
+        line[n] = 0;
+        if (n) {
+            die_dbg_log("SER: %s\n", line);
+        }
+        n = 0;
+        return;
+    }
+    line[n++] = c;
+}
+
+static bool die_dbg_on(void)
+{
+    return getenv("QEMU_IPQ_DIE_LOG") != NULL;
+}
+
+static void die_dbg_note(uint8_t v)
+{
+    if (die_dbg_n < sizeof(die_dbg_first)) {
+        die_dbg_first[die_dbg_n] = v;
+    }
+    die_dbg_n++;
+}
 
 static uint8_t qup_flash_byte(uint32_t off)
 {
@@ -536,11 +685,11 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
     q->data_bytes = 0;
 
     switch (op) {
-    case 0x03:                          /* READ: 24-bit address */
-        q->addr_left = 3;
+    case 0x03:                          /* READ */
+        q->addr_left = q->addr4 ? 4 : 3;
         q->read_data = 1;
         break;
-    case 0x13:                          /* READ4B: 32-bit address */
+    case 0x13:                          /* READ4B: always 32-bit address */
         /*
          * RouterBOOT picks this opcode whenever the offset does not fit in 24
          * bits (see its flash_read() helper: it tests addr >> 24), so the
@@ -552,7 +701,7 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
         q->read_data = 1;
         break;
     case 0x0b:                          /* FAST_READ */
-        q->addr_left = 3;
+        q->addr_left = q->addr4 ? 4 : 3;
         q->dummy_left = 1;
         q->read_data = 1;
         break;
@@ -561,10 +710,23 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
         q->dummy_left = 1;
         q->read_data = 1;
         break;
-    case 0x5a:                          /* SFDP: 24-bit address + 1 dummy */
-        q->addr_left = 3;
+    case 0x6b:                          /* 1-4-4 FAST_READ */
+    case 0xeb:                          /* 1-4-4 FAST_READ (8 dummy) */
+    case 0xbb:                          /* 1-1-4 FAST_READ */
+        q->addr_left = q->addr4 ? 4 : 3;
         q->dummy_left = 1;
         q->read_data = 1;
+        break;
+    case 0x5a:                          /* SFDP: address + 1 dummy byte */
+        q->addr_left = q->addr4 ? 4 : 3;
+        q->dummy_left = 1;
+        q->read_data = 1;
+        break;
+    case 0xb7:                          /* Enter 4-Byte Address Mode */
+        q->addr4 = 1;
+        break;
+    case 0xe9:                          /* Exit 4-Byte Address Mode */
+        q->addr4 = 0;
         break;
     case 0x9f:                          /* RDID */
         /* Whatever die the board has: QEMU_IPQ_FLASH_JEDEC/_SIZE. */
@@ -630,6 +792,12 @@ static void qup_spi_byte(IPQQupl *q, uint8_t b)
             q->rx_off = q->addr;
             q->last_addr = q->addr;
             q->phase = q->dummy_left ? 2 : 3;
+            die_dbg_n = 0;
+            if (die_dbg_on()) {
+                die_dbg_log("die: xact op=0x%02x addr=0x%08x pc=%08x\n",
+                            q->opcode, q->addr,
+                            (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+            }
             if (env_true("QEMU_IPQ_SPI_LOG")) {
                 qemu_log_mask(LOG_UNIMP, "spi-cmd 0x%02x addr 0x%06x\n",
                               q->opcode, q->addr);
@@ -662,8 +830,11 @@ static uint8_t qup_miso(IPQQupl *q)
         return 0x00;
     }
     if (q->read_data) {
+        uint8_t v = qup_flash_byte(q->rx_off++ & (ipq_flash_die_size - 1));
+
         q->data_bytes++;
-        return qup_flash_byte(q->rx_off++ & (ipq_flash_die_size - 1));
+        die_dbg_note(v);
+        return v;
     }
     if (q->rx_pos < q->rx_len) {
         return q->rx_buf[q->rx_pos++];
@@ -681,33 +852,171 @@ static void qup_clock(IPQQupl *q, uint8_t mosi)
 {
     uint8_t miso = qup_miso(q);
 
-    if (q->resp_head + q->resp_len < (int)sizeof(q->resp)) {
+    if (die_dbg_on() && q->phase <= 2) {
+        die_dbg_log("die: mosi %02x phase=%d pc=%08x\n", mosi, q->phase,
+                    (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+    }
+
+    if (q->resp_head + q->resp_len < (int)q->resp_cap) {
         q->resp[q->resp_head + q->resp_len] = miso;
         q->resp_len++;
     }
     q->clocked++;
+    q->clocks++;
     qup_spi_byte(q, mosi);
 }
 
-static uint32_t qup_in_word(IPQQupl *q)
+/*
+ * Bytes per SPI word, from QUP_CONFIG[4:0] (bits_per_word - 1, as
+ * spi_qup_io_config() programs it).  QCA's boot drivers never touch the
+ * register, so the reset value has to mean one byte per word too.
+ */
+static uint32_t qup_wsize(IPQQupl *q)
 {
-    uint32_t v = 0xff;               /* FIFO idle level */
+    return DIV_ROUND_UP((q->shadow[QUP_REG_CONFIG / 4] & 0x1f) + 1, 8);
+}
 
-    if (q->resp_len > 0) {
-        v = q->resp[q->resp_head];
-        q->resp_head++;
-        q->resp_len--;
-        if (q->resp_len == 0) {
-            q->resp_head = 0;
+/* Data direction field of QUP_IO_M_MODES: 0 FIFO, 1 BLOCK, 2 DMOV, 3 BAM */
+static uint32_t qup_mode(IPQQupl *q)
+{
+    return (q->shadow[QUP_REG_IO_MODES / 4] >> 10) & 0x3;
+}
+
+/* How many SPI words this transfer is programmed to carry, in each direction */
+static uint32_t qup_exp_words(IPQQupl *q, int tx)
+{
+    switch (qup_mode(q)) {
+    case QUP_IO_M_MODE_FIFO:
+        return q->shadow[(tx ? QUP_REG_MX_WRITE : QUP_REG_MX_READ) / 4];
+    case QUP_IO_M_MODE_BLOCK:
+        return q->shadow[(tx ? QUP_REG_MX_OUTPUT : QUP_REG_MX_INPUT) / 4];
+    default:
+        /* BAM: only the input count survives the driver's programming */
+        return tx ? 0 : q->shadow[QUP_REG_MX_INPUT / 4];
+    }
+}
+
+/*
+ * QUP_OPERATIONAL.
+ *
+ * The FIFO status bits are level and derived from the current occupancy --
+ * this model clocks a byte the moment software hands it to the output FIFO,
+ * so "room left" is always true and the input FIFO holds whatever the die
+ * shifted out and nobody has read yet.  MAX_*_DONE are sticky events, and
+ * the interrupt line is the OR of the unmasked service flags plus
+ * MAX_INPUT_DONE (see qup_update_irq()).
+ */
+static uint32_t qup_operational(IPQQupl *q)
+{
+    uint32_t ws = qup_wsize(q);
+    uint32_t mode = qup_mode(q);
+    uint32_t exp_tx = qup_exp_words(q, 1) * ws;
+    uint32_t exp_rx = qup_exp_words(q, 0) * ws;
+    uint32_t v = 0;
+    int running = q->state == QUP_STATE_RUN;
+
+    /*
+     * FIFO occupancy is reported whatever the state machine is doing.  QCA's
+     * boot drivers poll it straight after writing a byte and never program
+     * QUP_STATE at all, so gating it on RUN would hang the flash probe.
+     */
+    if (q->resp_len >= (int)ws) {
+        v |= QUP_OP_IN_FIFO_NOT_EMPTY;
+        if (mode == QUP_IO_M_MODE_BLOCK) {
+            v |= QUP_OP_IN_BLOCK_READ_REQ;
         }
+    }
+    if (running && q->tx_bytes < exp_tx) {
+        v |= QUP_OP_OUT_SERVICE_FLAG;
+        if (mode == QUP_IO_M_MODE_BLOCK) {
+            v |= QUP_OP_OUT_BLOCK_WRITE_REQ;
+        }
+    }
+    if (running && q->resp_len >= (int)ws) {
+        v |= QUP_OP_IN_SERVICE_FLAG;
+    }
+    if (q->max_out_done) {
+        v |= QUP_OP_MAX_OUTPUT_DONE;
+    }
+    if (q->max_in_done) {
+        v |= QUP_OP_MAX_INPUT_DONE;
     }
     return v;
 }
 
-static uint32_t qup_operational(IPQQupl *q)
+/*
+ * Level-sensitive interrupt: asserted while an unmasked service flag or
+ * MAX_INPUT_DONE is pending.  MAX_OUTPUT_DONE is deliberately not wired --
+ * the driver never looks at it, and in PIO mode it stays set after the last
+ * byte was queued, which would leave the line stuck high.
+ */
+static void qup_update_irq(IPQQupl *q)
 {
-    /* only input-available matters: room in/out is always reported */
-    return q->resp_len > 0 ? QUP_OP_IN_AVAILABLE : 0;
+    uint32_t op = qup_operational(q);
+    uint32_t bits = op & (QUP_OP_IN_SERVICE_FLAG | QUP_OP_OUT_SERVICE_FLAG |
+                          QUP_OP_MAX_INPUT_DONE);
+
+    qemu_set_irq(q->irq, (bits & ~q->op_mask) != 0);
+}
+
+/* Raise the sticky completion bits once the programmed counts are reached */
+static void qup_update_done(IPQQupl *q)
+{
+    uint32_t ws = qup_wsize(q);
+    uint32_t exp_tx = qup_exp_words(q, 1) * ws;
+    uint32_t exp_rx = qup_exp_words(q, 0) * ws;
+
+    if (q->state != QUP_STATE_RUN) {
+        return;
+    }
+    if (exp_tx && q->tx_bytes >= exp_tx) {
+        q->max_out_done = 1;
+    }
+    /*
+     * MAX_INPUT_DONE is only an interrupt source when the service flag is
+     * masked out, i.e. in BAM/DMOV mode -- that is the only completion
+     * signal dma transfers get from the QUP.  In PIO mode the driver reads
+     * the FIFO on IN_SERVICE_FLAG and completes there, and a sticky
+     * MAX_INPUT_DONE it never clears would leave the line stuck high.
+     */
+    if (exp_rx && q->clocks >= exp_rx &&
+        (q->op_mask & QUP_OP_IN_SERVICE_FLAG)) {
+        q->max_in_done = 1;
+    }
+}
+
+/* One SPI word out of the input FIFO, bytes packed big-endian in the word */
+static uint32_t qup_in_word(IPQQupl *q)
+{
+    uint32_t ws = qup_wsize(q);
+    uint32_t v = 0;
+    uint32_t i;
+
+    if (q->resp_len <= 0) {
+        return 0xff;                 /* FIFO idle level */
+    }
+    for (i = 0; i < ws; i++) {
+        uint8_t b = 0xff;
+
+        if (q->resp_len > 0) {
+            b = q->resp[q->resp_head++];
+            q->resp_len--;
+            q->rx_bytes++;
+        }
+        /*
+         * Linux's spi_qup_read_from_fifo() pulls byte i from shift
+         * 8 * (w_size - i - 1), so the word carries w_size bytes
+         * big-endian; with one byte per word that is the low byte, which
+         * is also the lane QCA's boot drivers read.
+         */
+        v |= (uint32_t)b << (8 * (ws - 1 - i));
+    }
+    if (q->resp_len == 0) {
+        q->resp_head = 0;
+        /* MAX_INPUT_DONE is an event: it clears once the FIFO is drained */
+        q->max_in_done = 0;
+    }
+    return v;
 }
 
 static uint64_t qupl_read(void *opaque, hwaddr off, unsigned size)
@@ -725,7 +1034,18 @@ static uint64_t qupl_read(void *opaque, hwaddr off, unsigned size)
         v = qup_operational(q);
         break;
     case QUP_REG_ERROR_FLAGS:
+    case 0x308:                    /* SPI_ERROR_FLAGS: no clock under/overrun */
         v = 0;
+        break;
+    case 0x30c:                    /* SPI_ERROR_FLAGS_EN, writable */
+    case QUP_REG_CONFIG:
+    case QUP_REG_IO_MODES:
+    case QUP_REG_OP_MASK:
+    case QUP_REG_MX_OUTPUT:
+    case QUP_REG_MX_WRITE:
+    case QUP_REG_MX_INPUT:
+    case QUP_REG_MX_READ:
+        v = idx < ARRAY_SIZE(q->shadow) ? q->shadow[idx] : 0;
         break;
     case QUP_REG_SW_RESET:
         v = 0;                     /* self-clearing */
@@ -735,6 +1055,7 @@ static uint64_t qupl_read(void *opaque, hwaddr off, unsigned size)
     case QUP_IN_FIFO + 8:
     case QUP_IN_FIFO + 0xc:
         v = qup_in_word(q);
+        qup_update_irq(q);
         break;
     default:
         v = idx < ARRAY_SIZE(q->shadow) ? q->shadow[idx] : 0;
@@ -769,10 +1090,52 @@ static void qup_bus_reset(IPQQupl *q)
     qup_fifo_flush(q);
 }
 
+/*
+ * The die has exactly one chip select, driven from two places depending on
+ * who is talking to the QUP: QCA's boot drivers poke FORCE_CS in
+ * SPI_IO_CONTROL, while Linux uses the gpio descriptor from cs-gpios and
+ * leaves SPI_IO_CONTROL alone.  Both are ORed into the same pin, and an edge
+ * of the result is what starts or ends a die-level transaction.
+ */
+static void qup_cs_source(IPQQupl *q, int *src, int level)
+{
+    int cs;
+
+    if (*src == level) {
+        return;
+    }
+    *src = level;
+    cs = q->cs_force || q->cs_gpio;
+    if (cs != q->cs) {
+        q->cs = cs;
+        if (die_dbg_on()) {
+            /*
+             * "sel" is the assertion state of the NOR's chip select, not its
+             * index: the die sits on CS0 and CS0 is active low, so sel=1
+             * means CS0 is driven low and the die is listening.  The line
+             * itself is printed by the pin54 tracer above.
+             */
+            die_dbg_log("die: cs0 sel=%d op=0x%02x addr=0x%08x n=%u"
+                        " first=%02x %02x %02x %02x\n", cs, qup_spi->opcode,
+                        qup_spi->last_addr, die_dbg_n,
+                        die_dbg_first[0], die_dbg_first[1],
+                        die_dbg_first[2], die_dbg_first[3]);
+        }
+        qup_bus_reset(q);
+    }
+}
+
 static void qupl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 {
     IPQQupl *q = opaque;
     uint32_t idx = off >> 2;
+
+    if (die_dbg_on()) {
+        die_dbg_log("die: qup-w off=0x%03x val=0x%08x size=%u cs=%d state=%u"
+                    " pc=%08x\n",
+                    (unsigned)off, (uint32_t)val, size, q->cs, q->state,
+                    (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+    }
 
     if (env_true("QEMU_IPQ_TRACE")) {
         qemu_log_mask(LOG_UNIMP, "qup-spi: write off 0x%03" HWADDR_PRIx
@@ -790,39 +1153,221 @@ static void qupl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
          * spi_xfer(), so a CS edge -- not a QUP state write -- is what starts
          * and ends a die-level SPI transaction.
          */
-        int assert = (val & QUP_IO_CONTROL_FORCE_CS) != 0;
-
-        if (assert != q->cs) {
-            q->cs = assert;
-            qup_bus_reset(q);
-        }
+        qup_cs_source(q, &q->cs_force,
+                      (val & QUP_IO_CONTROL_FORCE_CS) != 0);
     }
-    if (off == QUP_REG_STATE && (val & 0x3) == 0) {
-        /*
-         * QUP state RESET flushes the input FIFO on real hardware.  The die
-         * itself only loses the transaction when chip select drops with it;
-         * while FORCE_CS holds CS low there is no CS edge, so a reset between
-         * the command and data phase (U-Boot does exactly that) keeps the
-         * command in progress -- only the stale command-phase MISO bytes go.
-         */
-        qup_fifo_flush(q);
-        if (!q->cs) {
-            qup_bus_reset(q);
+    if (off == QUP_REG_STATE) {
+        uint32_t st = val & 0x3;
+
+        if (st == QUP_STATE_CLEAR) {
+            st = QUP_STATE_RESET;      /* PAUSE -> CLEAR -> RESET */
         }
+        if (st == QUP_STATE_RESET) {
+            /*
+             * State RESET flushes the input FIFO and abandons the programmed
+             * counts.  The die itself only loses the transaction when chip
+             * select drops with it; while FORCE_CS holds CS low there is no
+             * CS edge, so a reset between the command and data phase (U-Boot
+             * does exactly that) keeps the command in progress -- only the
+             * stale command-phase MISO bytes go.
+             */
+            q->state = QUP_STATE_RESET;
+            q->tx_bytes = q->rx_bytes = q->clocks = 0;
+            q->max_in_done = q->max_out_done = 0;
+            qup_fifo_flush(q);
+            if (!q->cs) {
+                qup_bus_reset(q);
+            }
+        } else {
+            q->state = st;
+            qup_update_done(q);
+        }
+        qup_update_irq(q);
+        return;
+    }
+    if (off == QUP_REG_OPERATIONAL) {
+        /*
+         * Write-one-to-clear for the event bits the ISR acknowledges:
+         * IN_SERVICE_FLAG, OUT_SERVICE_FLAG and MAX_INPUT_DONE.  The level
+         * bits (FIFO status, block requests) are not writable.
+         */
+        if (val & QUP_OP_IN_SERVICE_FLAG) {
+            q->max_in_done = 0;
+        }
+        if (val & QUP_OP_MAX_INPUT_DONE) {
+            q->max_in_done = 0;
+        }
+        if (val & QUP_OP_MAX_OUTPUT_DONE) {
+            q->max_out_done = 0;
+        }
+        qup_update_irq(q);
+        return;
+    }
+    if (off == QUP_REG_OP_MASK) {
+        q->op_mask = val;
+        qup_update_irq(q);
+        return;
     }
     if (off >= QUP_OUT_FIFO && off < QUP_OUT_FIFO + 0x40) {
         /*
-         * Byte packing: the driver does `ldrb r3,[buf],#1; str r3,[fifo]`, so
-         * a 32-bit store carries exactly one SPI byte and the read side pops
-         * one byte per load.  Do not unpack size bytes here -- that inserted
-         * three phantom zeros after every real byte.
+         * Byte packing.  Two masters write here and they disagree about the
+         * lane: QCA's boot drivers do `ldrb r3,[buf],#1; str r3,[fifo]` (byte
+         * in 7:0), while Linux's spi_qup_write_to_fifo() shifts by
+         * 8 * (3 - i) (byte in 31:24).  A low byte of zero with something in
+         * the top byte can only be the Linux lane, so use that to tell them
+         * apart; every other case is the QCA lane the boot chain needs.
          */
-        qup_clock(q, val & 0xff);
+        uint32_t ws = qup_wsize(q);
+        uint32_t i;
+
+        if (ws == 1) {
+            uint8_t b = ((val & 0xff) == 0 && (val & 0xff000000)) ?
+                        (uint8_t)(val >> 24) : (uint8_t)val;
+
+            if (die_dbg_on()) {
+                die_dbg_log("die: fifo-tx 0x%08x -> byte 0x%02x\n",
+                            (uint32_t)val, b);
+            }
+            qup_clock(q, b);
+        } else {
+            for (i = 0; i < ws; i++) {
+                qup_clock(q, (val >> (8 * (3 - i))) & 0xff);
+            }
+        }
+        q->tx_bytes += ws;
+        qup_update_done(q);
+        qup_update_irq(q);
         return;
     }
     if (idx < ARRAY_SIZE(q->shadow)) {
         q->shadow[idx] = val;
     }
+    if (off == QUP_REG_CONFIG || off == QUP_REG_IO_MODES) {
+        qup_update_done(q);
+        qup_update_irq(q);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* TLMM GPIO/pinctrl                                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The pin controller is a wall of 0x1000-byte per-pin register blocks:
+ *
+ *   0x000 + 0x1000 * pin   CTL      mux[3:2], pull[1:0], drive[8:6], OE[9]
+ *   0x004 + 0x1000 * pin   IO       in[0], out[1], interrupt config above
+ *   0x008 + 0x1000 * pin   INTR_CFG / INTR_TARGET
+ *   0x00c + 0x1000 * pin   INTR_STATUS
+ *
+ * (pinctrl-ipq4019.c: .ctl_reg = 0x1000 * id, .io_reg = 0x4 + 0x1000 * id.)
+ *
+ * Only one bit in this block is load-bearing for the machine: the SPI NOR
+ * chip select.  The OpenWrt DTS describes it as
+ *
+ *     cs-gpios = <&tlmm 54 GPIO_ACTIVE_LOW>;
+ *
+ * so the SPI core leaves host->set_cs alone and drives pin 54 through
+ * gpiolib instead.  Modelling the IO register is therefore what gives the
+ * flashing die its chip-select edges: without it every QUP state RESET would
+ * have to be guessed as a transaction boundary, and one SPI message with a
+ * separate command and data transfer (which is exactly how spi-mem issues a
+ * read) would be chopped in half.
+ *
+ * The rest of the block only needs to read back what was written: gpiolib
+ * does read-modify-writes on these registers.
+ */
+#define IPQ_TLMM_IO_OFFSET   0x004u
+#define IPQ_TLMM_IO_OUT_BIT  1
+
+typedef struct IPQTLMM {
+    MemoryRegion mr;
+    uint32_t *regs;
+    uint32_t nregs;
+} IPQTLMM;
+
+static IPQTLMM *ipq_tlmm;
+static unsigned ipq_tlmm_cs_pin = 54;
+
+/* Chip select changed: an active-low CS edge starts/ends a die transaction. */
+static void ipq_tlmm_cs_changed(void)
+{
+    IPQTLMM *t = ipq_tlmm;
+    uint32_t v;
+    int assert;
+
+    if (!t || !qup_spi || t->nregs <= ipq_tlmm_cs_pin * 0x400 + 1) {
+        return;
+    }
+    v = t->regs[(ipq_tlmm_cs_pin * 0x1000 + IPQ_TLMM_IO_OFFSET) >> 2];
+    /* GPIO_ACTIVE_LOW: the pin low is the asserted chip select */
+    assert = !((v >> IPQ_TLMM_IO_OUT_BIT) & 1);
+    if (die_dbg_on()) {
+        die_dbg_log("die: pin%u io=0x%08x cs-gpio=%d\n",
+                    ipq_tlmm_cs_pin, v, assert);
+    }
+    qup_cs_source(qup_spi, &qup_spi->cs_gpio, assert);
+}
+
+static uint64_t tlmm_read(void *opaque, hwaddr off, unsigned size)
+{
+    IPQTLMM *t = opaque;
+    uint32_t idx = off >> 2;
+    uint32_t v = idx < t->nregs ? t->regs[idx] : 0xffffffffu;
+
+    if (env_true("QEMU_IPQ_TRACE")) {
+        qemu_log_mask(LOG_UNIMP, "tlmm: read  off 0x%06" HWADDR_PRIx
+                      " -> 0x%08x\n", off, v);
+    }
+    return v;
+}
+
+static void tlmm_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    IPQTLMM *t = opaque;
+    uint32_t idx = off >> 2;
+    unsigned pin = off >> 12;
+
+    if (env_true("QEMU_IPQ_TRACE")) {
+        qemu_log_mask(LOG_UNIMP, "tlmm: write off 0x%06" HWADDR_PRIx
+                      " <- 0x%08" PRIx64 "\n", off, val);
+    }
+    if (idx < t->nregs) {
+        t->regs[idx] = val;
+    }
+    if ((off & 0xfff) == IPQ_TLMM_IO_OFFSET && pin == ipq_tlmm_cs_pin) {
+        ipq_tlmm_cs_changed();
+    }
+}
+
+static const MemoryRegionOps tlmm_ops = {
+    .read = tlmm_read,
+    .write = tlmm_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+static void add_tlmm(MemoryRegion *parent, hwaddr base, hwaddr size,
+                     const char *name)
+{
+    IPQTLMM *t = g_new0(IPQTLMM, 1);
+    uint32_t i;
+
+    t->nregs = size >> 2;
+    t->regs = g_new0(uint32_t, t->nregs);
+    /*
+     * Unimplemented pins answer ~0 exactly like the decode-only stub this
+     * replaced: the kernel only ever touches the pins its own pinctrl state
+     * describes, and the GPIO_IO reset value of all ones keeps every chip
+     * select deasserted until gpiolib drives it.
+     */
+    for (i = 0; i < t->nregs; i++) {
+        t->regs[i] = 0xffffffffu;
+    }
+    memory_region_init_io(&t->mr, NULL, &tlmm_ops, t, name, size);
+    memory_region_add_subregion(parent, base, &t->mr);
+    ipq_tlmm = t;
 }
 
 static const MemoryRegionOps qupl_ops = {
@@ -838,6 +1383,13 @@ static IPQQupl *add_qupl(MemoryRegion *parent, hwaddr base, hwaddr size,
 {
     IPQQupl *q = g_new0(IPQQupl, 1);
 
+    /*
+     * A whole SPI_MAX_XFER (64 KiB) of MISO has to fit: in BLOCK mode the
+     * driver hands the QUP every byte of a flash read in one go, and this
+     * model shifts the reply into the queue as the bytes go out.
+     */
+    q->resp_cap = 1u << 17;
+    q->resp = g_new0(uint8_t, q->resp_cap);
     /* QUP configuration registers come up cleared, not "nothing here" */
     memory_region_init_io(&q->mr, NULL, &qupl_ops, q, name, size);
     memory_region_add_subregion(parent, base, &q->mr);
@@ -896,6 +1448,11 @@ static IPQQupl *add_qupl(MemoryRegion *parent, hwaddr base, hwaddr size,
 #define BAM_P_DESC_FIFO_ADDR 0x81cu  /* BAM_P_DESC_FIFO_ADDRn */
 #define BAM_P_FIFO_SIZES     0x820u  /* BAM_P_FIFO_SIZESn    */
 
+/*
+ * { u32 addr; u16 size; u16 flags } -- the layout QCA's bam.h documents and the
+ * one Linux's struct bam_desc_hw uses.  The length is the 16-bit size field;
+ * bits 16.. are flags (EOT/INT/NWD/CMD) and must not end up in the count.
+ */
 #define BAM_DESC_SIZE       8u
 #define BAM_DESC_LEN_MASK   0x000fffffu
 
@@ -928,7 +1485,28 @@ static IPQQupl *add_qupl(MemoryRegion *parent, hwaddr base, hwaddr size,
 #define BAM_EV_PIPE_BUSY    0x00020000u
 #define BAM_EV_COMPLETE     0x00100000u
 
+/*
+ * Which peripheral a BAM pipe is wired to.  The SoC fixes this in silicon (the
+ * BLSP routes each QUP to a pipe pair) and the board DTB spells it out with
+ * "dmas"/"dma-names": on the IPQ40xx the console UART is pipes 0 (tx) / 1 (rx)
+ * and the SPI the boot flash hangs off is pipes 4 (tx) / 5 (rx).
+ *
+ * This matters because the flash die must only ever be driven by the pipe that
+ * really carries SPI.  The kernel's console driver keeps a serial RX transfer
+ * queued on pipe 1 at all times -- completing it against the SPI die invents
+ * SPI clocks on the wire (opcode 0x00, address 0x000000, ...) and leaves the
+ * die in the middle of a bogus transaction, which is exactly how a perfectly
+ * good rootfs read can come back as zeros.
+ */
+typedef enum {
+    BAM_CLIENT_NONE,            /* no data source: leave the ring alone */
+    BAM_CLIENT_SPI,             /* talk to the QUP SPI (the NOR die) */
+    BAM_CLIENT_UART_TX,         /* push bytes to the serial backend */
+    BAM_CLIENT_UART_RX,         /* wait for console input */
+} BAMClient;
+
 typedef struct IPQBamPipe {
+    BAMClient client;
     uint32_t ctrl;
     uint32_t event;
     uint32_t irq_stts;          /* BAM_P_IRQ_STTSn */
@@ -947,8 +1525,72 @@ typedef struct IPQBam {
     uint8_t *valid;
     uint32_t nregs;
     uint32_t irq_srcs_msk;      /* BAM_IRQ_SRCS_MSK of EE0 */
+    qemu_irq irq;               /* SPI 238, level high */
     IPQBamPipe pipe[BAM_PIPE_COUNT];
 } IPQBam;
+
+/*
+ * Pipe wiring: which peripheral each BAM pipe belongs to.  Defaults are the
+ * IPQ40xx BLSP layout used by every ipq40xx board's boot flash and console
+ * (console UART = 0/1, boot SPI = 4/5); QEMU_IPQ_BAM_SPI_PIPES and
+ * QEMU_IPQ_BAM_UART_PIPES override them for a board that wires them
+ * differently.
+ */
+static void bam_set_pipe_list(IPQBam *b, const char *env, BAMClient client)
+{
+    const char *spec = getenv(env);
+    const char *p;
+
+    if (!spec || !*spec) {
+        return;
+    }
+    for (p = spec; *p; ) {
+        long n;
+        char *end;
+
+        n = strtol(p, &end, 0);
+        if (end == p) {
+            break;
+        }
+        if (n >= 0 && n < BAM_PIPE_COUNT) {
+            b->pipe[n].client = client;
+        }
+        p = (*end == ',') ? end + 1 : end;
+    }
+}
+
+static void bam_wire_pipes(IPQBam *b)
+{
+    static const int spi_default[] = { 4, 5 };
+    static const int uart_default[] = { 0, 1 };
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(spi_default); i++) {
+        b->pipe[spi_default[i]].client = BAM_CLIENT_SPI;
+    }
+    /* Console UART: tx goes out to the backend, rx waits for input. */
+    b->pipe[uart_default[0]].client = BAM_CLIENT_UART_TX;
+    b->pipe[uart_default[1]].client = BAM_CLIENT_UART_RX;
+
+    if (getenv("QEMU_IPQ_BAM_SPI_PIPES") ||
+        getenv("QEMU_IPQ_BAM_UART_PIPES")) {
+        for (i = 0; i < BAM_PIPE_COUNT; i++) {
+            b->pipe[i].client = BAM_CLIENT_NONE;
+        }
+        if (!getenv("QEMU_IPQ_BAM_SPI_PIPES")) {
+            for (i = 0; i < ARRAY_SIZE(spi_default); i++) {
+                b->pipe[spi_default[i]].client = BAM_CLIENT_SPI;
+            }
+        }
+        if (!getenv("QEMU_IPQ_BAM_UART_PIPES")) {
+            b->pipe[uart_default[0]].client = BAM_CLIENT_UART_TX;
+            b->pipe[uart_default[1]].client = BAM_CLIENT_UART_RX;
+        }
+    }
+    bam_set_pipe_list(b, "QEMU_IPQ_BAM_SPI_PIPES", BAM_CLIENT_SPI);
+    bam_set_pipe_list(b, "QEMU_IPQ_BAM_UART_PIPES", BAM_CLIENT_UART_TX);
+}
+
 
 /* BAM-side FIFO access: the same datapath the CPU uses, one byte per access */
 static void qup_bam_tx(IPQQupl *q, uint8_t b)
@@ -970,6 +1612,8 @@ static uint8_t qup_bam_rx(IPQQupl *q)
     return (uint8_t)qup_in_word(q);
 }
 
+static void bam_update_irq(IPQBam *b);
+
 static bool bam_pipe_lookup(hwaddr off, int *n, hwaddr *roff)
 {
     if (off < BAM_PIPE_FIRST || off >= IPQ_BLSP1_BAM_SIZE) {
@@ -980,11 +1624,44 @@ static bool bam_pipe_lookup(hwaddr off, int *n, hwaddr *roff)
     return *n < BAM_PIPE_COUNT;
 }
 
+/* Defined with the UART model; lets the BAM TX pipe drive the same backend. */
+static void uart_bam_write(const uint8_t *buf, size_t n);
+
+static const char *bam_client_name(BAMClient c, uint32_t ctrl)
+{
+    switch (c) {
+    case BAM_CLIENT_SPI:
+        return "spi";
+    case BAM_CLIENT_UART_TX:
+        return "uart-tx";
+    case BAM_CLIENT_UART_RX:
+        return "uart-rx";
+    default:
+        return "idle";
+    }
+}
+
 static void bam_pipe_xfer(IPQBam *b, int n, uint32_t addr, uint32_t len)
 {
     IPQBamPipe *p = &b->pipe[n];
     uint32_t done, i;
     uint8_t buf[256];
+
+    if (p->client == BAM_CLIENT_UART_TX) {
+        /*
+         * Console output: hand the queued bytes to the serial backend.  The
+         * driver maps them for DMA, so they only reach the wire through this
+         * pipe.
+         */
+        for (done = 0; done < len; done += i) {
+            i = MIN(len - done, (uint32_t)sizeof(buf));
+            address_space_read(&address_space_memory, addr + done,
+                               MEMTXATTRS_UNSPECIFIED, buf, i);
+            uart_bam_write(buf, i);
+        }
+        p->bytes += len;
+        return;
+    }
 
     if (!qup_spi) {
         return;
@@ -1026,6 +1703,16 @@ static void bam_pipe_run(IPQBam *b, int n)
     if (!p->ring_base || !p->ring_size) {
         return;
     }
+    /*
+     * A pipe with no client has no data to move: on real hardware its
+     * descriptors simply stay in the FIFO until the peripheral has something.
+     * Left queued (and uncompleted) here too, so software sees exactly what it
+     * would see on the board -- and, more importantly, nothing else in the
+     * machine believes a transfer happened.
+     */
+    if (p->client == BAM_CLIENT_NONE || p->client == BAM_CLIENT_UART_RX) {
+        return;
+    }
     while (p->cons != p->prod && guard++ < 4096) {
         uint32_t d[2];
         uint32_t addr, ctrl, len;
@@ -1047,6 +1734,25 @@ static void bam_pipe_run(IPQBam *b, int n)
         if (len == 0) {
             continue;
         }
+        if (die_dbg_on()) {
+            uint8_t head[8] = { 0 };
+            int hn = MIN(len, (uint32_t)sizeof(head));
+            int k;
+
+            if (!(p->ctrl & BAM_CTRL_DIR_BAM2SYS)) {
+                address_space_read(&address_space_memory, addr,
+                                   MEMTXATTRS_UNSPECIFIED, head, hn);
+            }
+            die_dbg_log("die: bam desc pipe=%d %s addr=0x%08x len=%u"
+                        " pc=%08x head=", n,
+                        (p->ctrl & BAM_CTRL_DIR_BAM2SYS) ? "qup->ram" :
+                        "ram->qup", addr, len,
+                        (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+            for (k = 0; k < 8; k++) {
+                die_dbg_log("%02x", head[k]);
+            }
+            die_dbg_log("\n");
+        }
         bam_pipe_xfer(b, n, addr, len);
         if (env_true("QEMU_IPQ_SPI_LOG")) {
             qemu_log_mask(LOG_UNIMP, "bam-xfer pipe %d %s 0x%08x %u bytes\n",
@@ -1059,6 +1765,7 @@ static void bam_pipe_run(IPQBam *b, int n)
     }
     p->event |= env_u32("QEMU_IPQ_BAM_EVENT", BAM_EV_COMPLETE);
     p->irq_stts |= BAM_P_IRQ_PRCSD_DESC | BAM_P_IRQ_TRNSFR_END;
+    bam_update_irq(b);
 }
 
 /* Per-pipe interrupt sources, as EE0 sees them (BAM_IRQ_SRCS). */
@@ -1073,6 +1780,16 @@ static uint32_t bam_irq_srcs(IPQBam *b)
         }
     }
     return v;
+}
+
+/*
+ * The global line is the AND of the per-pipe sources with the per-EE mask
+ * (BAM_IRQ_SRCS_MSK), level-high.  Linux's bam_dma expects it to stay
+ * asserted until it has cleared every pipe's BAM_P_IRQ_STTS.
+ */
+static void bam_update_irq(IPQBam *b)
+{
+    qemu_set_irq(b->irq, (bam_irq_srcs(b) & b->irq_srcs_msk) != 0);
 }
 
 /*
@@ -1112,8 +1829,13 @@ static uint64_t bam_read(void *opaque, hwaddr off, unsigned size)
         case BAM_P_IRQ_STTS:        v = p->irq_stts; break;
         case BAM_P_IRQ_EN:          v = p->irq_en; break;
         case BAM_P_EVENT:           v = p->event; break;
-        case BAM_P_SW_OFSTS:        v = p->cons; break;
         case BAM_P_EVNT_REG:        v = p->prod; break;
+        case BAM_P_SW_OFSTS:
+            v = p->cons;
+            if (die_dbg_on()) {
+                die_dbg_log("die: bam sw_ofsts read pipe=%d -> 0x%x\n", n, v);
+            }
+            break;
         case BAM_P_DESC_FIFO_ADDR:  v = p->ring_base; break;
         case BAM_P_FIFO_SIZES:      v = p->ring_size; break;
         default:
@@ -1154,6 +1876,7 @@ static void bam_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     }
     if (off == BAM_IRQ_SRCS_MSK) {
         b->irq_srcs_msk = val;
+        bam_update_irq(b);
         return;
     }
     if (!bam_pipe_lookup(off, &n, &roff)) {
@@ -1171,26 +1894,56 @@ static void bam_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             b->pipe[n].irq_stts = 0;
             b->pipe[n].prod = 0;
             b->pipe[n].cons = 0;
+            bam_update_irq(b);
         }
         break;
     case BAM_P_IRQ_CLR:
         b->pipe[n].irq_stts &= ~(uint32_t)val;   /* write-one-to-clear */
+        bam_update_irq(b);
         break;
     case BAM_P_IRQ_EN:
         b->pipe[n].irq_en = val;
+        bam_update_irq(b);
         break;
     case BAM_P_EVENT:
         b->pipe[n].event &= val;                /* write-one-to-clear */
         break;
     case BAM_P_DESC_FIFO_ADDR:
         b->pipe[n].ring_base = val;
+        if (die_dbg_on()) {
+            die_dbg_log("die: bam ring pipe=%d base=0x%08x pc=%08x\n",
+                        n, (unsigned)val,
+                        (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+        }
         break;
     case BAM_P_FIFO_SIZES:
         b->pipe[n].ring_size = val & 0xffffu;
+        if (die_dbg_on()) {
+            die_dbg_log("die: bam sizes pipe=%d val=0x%08x pc=%08x\n",
+                        n, (unsigned)val,
+                        (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+        }
         break;
-    case BAM_P_EVNT_REG:
-        b->pipe[n].prod = val & 0xffffu;
+    case BAM_P_EVNT_REG: {
+        IPQBamPipe *p = &b->pipe[n];
+
+        p->prod = val & 0xffffu;
+        if (die_dbg_on()) {
+            die_dbg_log("die: bam evnt pipe=%d val=0x%x cons=0x%x"
+                        " prod=0x%x base=0x%08x size=0x%x dir=%s ctrl=0x%x"
+                        " pc=%08x\n", n, (unsigned)val, p->cons, p->prod,
+                        p->ring_base, p->ring_size,
+                        bam_client_name(p->client, p->ctrl), p->ctrl,
+                        (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+        }
         bam_pipe_run(b, n);
+        break;
+    }
+    case BAM_P_SW_OFSTS:
+        if (die_dbg_on()) {
+            die_dbg_log("die: bam sw_ofsts write pipe=%d val=0x%x\n", n,
+                        (unsigned)val);
+        }
         break;
     default:
         break;
@@ -1950,6 +2703,10 @@ typedef struct IPQUart {
     const char *name;
 } IPQUart;
 
+/* The console UART, so the BAM UART TX pipe can drive the same backend. */
+static IPQUart *ipq_console_uart;
+
+
 static uint64_t uart_read(void *opaque, hwaddr off, unsigned size)
 {
     IPQUart *u = opaque;
@@ -2010,6 +2767,9 @@ static void uart_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             }
         }
         if (n) {
+            for (k = 0; k < n; k++) {
+                die_dbg_ser(buf[k]);
+            }
             qemu_chr_fe_write_all(&u->chr, buf, n);
         }
         return;
@@ -2042,6 +2802,23 @@ static void add_uart(MemoryRegion *parent, hwaddr base, const char *name,
     }
     memory_region_init_io(&u->mr, NULL, &uart_ops, u, name, 0x1000);
     memory_region_add_subregion(parent, base, &u->mr);
+    if (!ipq_console_uart) {
+        ipq_console_uart = u;
+    }
+}
+
+/* Bytes handed to the console UART by its BAM TX pipe (DMA console output). */
+static void uart_bam_write(const uint8_t *buf, size_t n)
+{
+    size_t i;
+
+    if (!ipq_console_uart) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        die_dbg_ser(buf[i]);
+    }
+    qemu_chr_fe_write_all(&ipq_console_uart->chr, buf, n);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2453,7 +3230,8 @@ static void ipq4019_init(MachineState *machine)
     memory_region_init_io(qtimer, NULL, &gcnt_ops, &qtimer_hz, "qtimer", 8);
     memory_region_add_subregion(sysmem, 0x4a2000, qtimer);
     add_stub(sysmem, 0x4a3000, 0x8000, "timer-misc");
-    add_stub(sysmem, IPQ_TLMM_BASE, IPQ_TLMM_SIZE, "tlmm");
+    ipq_tlmm_cs_pin = env_u32("QEMU_IPQ_CS_GPIO", 54);
+    add_tlmm(sysmem, IPQ_TLMM_BASE, IPQ_TLMM_SIZE, "tlmm");
     /*
      * Clock blocks: bit 0 behaves as a self-clearing trigger on written
      * registers (software sets it, then polls until it reads 0).  Unwritten
@@ -2513,14 +3291,24 @@ static void ipq4019_init(MachineState *machine)
      * engine.  It writes a ring of {addr, ctrl} descriptors into DRAM and
      * rings a per-pipe doorbell; see add_bam() for the register map.
      *
-     * The transport reads a "BAM version" field at +0x1000 and only accepts
-     * 6..11, 19..25 or 32..39 (bam_get_version); the DTS describes bam-v1.7.0,
-     * so seed 7.  Without it the field reads 0xff out of the untouched default
-     * and the probe aborts with 0x303d.
+     * Two identification registers matter:
+     *
+     *   BAM_REVISION  (+0x1000) is {major:8, minor:8, num_ees:4, step:8} in
+     *                 QCA's bam.h.  SBL1's flash driver only accepts the step
+     *                 field values 6..11 / 19..25 / 32..39, and Linux's
+     *                 bam_init() reads NUM_EES from bits 15:8 to range-check
+     *                 the "qcom,ee" property -- with a zero there the probe
+     *                 fails with -EINVAL and spi-qup defers for ever.
+     *   BAM_NUM_PIPES (+0x1008) is the pipe count Linux allocates channels
+     *                 for.  The IPQ4019 BAM has twelve.
      */
     bam = add_bam(sysmem, IPQ_BLSP1_BAM_BASE, IPQ_BLSP1_BAM_SIZE, "blsp1-bam");
-    bam->shadow[0x1000 >> 2] = env_u32("QEMU_IPQ_BAM_VER", 7);
+    bam_wire_pipes(bam);
+    bam->shadow[0x1000 >> 2] = (env_u32("QEMU_IPQ_BAM_EES", 4) << 8) |
+                               env_u32("QEMU_IPQ_BAM_VER", 7);
     bam->valid[0x1000 >> 2] = 1;
+    bam->shadow[0x1008 >> 2] = env_u32("QEMU_IPQ_BAM_PIPES", 12);
+    bam->valid[0x1008 >> 2] = 1;
     add_qupl(sysmem, IPQ_QUP_BASE, 0x1000, "qup-spi");
     add_stub(sysmem, IPQ_QPIC_BASE, IPQ_QPIC_SIZE, "qpic-nand");
     /*
@@ -2577,6 +3365,16 @@ static void ipq4019_init(MachineState *machine)
             sysbus_realize_and_unref(SYS_BUS_DEVICE(gicdev), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(gicdev), 0, IPQ_QGIC_BASE);
             sysbus_mmio_map(SYS_BUS_DEVICE(gicdev), 1, IPQ_QGIC_BASE + 0x2000);
+            /*
+             * SPI lines the board uses in the DTS: <GIC_SPI 238> is the BAM
+             * and <GIC_SPI 95> the QUP.  arm_gic lays its input lines out as
+             * [SPIs][32 PPIs per CPU] and adds GIC_INTERNAL back in
+             * gic_set_irq(), so input line n is SPI n.
+             */
+            bam->irq = qdev_get_gpio_in(gicdev, 238);
+            if (qup_spi) {
+                qup_spi->irq = qdev_get_gpio_in(gicdev, 95);
+            }
 
             for (n = 0; n < machine->smp.cpus; n++) {
                 DeviceState *cpudev = DEVICE(qemu_get_cpu(n));
