@@ -3437,6 +3437,35 @@ static void edma_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         }
     }
 
+    for (q = 0; q < IPQ_EDMA_QUEUES; q++) {
+        if (off == EDMA_REG_RFD_IDX_Q(q)) {
+            /*
+             * Same split ownership as the TPD index: the driver publishes
+             * receive buffers by writing the producer half, the engine owns
+             * the consumer half.  Storing the value verbatim would reset the
+             * engine's consumer to 0 and make it overwrite buffers the driver
+             * had not taken yet.
+             */
+            e->regs[off / 4] = (e->regs[off / 4] & ~EDMA_RFD_PROD_MASK) |
+                               ((uint32_t)val & EDMA_RFD_PROD_MASK);
+            /*
+             * The driver just made room, so tell QEMU to look again.  A net
+             * client whose can_receive() said no gets its frames queued and
+             * its backend read poll switched off -- for a tap that is the
+             * host's side of the cable -- and nothing re-checks until the
+             * device asks.  One frame that arrives while the ring is full
+             * (the host's IPv6 DAD at boot, long before the guest's driver
+             * publishes a single buffer) therefore wedged the receive path
+             * for the whole session: the guest saw no input at all while its
+             * own output worked.
+             */
+            if (e->nc) {
+                qemu_flush_queued_packets(e->nc);
+            }
+            return;
+        }
+    }
+
     /*
      * Both interrupt-status registers are write-1-to-clear.  This matters a
      * lot for RX: ipqess_irq_enable() and ipqess_rx_napi() clear the pending
