@@ -2924,6 +2924,12 @@ static void edma_tx_send(IPQEdma *e, const uint8_t *f, size_t len,
                  e->nc->name, len, ret);
     }
     e->tx_host++;
+    if (!(e->tx_host % 500)) {
+        EDMA_DBG("net: tx=%" PRIu64 " (noport=%" PRIu64 " nolink=%" PRIu64
+                 ") rx=%" PRIu64 " (dropped=%" PRIu64 ")\n",
+                 e->tx_host, e->tx_drop_noport, e->tx_drop_nolink,
+                 e->rx_host, e->rx_dropped);
+    }
 }
 
 /*
@@ -3165,6 +3171,12 @@ static void edma_rx_deliver(IPQEdma *e, const uint8_t *frame, size_t len)
     e->regs[EDMA_REG_RX_ISR / 4] |= 1u << q;
     edma_update_irqs(e);
     e->rx_host++;
+    if (!(e->rx_host % 500)) {
+        EDMA_DBG("net: tx=%" PRIu64 " (noport=%" PRIu64 " nolink=%" PRIu64
+                 ") rx=%" PRIu64 " (dropped=%" PRIu64 ")\n",
+                 e->tx_host, e->tx_drop_noport, e->tx_drop_nolink,
+                 e->rx_host, e->rx_dropped);
+    }
 }
 
 /* Walk the descriptors the driver just published, retire them and forward. */
@@ -4057,16 +4069,16 @@ static void dtb_report_switch(void *fdt)
         } else if (fdt_subnode_offset(fdt, port, "fixed-link") >= 0) {
             phy = -2;                   /* fixed link, no PHY */
         }
-        printf("ipq4019: dtb port %d", reg ? (int)fdt32_to_cpu(reg[0]) : -1);
+        fprintf(stderr, "ipq4019: dtb port %d", reg ? (int)fdt32_to_cpu(reg[0]) : -1);
         if (label) {
-            printf(" \"%s\"", label);
+            fprintf(stderr, " \"%s\"", label);
         }
         if (phy == -2) {
-            printf(" fixed-link\n");
+            fprintf(stderr, " fixed-link\n");
         } else if (phy >= 0) {
-            printf(" -> mdio phy %d\n", phy);
+            fprintf(stderr, " -> mdio phy %d\n", phy);
         } else {
-            printf(" -> disconnected\n");
+            fprintf(stderr, " -> disconnected\n");
         }
     }
 }
@@ -4092,7 +4104,7 @@ static void mdio_add_from_dtb(IPQMdio *m, const char *path)
     }
     dtb_collect_phys(fdt, mdio, m, &count);
     if (count) {
-        printf("ipq4019: %d mdio port(s) from %s\n", count, path);
+        fprintf(stderr, "ipq4019: %d mdio port(s) from %s\n", count, path);
     }
     dtb_report_switch(fdt);
 out:
@@ -4150,12 +4162,12 @@ static IPQMdio *add_mdio(MemoryRegion *parent, const char *dtb_path)
     memory_region_init_io(&m->mr, NULL, &mdio_ops, m, "mdio", IPQ_MDIO_SIZE);
     memory_region_add_subregion(parent, IPQ_MDIO_BASE, &m->mr);
 
-    printf("ipq4019: mdio@%08x, %d port(s):", IPQ_MDIO_BASE, m->nphy);
+    fprintf(stderr, "ipq4019: mdio@%08x, %d port(s):", IPQ_MDIO_BASE, m->nphy);
     for (i = 0; i < m->nphy; i++) {
-        printf(" %d@%d%s", m->phy[i].addr, m->phy[i].speed,
+        fprintf(stderr, " %d@%d%s", m->phy[i].addr, m->phy[i].speed,
                m->phy[i].link ? "" : "(down)");
     }
-    printf("\n");
+    fprintf(stderr, "\n");
     return m;
 }
 
@@ -4906,7 +4918,7 @@ static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
     }
 
     ipq4019_elf_entry = eh->e_entry;
-    printf("ipq4019: loaded %s (SBL ELF), entry 0x%08x, %d phdrs\n",
+    fprintf(stderr, "ipq4019: loaded %s (SBL ELF), entry 0x%08x, %d phdrs\n",
            path, ipq4019_elf_entry, eh->e_phnum);
     g_free(buf);
     return true;
@@ -5059,14 +5071,14 @@ static void ipq4019_timer_dbg(void *opaque)
     static const char *const names[] = { "phys", "virt", "hyp", "sec" };
     int i;
 
-    printf("ipq4019-timer: cntfrq=%" PRIu64 " cntvoff=%" PRIu64 " cnthctl=%" PRIx64
+    fprintf(stderr, "ipq4019-timer: cntfrq=%" PRIu64 " cntvoff=%" PRIu64 " cnthctl=%" PRIx64
            " daif=%02x irq_line=%x\n", cpu->gt_cntfrq_hz,
            env->cp15.cntvoff_el2, env->cp15.cnthctl_el2,
            (unsigned)env->daif, env->irq_line_state);
     for (i = 0; i < ARRAY_SIZE(names); i++) {
         ARMGenericTimer *gt = &env->cp15.c14_timer[i];
 
-        printf("  %s ctl=%03" PRIx64 " cval=%" PRIu64 " expire_ns=%" PRId64
+        fprintf(stderr, "  %s ctl=%03" PRIx64 " cval=%" PRIu64 " expire_ns=%" PRId64
                "\n", names[i], gt->ctl, gt->cval,
                timer_expire_time_ns(cpu->gt_timer[i]) -
                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
@@ -5091,14 +5103,14 @@ static void ipq4019_diag(void *opaque)
     int64_t v = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     int64_t h = qemu_clock_get_ns(QEMU_CLOCK_HOST);
 
-    printf("diag: state=%s h=%" PRId64 " v=%" PRId64 " dv=%" PRId64
+    fprintf(stderr, "diag: state=%s h=%" PRId64 " v=%" PRId64 " dv=%" PRId64
            " pc=%08x halted=%d irqreq=%x daif=%02x\n",
            RunState_str(runstate_get()),
            h, v, v - ipq_diag_last_virtual,
            (uint32_t)cpu->env.regs[15], cs->halted,
            cs->interrupt_request, (unsigned)cpu->env.daif);
     if (ipq_edma) {
-        printf("diag: net tx=%" PRIu64 " (noport=%" PRIu64 " nolink=%" PRIu64
+        fprintf(stderr, "diag: net tx=%" PRIu64 " (noport=%" PRIu64 " nolink=%" PRIu64
                ") rx=%" PRIu64 " (dropped=%" PRIu64 ")\n",
                ipq_edma->tx_host, ipq_edma->tx_drop_noport,
                ipq_edma->tx_drop_nolink, ipq_edma->rx_host,
@@ -5184,7 +5196,7 @@ static void ipq4019_init(MachineState *machine)
             object_property_set_int(OBJECT(cs), "psci-conduit",
                                     conduit, &error_abort);
         }
-        printf("ipq4019: psci conduit %s\n",
+        fprintf(stderr, "ipq4019: psci conduit %s\n",
                conduit == QEMU_PSCI_CONDUIT_SMC ? "smc" :
                conduit == QEMU_PSCI_CONDUIT_HVC ? "hvc" : "disabled");
     }
@@ -5260,11 +5272,11 @@ static void ipq4019_init(MachineState *machine)
             memcpy(flash->data, buf, MIN(len, flash->size));
             g_free(buf);
         }
-        printf("ipq4019: flash die %u MiB, RDID", (unsigned)(die / MiB));
+        fprintf(stderr, "ipq4019: flash die %u MiB, RDID", (unsigned)(die / MiB));
         for (j = 0; j < ipq_flash_jedec_len; j++) {
-            printf(" %02x", ipq_flash_jedec[j]);
+            fprintf(stderr, " %02x", ipq_flash_jedec[j]);
         }
-        printf(", window %u MiB <- %s (%zu bytes)\n",
+        fprintf(stderr, ", window %u MiB <- %s (%zu bytes)\n",
                (unsigned)(IPQ_FLASH_SIZE / MiB), img ? img : "(none)", len);
     }
     /*
@@ -5497,7 +5509,7 @@ static void ipq4019_init(MachineState *machine)
                                    n + 3 * machine->smp.cpus,
                                    qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
             }
-            printf("ipq4019: QGIC2 at 0x%08x (num-irq %u, %d cpu)\n",
+            fprintf(stderr, "ipq4019: QGIC2 at 0x%08x (num-irq %u, %d cpu)\n",
                    IPQ_QGIC_BASE, IPQ_GIC_NUM_IRQ, machine->smp.cpus);
         }
     }
@@ -5795,7 +5807,7 @@ static void ipq4019_init(MachineState *machine)
         rom_add_blob_fixed("ipq.bootinfo.l2", bi, 0x2000,
                            ipq4019_bootinfo + 0x20000);
         g_free(bi);
-        printf("ipq4019: boot-info handed to SBL1 in r0 = 0x%08x\n",
+        fprintf(stderr, "ipq4019: boot-info handed to SBL1 in r0 = 0x%08x\n",
                ipq4019_bootinfo);
     } else {
         arm_load_kernel(ARM_CPU(first_cpu), machine, &ipq4019_binfo);
