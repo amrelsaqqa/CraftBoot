@@ -136,6 +136,8 @@
 #define IPQ_QGIC_BASE     0x0b000000u
 /* QGIC2 line count: 256 SPIs (the ipq40xx DTS uses up to 0xff) + 32 PPIs */
 #define IPQ_GIC_NUM_IRQ   288u
+/* Cortex-A7s in the DTS: cpu@0..cpu@3 (see the GIC note in ipq4019_init) */
+#define IPQ_GIC_NUM_CPU   4u
 #define IPQ_FLASH_BASE    0x0e000000u
 #define IPQ_FLASH_SIZE    (64 * MiB)      /* address window */
 #define IPQ_FLASH_MIN     (1 * MiB)       /* smallest die modelled */
@@ -5553,7 +5555,30 @@ static void ipq4019_init(MachineState *machine)
             DeviceState *gicdev = qdev_new(TYPE_ARM_GIC);
             int n;
 
-            qdev_prop_set_uint32(gicdev, "num-cpu", machine->smp.cpus);
+            /*
+             * The SoC has four Cortex-A7s (cpu@0..cpu@3 in the DTS), and the
+             * count here is load-bearing rather than cosmetic: with num-cpu
+             * 1 QEMU's arm_gic RAZ/WIs the SGI/PPI target registers, so the
+             * guest's gic_get_cpumask() reads 0 and leaves gic_cpu_map[0] =
+             * 0.  A guest whose DT lists more than one CPU has nr_cpu_ids !=
+             * 1, which makes gic_raise_softirq() take the target-mask path
+             * instead of the "only one CPU, do a self-IPI" shortcut, so it
+             * writes GICD_SGIR with an empty CPU mask and the IPI is
+             * dropped.
+             *
+             * Nothing else needs an IPI here (the other CPUs never come
+             * online -- qcom_scm_set_cold_boot_addr needs the QSEE/TZ
+             * bring-up this machine does not model -- so the kernel prints
+             * "Failed to set CPU boot address, disabling SMP" and runs one
+             * CPU), but irq_work does: irq_work_sync() spins on
+             * IRQ_WORK_BUSY until the work runs, and the work only runs from
+             * the IPI handler.  RouterOS's cpufreq governor stop does exactly
+             * that during /system reboot, so with the IPI dropped the clean
+             * shutdown waits forever ("soft lockup ... [init]") and never
+             * reaches the pshold write.  The extra CPU interfaces are simply
+             * never used.
+             */
+            qdev_prop_set_uint32(gicdev, "num-cpu", IPQ_GIC_NUM_CPU);
             qdev_prop_set_uint32(gicdev, "num-irq", IPQ_GIC_NUM_IRQ);
             sysbus_realize_and_unref(SYS_BUS_DEVICE(gicdev), &error_fatal);
             sysbus_mmio_map(SYS_BUS_DEVICE(gicdev), 0, IPQ_QGIC_BASE);
