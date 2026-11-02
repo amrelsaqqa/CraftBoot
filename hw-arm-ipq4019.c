@@ -684,6 +684,8 @@ static IPQQupl *qup_spi;         /* the one QUP the BAM pipes are wired to */
  * QEMU_IPQ_DIE_LOG=1: a one-line summary per chip-select transaction, on
  * stderr (unbuffered, so a killed run still shows it).  This is how the
  * machine proves what the die actually shifted out for a given SPI command.
+ * A value that looks like a path (it contains a '/') is opened as its own
+ * file instead, which keeps the trace apart from the -D log.
  */
 static uint8_t die_dbg_first[8];
 static uint32_t die_dbg_n;
@@ -709,6 +711,16 @@ static void die_dbg_log(const char *fmt, ...)
 
         if (!path || !*path) {
             fd = -2;
+            return;
+        }
+        /*
+         * A bare word ("1") means "on, to stderr"; only a value with a '/'
+         * in it is a path.  Opening a file literally called "1" in the
+         * current directory is what the old code did, and a guest that talks
+         * to the die for a minute then left a 400 MB file nobody asked for.
+         */
+        if (!strchr(path, '/')) {
+            fd = STDERR_FILENO;
             return;
         }
         fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -766,7 +778,10 @@ static void die_dbg_ser(uint8_t c)
 
 static bool die_dbg_on(void)
 {
-    return getenv("QEMU_IPQ_DIE_LOG") != NULL;
+    const char *v = getenv("QEMU_IPQ_DIE_LOG");
+
+    /* "0"/"" mean off, like every other knob here; "1" and paths mean on. */
+    return v && *v && strcmp(v, "0") != 0;
 }
 
 static void die_dbg_note(uint8_t v)
