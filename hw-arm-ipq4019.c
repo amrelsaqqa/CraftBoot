@@ -52,6 +52,10 @@
  *   QEMU_IPQ_BOOTCFG     value of the SoC boot-config word (0x5e02c, bits 9:0)
  *   QEMU_IPQ_DEVCFG      value of the boot-device descriptor words (0x5e030+)
  *   QEMU_IPQ_SPI_LOG=1   log the decoded SPI command stream (-d unimp)
+ *   QEMU_IPQ_QUP_TRACE=1 log only QUP SPI + BLSP1 BAM accesses, each with the
+ *                        guest PC that touched the register.  Same lines as
+ *                        QEMU_IPQ_TRACE=2 for those two blocks, without the
+ *                        hundreds of megabytes the rest of the SoC adds.
  *   QEMU_IPQ_FLASH_SIZE  SPI NOR die size in bytes, power of two
  *                        1 MiB..64 MiB (default 32 MiB)
  *   QEMU_IPQ_FLASH_JEDEC RDID bytes as hex, e.g. "ef4019" or "20ba19"
@@ -1348,10 +1352,11 @@ static uint64_t qupl_read(void *opaque, hwaddr off, unsigned size)
         v = idx < ARRAY_SIZE(q->shadow) ? q->shadow[idx] : 0;
         break;
     }
-    if (env_true("QEMU_IPQ_TRACE")) {
+    if (env_true("QEMU_IPQ_TRACE") || env_true("QEMU_IPQ_QUP_TRACE")) {
         qemu_log_mask(LOG_UNIMP, "qup-spi: read  off 0x%03" HWADDR_PRIx
                       " -> 0x%08x%s\n", off, v,
-                      env_u32("QEMU_IPQ_TRACE", 0) > 1 ? trace_pc() : "");
+                      (env_u32("QEMU_IPQ_TRACE", 0) > 1 ||
+                       env_true("QEMU_IPQ_QUP_TRACE")) ? trace_pc() : "");
     }
     return v;
 }
@@ -1424,10 +1429,11 @@ static void qupl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
                     (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
     }
 
-    if (env_true("QEMU_IPQ_TRACE")) {
+    if (env_true("QEMU_IPQ_TRACE") || env_true("QEMU_IPQ_QUP_TRACE")) {
         qemu_log_mask(LOG_UNIMP, "qup-spi: write off 0x%03" HWADDR_PRIx
                       " <- 0x%08" PRIx64 "%s\n", off, val,
-                      env_u32("QEMU_IPQ_TRACE", 0) > 1 ? trace_pc() : "");
+                      (env_u32("QEMU_IPQ_TRACE", 0) > 1 ||
+                       env_true("QEMU_IPQ_QUP_TRACE")) ? trace_pc() : "");
     }
     if (off == QUP_REG_SW_RESET) {
         qup_bus_reset(q);
@@ -1449,6 +1455,20 @@ static void qupl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         if (st == QUP_STATE_CLEAR) {
             st = QUP_STATE_RESET;      /* PAUSE -> CLEAR -> RESET */
         }
+        /*
+         * The state field has to read back as the state that was requested:
+         * readl(QUP_STATE) reports STATE_VALID (0x4) plus the low two bits,
+         * and every driver that programs the engine spins on
+         * ((readl(QUP_STATE) & 0x3) == requested) before touching the FIFOs.
+         *
+         * Leaving the read-back at a constant 0x4 makes that poll fail even
+         * though the write was taken: the transfer never enters RUN, so
+         * qup_operational() never raises the service flags and qup_update_done()
+         * never sets the done bits.  RouterOS's flash.ko then retries the
+         * rejected read forever, which is the `/system reboot` hang -- it also
+         * keeps the reboot thread from ever reaching the pshold write.
+         */
+        q->shadow[QUP_REG_STATE / 4] = st;
         if (st == QUP_STATE_RESET) {
             /*
              * State RESET flushes the input FIFO and abandons the programmed
@@ -2342,10 +2362,11 @@ static uint64_t bam_read(void *opaque, hwaddr off, unsigned size)
     }
 
 trace:
-    if (env_true("QEMU_IPQ_TRACE")) {
+    if (env_true("QEMU_IPQ_TRACE") || env_true("QEMU_IPQ_QUP_TRACE")) {
         qemu_log_mask(LOG_UNIMP, "blsp1-bam: read  off 0x%03" HWADDR_PRIx
                       " -> 0x%08x%s\n", off, v,
-                      env_u32("QEMU_IPQ_TRACE", 0) > 1 ? trace_pc() : "");
+                      (env_u32("QEMU_IPQ_TRACE", 0) > 1 ||
+                       env_true("QEMU_IPQ_QUP_TRACE")) ? trace_pc() : "");
     }
     return v;
 }
@@ -2357,10 +2378,11 @@ static void bam_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     hwaddr roff;
     int n;
 
-    if (env_true("QEMU_IPQ_TRACE")) {
+    if (env_true("QEMU_IPQ_TRACE") || env_true("QEMU_IPQ_QUP_TRACE")) {
         qemu_log_mask(LOG_UNIMP, "blsp1-bam: write off 0x%03" HWADDR_PRIx
                       " <- 0x%08" PRIx64 "%s\n", off, val,
-                      env_u32("QEMU_IPQ_TRACE", 0) > 1 ? trace_pc() : "");
+                      (env_u32("QEMU_IPQ_TRACE", 0) > 1 ||
+                       env_true("QEMU_IPQ_QUP_TRACE")) ? trace_pc() : "");
     }
     if (env_true("QEMU_IPQ_BAM_LOG") && off >= BAM_PIPE_FIRST &&
         off < IPQ_BLSP1_BAM_SIZE) {
