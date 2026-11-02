@@ -421,6 +421,44 @@ static const MemoryRegionOps pshold_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/*
+ * Panic capture.
+ *
+ * RouterOS 7.17 keeps kernel messages in memory (logring.ko) instead of
+ * printing them, so a crash on the board is invisible -- except that its
+ * panic handler stores the text in DRAM ("save panic in DRAM").  The reset
+ * that follows is the last moment that copy exists, because the next boot's
+ * SBL1 reloads straight over it.  Dumping DRAM as the reset happens makes a
+ * suppressed panic readable from the image itself, with nothing decoded or
+ * patched:
+ *
+ *   QEMU_IPQ_RESET_DUMP=/tmp/ram.bin ./run.sh
+ *   strings -n 8 /tmp/ram.bin | grep -n "Kernel panic"
+ */
+static MemoryRegion *ipq_dram_mr;
+static uint64_t ipq_dram_size;
+
+static void ipq_reset_dump(void *opaque)
+{
+    const char *path = getenv("QEMU_IPQ_RESET_DUMP");
+    const void *ram;
+    FILE *f;
+
+    if (!path || !*path || !ipq_dram_mr) {
+        return;
+    }
+    ram = memory_region_get_ram_ptr(ipq_dram_mr);
+    f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "ipq4019: cannot write reset dump %s\n", path);
+        return;
+    }
+    fwrite(ram, 1, ipq_dram_size, f);
+    fclose(f);
+    fprintf(stderr, "ipq4019: dram dumped to %s at reset (%" PRIu64 " bytes)\n",
+            path, ipq_dram_size);
+}
+
 static void add_stub(MemoryRegion *parent, hwaddr base, hwaddr size,
                      const char *name)
 {
@@ -5202,6 +5240,9 @@ static void ipq4019_init(MachineState *machine)
     }
 
     memory_region_add_subregion(sysmem, IPQ_RAM_BASE, machine->ram);
+    ipq_dram_mr = machine->ram;
+    ipq_dram_size = machine->ram_size;
+    qemu_register_reset(ipq_reset_dump, NULL);
 
     flash = add_mem(sysmem, IPQ_FLASH_BASE, IPQ_FLASH_SIZE, "flash");
     ipq_flash = flash;
@@ -5540,6 +5581,34 @@ static void ipq4019_init(MachineState *machine)
     add_stub(sysmem, 0x08af8800, 0x000800, "usb3-qscratch");
     add_stub(sysmem, 0x06000000, 0x0f8000, "usb2-dwc3");
     add_stub(sysmem, 0x060f8800, 0x000800, "usb2-qscratch");
+    /*
+     * WLAN register windows (the integrated 802.11ac radio and its CPU).
+     * The radio itself is not emulated, but its register block has to answer:
+     * RouterOS loads qca_ol from modprobe, and hif_ahb_enable_radio writes
+     * 0x0a04f014 early in the probe.  With no memory region behind it that
+     * write is a synchronous external abort, which panics Linux and resets
+     * the board before it finishes starting up.  A register file that reads
+     * back what was written (and all-ones where nothing was written, like an
+     * unclocked block) lets the probe fail or time out instead of faulting.
+     * The windows and their sizes come from the board device tree
+     * (`wifi@a000000`, `wifi@a800000`, 2 MiB each).
+     */
+    {
+        /*
+         * What an unwritten register reads back decides whether the driver
+         * thinks the radio is alive.  All-ones says "every status bit set",
+         * so polls for "firmware ready" succeed and the probe continues with
+         * state that was never initialised; zero says "this block is not
+         * running", which is what makes qca_ol give the radio up.  Knobbed so
+         * the two can be compared on the same machine: default 0.
+         */
+        uint32_t wifi_read = env_u32("QEMU_IPQ_WIFI_READ", 0);
+
+        add_stub_ex(sysmem, 0x0a000000, 0x00200000, "wifi0",
+                    0xffffffffu)->def_read = wifi_read;
+        add_stub_ex(sysmem, 0x0a800000, 0x00200000, "wifi1",
+                    0xffffffffu)->def_read = wifi_read;
+    }
     /* Ethernet: MDIO master at 0x90000 (ports on it are board config). */
     add_mdio(sysmem, ipq_machine_dtb(machine));
     /*
