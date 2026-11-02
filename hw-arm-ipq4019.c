@@ -100,6 +100,9 @@
 #include "target/arm/cpu-qom.h"
 #include "target/arm/gtimer.h"
 #include "cpu.h"
+#include "net/net.h"
+#include "net/checksum.h"
+#include "net/eth.h"
 #include <libfdt.h>
 
 #define IPQ_ROM_BASE      0x00000000u
@@ -2537,6 +2540,10 @@ static IPQRegFile *add_regfile(MemoryRegion *parent, hwaddr base, hwaddr size,
 /* Ethernet DMA engine (IPQESS)                                        */
 /* ------------------------------------------------------------------ */
 
+/* Implemented with the MDIO/PHY model below; the packet path needs them first. */
+static const char *ipq_port_name(int port);
+static void ipq_eth_set_host_link(int switch_port, bool up);
+
 /*
  * The EDMA is the DMA engine between the CPU and the switch that is built
  * into the IPQ4019: 16 TX and 16 RX descriptor rings, per-queue interrupt
@@ -2559,10 +2566,17 @@ static IPQRegFile *add_regfile(MemoryRegion *parent, hwaddr base, hwaddr size,
  * the queue statistics and raises the queue's interrupt, which is all the
  * driver needs to reclaim the descriptors.
  *
- * No frame leaves the machine: the internal port has no link partner in the
- * model, so descriptors are accounted for and dropped -- like a MAC whose
- * switch port is down.  Nothing is ever received either, so the RX rings are
- * left exactly as the driver programmed them.
+ * No frame leaves the machine by default: without a -netdev the internal port
+ * has no link partner, so descriptors are accounted for and dropped -- like a
+ * MAC whose switch port is down.  Nothing is received either, so the RX rings
+ * stay exactly as the driver programmed them.
+ *
+ * The packet path to the host lives in edma_tx_frame()/edma_rx_deliver()
+ * below: the engine is attached to a QEMU -netdev (QEMU_IPQ_NETDEV, "net0" by
+ * default) and one switch port is bridged to it (QEMU_IPQ_ETH_BRIDGE_PORT,
+ * lan1 = port 5 by default).  The out-of-band DSA tag in word3 selects which
+ * transmitted frames go out, and the port id in rrd1 tells the guest which
+ * front-panel port a received frame arrived on.
  */
 #define IPQ_EDMA_QUEUES          16
 #define IPQ_EDMA_TPD_SIZE        16
@@ -2579,9 +2593,74 @@ static IPQRegFile *add_regfile(MemoryRegion *parent, hwaddr base, hwaddr size,
 #define EDMA_REG_TX_STAT_PKT_Q(x) (0x0700 + ((x) << 3))
 #define EDMA_REG_TX_STAT_BYTE_Q(x) (0x0704 + ((x) << 3))
 
+#define EDMA_REG_RFD_BASE_Q(x)   (0x0950 + ((x) << 2))
+#define EDMA_REG_RFD_IDX_Q(x)    (0x09b0 + ((x) << 2))
+#define EDMA_REG_RX_DESC0        0x0a10
+
 #define EDMA_TPD_PROD_MASK       0x0000ffffu
 #define EDMA_TPD_CONS_SHIFT      16
 #define EDMA_TPD_EOP             (1u << 31)
+
+/*
+ * word1 flags, straight out of the OpenWrt driver (patches 700/702 of
+ * target/linux/ipq40xx).  The checksum block is the interesting part:
+ *
+ *   bits 1:0..17   checksum start, in 16-bit words from the frame start
+ *   bits 31:18     checksum insert offset, in 16-bit words from frame start
+ *
+ * and when neither LSO bit is set the hardware is expected to sum the frame
+ * from the start offset to the end of the L4 payload and write the result at
+ * the insert offset.  Linux already left the pseudo-header sum in the TCP/UDP
+ * checksum field when it marked the skb CHECKSUM_PARTIAL, so summing the
+ * segment as-is (field included) is all the engine has to do.
+ */
+#define EDMA_TPD_PPPOE           0x00000100
+#define EDMA_TPD_IP_CSUM         0x00000200
+#define EDMA_TPD_TCP_CSUM        0x00000400
+#define EDMA_TPD_UDP_CSUM        0x00000800
+#define EDMA_TPD_CUSTOM_CSUM     0x00000c00
+#define EDMA_TPD_LSO             0x00001000
+#define EDMA_TPD_LSO_V2          0x00002000
+#define EDMA_TPD_VLAN_TAGGED     0x00004000
+#define EDMA_TPD_IPV4            0x00010000
+/*
+ * Both fields are only 13 bits wide: the driver shifts `cso >> 1` (a byte
+ * offset, so a 13-bit word offset covers 16 KiB) and stores the checksum
+ * offset the same way.  Bit 31 of word1 is EOP, so an unmasked shift turns it
+ * into bit 13 of the checksum-offset field and the engine would try to write
+ * the checksum far past the end of the frame.
+ */
+#define EDMA_TPD_CSUM_START_MASK 0x00001fff
+#define EDMA_TPD_CSUM_OFF_SHIFT  18
+#define EDMA_TPD_CSUM_OFF_MASK   0x00001fff
+
+#define EDMA_TPD_CVLAN           16
+#define EDMA_TPD_INS_CVLAN       17
+#define EDMA_TPD_SVLAN           14
+#define EDMA_TPD_INS_SVLAN       15
+#define EDMA_TPD_PORT_SHIFT      18
+#define EDMA_TPD_PORT_MASK       0x01fc0000
+#define EDMA_TPD_FROM_CPU        (1u << 25)
+
+#define EDMA_RX_RING_SIZE        128
+#define EDMA_RX_HEAD_BUFF_SIZE   1540    /* IPQESS_RX_HEAD_BUFF_SIZE */
+#define EDMA_RRD_SIZE            16
+#define EDMA_TPD_SIZE            16
+#define EDMA_RFD_PROD_MASK       0x00000fffu
+#define EDMA_RFD_CONS_SHIFT      16
+#define EDMA_RRD_VALID           0x8000
+#define EDMA_RRD_CSUM_FAIL       0xc000
+#define EDMA_MAX_FRAME           65536
+
+/* Host round-trip tracing at the netdev boundary, off unless asked for. */
+#define NET_TRACE(...)                                                     \
+    do {                                                                   \
+        if (env_true("QEMU_IPQ_NET_TRACE")) {                              \
+            fprintf(stderr, "net: t=%" PRId64 " ",                         \
+                    qemu_clock_get_ms(QEMU_CLOCK_REALTIME));               \
+            fprintf(stderr, __VA_ARGS__);                                  \
+        }                                                                  \
+    } while (0)
 
 #define EDMA_DBG(...)                                                     \
     do {                                                                  \
@@ -2599,6 +2678,20 @@ typedef struct IPQEdma {
     qemu_irq irq_tx[IPQ_EDMA_QUEUES];
     qemu_irq irq_rx[IPQ_EDMA_QUEUES];
     int tx_level[IPQ_EDMA_QUEUES];
+
+    /* Host backend and the switch port it is wired to. */
+    NetClientState *nc;
+    NICConf nic;
+    MemReentrancyGuard rx_guard;
+    int bridge_port;                /* switch port index, 1..5 */
+    int host_link;
+    uint8_t *txbuf;                 /* one assembled TX frame */
+    uint8_t *segbuf;                /* one segment of a TSO super-packet */
+    uint64_t tx_host;               /* frames handed to the netdev */
+    uint64_t tx_drop_noport;        /* frame's port bitmap lacks bridge_port */
+    uint64_t tx_drop_nolink;        /* netdev client down / detached */
+    uint64_t rx_host;               /* frames taken from the netdev */
+    uint64_t rx_dropped;
 } IPQEdma;
 
 static IPQEdma *ipq_edma;
@@ -2639,7 +2732,442 @@ static void edma_hexdump(const char *tag, const void *buf, unsigned n)
     fprintf(stderr, "\n");
 }
 
-/* Walk the descriptors the driver just published and retire them. */
+/*
+ * ------------------------------------------------------------------
+ * The packet path
+ * ------------------------------------------------------------------
+ *
+ * The 16 TPDs of the descriptor layout the driver writes are
+ *
+ *     struct ipqess_tx_desc {          offset
+ *         __le16 len;                    0    payload length of this buffer
+ *         __le16 svlan_tag;              2
+ *         __le32 word1;                  4    flags (see EDMA_TPD_*), EOP = bit 31
+ *         __le32 addr;                   8    guest physical address of the data
+ *         __le32 word3;                 12    DSA port bitmap, VLAN insert
+ *     } __packed __aligned(16);
+ *
+ * A frame is the chain of descriptors up to and including the one with EOP
+ * set, so the engine has to assemble them before it can do anything with the
+ * frame.  word3 carries the out-of-band DSA tag: bit (port + 18) selects the
+ * switch port the frame leaves through and bit 25 says the tag came from the
+ * CPU.  Only the framed port is wired to the host, so only frames tagged for
+ * it are sent; the rest are accounted for and dropped, which is exactly what
+ * happens to a frame aimed at a port with nothing plugged in.
+ */
+
+/* Big-endian (network order) ones-complement sum, starting from `sum`. */
+static uint32_t edma_csum_add(uint32_t sum, const uint8_t *p, unsigned n)
+{
+    unsigned i;
+
+    for (i = 0; i + 1 < n; i += 2) {
+        sum += ((uint32_t)p[i] << 8) | p[i + 1];
+    }
+    if (i < n) {
+        sum += (uint32_t)p[i] << 8;
+    }
+    return sum;
+}
+
+static uint16_t edma_csum_fold(uint32_t sum)
+{
+    while (sum >> 16) {
+        sum = (sum & 0xffffu) + (sum >> 16);
+    }
+    return (uint16_t)sum;
+}
+
+/* Length of the Ethernet header, counting any VLAN tags. */
+static unsigned edma_l2_len(const uint8_t *f, size_t len)
+{
+    unsigned l2 = 14;
+
+    while (len >= l2 + 2) {
+        uint16_t ethertype = ((uint16_t)f[l2 - 2] << 8) | f[l2 - 1];
+
+        if (ethertype != 0x8100 && ethertype != 0x88a8 &&
+            ethertype != 0x9100) {
+            break;
+        }
+        if (len < l2 + 4) {
+            break;
+        }
+        l2 += 4;
+    }
+    return MIN(l2, len);
+}
+
+/*
+ * Complete the L4 checksum.
+ *
+ * The descriptor carries the offset of the checksum field in word1 bits 31:18
+ * (in 16-bit words) and the L4 header offset in bits 12:0, but those low bits
+ * are shared with the flag bits (0x100..0x2000), so the start offset cannot be
+ * recovered from word1 alone -- for a TCP segment over IPv4 the driver ORs
+ * 0xc00 for "custom checksum" on top of 17 for "34 bytes".  Take the layout
+ * from the packet instead: the L4 header starts right after the IP header,
+ * which is also exactly what the driver computes for the frame offsets.
+ *
+ * The checksum field must be zeroed before summing: Linux fills it with the
+ * complement of the pseudo-header sum for CHECKSUM_PARTIAL skbs, so summing
+ * the segment as it arrives would count the pseudo-header twice.
+ */
+static void edma_tx_csum(uint8_t *f, size_t len, uint32_t word1)
+{
+    size_t off = ((word1 >> EDMA_TPD_CSUM_OFF_SHIFT) &
+                  EDMA_TPD_CSUM_OFF_MASK) * 2;
+    unsigned l2 = edma_l2_len(f, len);
+    const uint8_t *ip = f + l2;
+    size_t cso, l4len;
+    uint32_t sum;
+    uint16_t csum;
+
+    if (len < l2 + 20) {
+        return;
+    }
+    if ((ip[0] >> 4) == 4) {
+        unsigned ihl = (ip[0] & 0x0f) * 4;
+        unsigned total = ((unsigned)ip[2] << 8) | ip[3];
+
+        if (ihl < 20 || total <= ihl || l2 + total > len) {
+            return;
+        }
+        cso = l2 + ihl;
+        l4len = total - ihl;
+    } else if ((ip[0] >> 4) == 6) {
+        unsigned plen;
+
+        if (len < l2 + 40) {
+            return;
+        }
+        plen = ((unsigned)ip[4] << 8) | ip[5];
+        if (l2 + 40 + plen > len) {
+            return;
+        }
+        cso = l2 + 40;
+        l4len = plen;
+    } else {
+        return;
+    }
+    if (cso + 4 > len || off + 2 > len || off < cso) {
+        return;
+    }
+
+    sum = 0;
+    if ((ip[0] >> 4) == 4) {
+        /* src + dst + protocol + L4 length */
+        sum = edma_csum_add(sum, ip + 12, 8);
+        sum += ip[9];
+        sum += (uint32_t)l4len;
+    } else {
+        uint32_t vlen = (uint32_t)l4len;
+
+        /* src + dst + 32-bit L4 length + next header */
+        sum = edma_csum_add(sum, ip + 8, 32);
+        sum += (vlen >> 16) + (vlen & 0xffff);
+        sum += ip[6];
+    }
+
+    f[off] = f[off + 1] = 0;
+    sum = edma_csum_add(sum, f + cso, l4len);
+    csum = ~edma_csum_fold(sum);
+    /*
+     * A UDP checksum of 0 means "no checksum", so 0xffff is transmitted
+     * instead whenever the computed value comes out as zero.
+     */
+    if (csum == 0 && (word1 & EDMA_TPD_CUSTOM_CSUM) == EDMA_TPD_UDP_CSUM) {
+        csum = 0xffff;
+    }
+    f[off] = csum >> 8;
+    f[off + 1] = csum & 0xff;
+    EDMA_DBG("tx csum: cso=%zu off=%zu l4len=%zu -> %04x\n",
+             cso, off, l4len, csum);
+}
+
+static void edma_tx_send(IPQEdma *e, const uint8_t *f, size_t len,
+                         uint32_t word3)
+{
+    uint32_t ports;
+    ssize_t ret;
+
+    if (!e->nc || !len) {
+        return;
+    }
+    ports = (word3 >> EDMA_TPD_PORT_SHIFT) & 0x7f;
+    if (!(ports & (1u << e->bridge_port))) {
+        /*
+         * The switch would only put this frame on the ports in the bitmap.
+         * A bridged LAN floods to every front-panel port, so this normally
+         * means the frame was steered somewhere we do not model.
+         */
+        if (e->tx_drop_noport < 8) {
+            EDMA_DBG("tx: drop %zuB bitmap %02x excludes bridge port %d"
+                     " (ethertype %02x%02x)\n", len, ports, e->bridge_port,
+                     len > 13 ? f[12] : 0, len > 13 ? f[13] : 0);
+        }
+        e->tx_drop_noport++;
+        return;
+    }
+    if (e->nc->link_down || !e->nc->peer) {
+        if (!e->tx_drop_nolink) {
+            EDMA_DBG("tx: netdev '%s' down (link_down=%d peer=%p)\n",
+                     e->nc->name, e->nc->link_down, (void *)e->nc->peer);
+        }
+        e->tx_drop_nolink++;
+        return;
+    }
+    NET_TRACE("tx %zuB\n", len);
+    ret = qemu_send_packet(e->nc, f, (int)len);
+    if (ret < 0 && !e->tx_drop_nolink) {
+        EDMA_DBG("tx: netdev '%s' refused a %zu byte frame (%zd)\n",
+                 e->nc->name, len, ret);
+    }
+    e->tx_host++;
+}
+
+/*
+ * TCP segmentation offload.  The guest hands the engine one super-packet and
+ * expects it to emit MTU-sized segments with the lengths and checksums fixed
+ * up; without this a jumbo TCP send would reach the tap as a single frame
+ * that the host would have to drop.
+ */
+static int edma_tx_lso(IPQEdma *e, const uint8_t *frame, size_t len,
+                       uint32_t word1, uint32_t word3)
+{
+    unsigned l2 = edma_l2_len(frame, len);
+    const uint8_t *ip, *tcp;
+    unsigned mss = (word1 >> EDMA_TPD_CSUM_OFF_SHIFT) & 0x1fff;
+    unsigned ihl, thl, hdr;
+    size_t plen, done;
+    uint32_t seq;
+    int v6;
+
+    if (!mss || len < l2 + 40) {
+        return -1;
+    }
+    ip = frame + l2;
+    v6 = (ip[0] >> 4) == 6;
+    if (!v6 && (ip[0] >> 4) != 4) {
+        return -1;
+    }
+    ihl = v6 ? 40 : (unsigned)(ip[0] & 0x0f) * 4;
+    if ((v6 ? ip[6] : ip[9]) != 6 /* TCP */ || len < l2 + ihl + 20) {
+        return -1;
+    }
+    tcp = ip + ihl;
+    thl = (tcp[12] >> 4) * 4;
+    if (thl < 20) {
+        return -1;
+    }
+    hdr = l2 + ihl + thl;
+    if (hdr > len) {
+        return -1;
+    }
+    plen = len - hdr;
+    seq = ((uint32_t)tcp[4] << 24) | ((uint32_t)tcp[5] << 16) |
+          ((uint32_t)tcp[6] << 8) | tcp[7];
+
+    for (done = 0; done < plen; done += mss) {
+        size_t seg = MIN((size_t)mss, plen - done);
+        uint8_t *out = e->segbuf;
+        uint8_t *oip = out + l2;
+        uint8_t *otcp = oip + ihl;
+        uint32_t sum = 0;
+        uint16_t csum;
+
+        memcpy(out, frame, hdr);
+        memcpy(out + hdr, frame + hdr + done, seg);
+
+        if (v6) {
+            unsigned ulen = thl + seg;
+
+            oip[4] = ulen >> 8;
+            oip[5] = ulen & 0xff;
+            sum = edma_csum_add(sum, oip + 8, 32);      /* src + dst */
+            sum += ulen >> 16;
+            sum += ulen & 0xffff;
+            sum += 6;
+        } else {
+            unsigned total = ihl + thl + seg;
+
+            oip[2] = total >> 8;
+            oip[3] = total & 0xff;
+            oip[10] = oip[11] = 0;
+            csum = ~edma_csum_fold(edma_csum_add(0, oip, ihl));
+            oip[10] = csum >> 8;
+            oip[11] = csum & 0xff;
+            sum += edma_csum_add(0, oip + 12, 8);       /* src + dst */
+            sum += 6;
+            sum += thl + seg;
+        }
+
+        seq += done;
+        otcp[4] = seq >> 24;
+        otcp[5] = seq >> 16;
+        otcp[6] = seq >> 8;
+        otcp[7] = seq;
+        seq -= done;
+        otcp[16] = otcp[17] = 0;
+        sum = edma_csum_add(sum, otcp, thl + seg);
+        csum = ~edma_csum_fold(sum);
+        otcp[16] = csum >> 8;
+        otcp[17] = csum & 0xff;
+
+        edma_tx_send(e, out, hdr + seg, word3);
+    }
+    return 0;
+}
+
+/* Hand one assembled frame to the engine's egress path. */
+static void edma_tx_frame(IPQEdma *e, uint8_t *f, size_t len, uint32_t word1,
+                          uint32_t word3)
+{
+    if (!len) {
+        return;
+    }
+    if (word1 & EDMA_TPD_LSO) {
+        if (edma_tx_lso(e, f, len, word1, word3) < 0) {
+            EDMA_DBG("tx: cannot offload lso word1=%08x, dropped\n", word1);
+        }
+        return;
+    }
+    if ((word1 & EDMA_TPD_CUSTOM_CSUM) == EDMA_TPD_CUSTOM_CSUM) {
+        edma_tx_csum(f, len, word1);
+    }
+    if (env_u32("QEMU_IPQ_EDMA_LOG", 0) > 2) {
+        unsigned n = MIN(len, 32u), i;
+
+        fprintf(stderr, "edma: tx %zuB word1=%08x:", len, word1);
+        for (i = 0; i < n; i++) {
+            fprintf(stderr, " %02x", f[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+    edma_tx_send(e, f, len, word3);
+}
+
+/*
+ * Number of RFD buffers the driver has published but not consumed yet.  The
+ * producer index names the newest buffer the driver filled, so the slots the
+ * engine may still use are cons..prod-1 and the one at prod is the guard.
+ */
+static unsigned edma_rx_free(IPQEdma *e, unsigned q, unsigned *prod_out,
+                             unsigned *cons_out, unsigned *ring_out,
+                             uint32_t *base_out)
+{
+    uint32_t idx = e->regs[EDMA_REG_RFD_IDX_Q(q) / 4];
+    uint32_t desc0 = e->regs[EDMA_REG_RX_DESC0 / 4];
+    unsigned prod = idx & EDMA_RFD_PROD_MASK;
+    unsigned cons = (idx >> EDMA_RFD_CONS_SHIFT) & EDMA_RFD_PROD_MASK;
+    unsigned ring = desc0 & 0xfffu;
+    uint32_t base = e->regs[EDMA_REG_RFD_BASE_Q(q) / 4];
+
+    if (!ring) {
+        ring = EDMA_RX_RING_SIZE;
+    }
+    if (prod >= ring) {
+        prod %= ring;
+    }
+    if (cons >= ring) {
+        cons %= ring;
+    }
+    if (prod_out) {
+        *prod_out = prod;
+    }
+    if (cons_out) {
+        *cons_out = cons;
+    }
+    if (ring_out) {
+        *ring_out = ring;
+    }
+    if (base_out) {
+        *base_out = base;
+    }
+    return (prod - cons) & (ring - 1);
+}
+
+static unsigned edma_rx_bufs_needed(size_t len)
+{
+    unsigned n = 1;
+    size_t rest = len;
+
+    if (rest <= EDMA_RX_HEAD_BUFF_SIZE - EDMA_RRD_SIZE) {
+        return 1;
+    }
+    rest -= EDMA_RX_HEAD_BUFF_SIZE - EDMA_RRD_SIZE;
+    n += DIV_ROUND_UP(rest, EDMA_RX_HEAD_BUFF_SIZE);
+    return n;
+}
+
+/*
+ * Put one received frame into the driver's RX ring.  The engine writes a
+ * 16-byte RRD in front of the frame in the first buffer and raw bytes in the
+ * buffers after it, then advances the consumer index -- the driver's poll
+ * compares that index against its own tail and takes everything in between.
+ */
+static void edma_rx_deliver(IPQEdma *e, const uint8_t *frame, size_t len)
+{
+    /* The driver gives queue 0 ring index 0, queue 1 index 2, and so on. */
+    const unsigned q = 0;
+    unsigned prod, cons, ring, nbuf, i;
+    uint32_t base;
+    unsigned free;
+    size_t off = 0;
+
+    if (!len || len > EDMA_MAX_FRAME) {
+        e->rx_dropped++;
+        return;
+    }
+    free = edma_rx_free(e, q, &prod, &cons, &ring, &base);
+    nbuf = edma_rx_bufs_needed(len);
+    if (!base || free < nbuf) {
+        e->rx_dropped++;
+        return;
+    }
+
+    for (i = 0; i < nbuf; i++) {
+        unsigned slot = (cons + i) % ring;
+        unsigned cap = (i == 0) ? EDMA_RX_HEAD_BUFF_SIZE - EDMA_RRD_SIZE
+                                : EDMA_RX_HEAD_BUFF_SIZE;
+        size_t n = MIN((size_t)cap, len - off);
+        uint32_t addr = 0;
+
+        dma_memory_read(&address_space_memory,
+                        (hwaddr)base + (hwaddr)slot * 4, &addr, 4,
+                        MEMTXATTRS_UNSPECIFIED);
+        addr = le32_to_cpu(addr);
+        if (!addr) {
+            e->rx_dropped++;
+            return;
+        }
+        if (i == 0) {
+            uint16_t rrd[EDMA_RRD_SIZE / 2] = { 0 };
+
+            rrd[1] = cpu_to_le16(nbuf | (e->bridge_port << 12));
+            rrd[6] = cpu_to_le16(len & 0x3fff);
+            rrd[7] = cpu_to_le16(EDMA_RRD_VALID);
+            dma_memory_write(&address_space_memory, addr, rrd, sizeof(rrd),
+                             MEMTXATTRS_UNSPECIFIED);
+        }
+        dma_memory_write(&address_space_memory,
+                         (hwaddr)addr + (i ? 0 : EDMA_RRD_SIZE),
+                         frame + off, n, MEMTXATTRS_UNSPECIFIED);
+        off += n;
+    }
+
+    EDMA_DBG("rx q=%u port=%d len=%zu nbuf=%u slot=%u cons %u->%u prod=%u\n",
+             q, e->bridge_port, len, nbuf, (cons + ring - nbuf) % ring,
+             (cons + ring - nbuf) % ring, (cons + nbuf) % ring, prod);
+    cons = (cons + nbuf) % ring;
+    e->regs[EDMA_REG_RFD_IDX_Q(q) / 4] =
+        (cons << EDMA_RFD_CONS_SHIFT) | prod;
+    e->regs[EDMA_REG_RX_ISR / 4] |= 1u << q;
+    edma_update_irqs(e);
+    e->rx_host++;
+}
+
+/* Walk the descriptors the driver just published, retire them and forward. */
 static void edma_tx_kick(IPQEdma *e, unsigned q)
 {
     uint32_t idx = e->regs[EDMA_REG_TPD_IDX_Q(q) / 4];
@@ -2647,16 +3175,28 @@ static void edma_tx_kick(IPQEdma *e, unsigned q)
     uint32_t cons = (idx >> EDMA_TPD_CONS_SHIFT) & EDMA_TPD_PROD_MASK;
     uint32_t ring = e->regs[EDMA_REG_TPD_RING_SIZE / 4];
     uint32_t base = e->regs[EDMA_REG_TPD_BASE_Q(q) / 4];
-    uint32_t n = (prod - cons) & EDMA_TPD_PROD_MASK;
+    uint32_t n;
+    size_t flen = 0;
     unsigned i;
 
     if (!ring) {
         ring = 128;
     }
-    if (n > ring) {
-        /* A producer index outside the ring is a driver bug; do not walk it. */
-        n = ring;
+    /*
+     * Both indices are ring-relative: the driver advances them with
+     * IPQESS_NEXT_IDX() == ((i + 1) & (count - 1)), so going from count-1
+     * back to 0 is one step, not count-1 of them.  Measuring the distance
+     * with the 16-bit field mask would turn every wrap into a full ring of
+     * stale descriptors, which resends old frames and desynchronises the
+     * driver's tail.
+     */
+    if (prod >= ring || cons >= ring) {
+        EDMA_DBG("kick q=%u: index outside ring (prod=%u cons=%u ring=%u)\n",
+                 q, prod, cons, ring);
+        prod %= ring;
+        cons %= ring;
     }
+    n = (prod + ring - cons) % ring;
     EDMA_DBG("kick q=%u prod=%u cons=%u n=%u base=%08x\n",
              q, prod, cons, n, base);
     if (!n) {
@@ -2664,37 +3204,47 @@ static void edma_tx_kick(IPQEdma *e, unsigned q)
     }
 
     for (i = 0; i < n; i++) {
-        uint8_t tpd[IPQ_EDMA_TPD_SIZE];
-        uint16_t len;
+        uint8_t tpd[EDMA_TPD_SIZE];
+        uint32_t word1, word3, addr;
+        uint16_t dlen;
 
         if (!base) {
             cons = (cons + 1) % ring;
             continue;
         }
         dma_memory_read(&address_space_memory,
-                        (hwaddr)base + (hwaddr)cons * IPQ_EDMA_TPD_SIZE,
+                        (hwaddr)base + (hwaddr)cons * EDMA_TPD_SIZE,
                         tpd, sizeof(tpd), MEMTXATTRS_UNSPECIFIED);
+        dlen = lduw_le_p(tpd + 0);
+        word1 = ldl_le_p(tpd + 4);
+        addr = ldl_le_p(tpd + 8);
+        word3 = ldl_le_p(tpd + 12);
+
         if (env_u32("QEMU_IPQ_EDMA_LOG", 0) > 1) {
-            uint8_t frame[96];
-            uint32_t a8 = ldl_le_p(tpd + 8) & ~3u;
-            uint32_t a4 = ldl_le_p(tpd + 4) & ~3u;
+            uint8_t peek[64];
 
             edma_hexdump("tpd", tpd, sizeof(tpd));
-            if ((a4 >= 0x80000000u && a4 < 0x90000000u)) {
-                dma_memory_read(&address_space_memory, a4, frame, 64,
+            if (addr >= 0x80000000u && addr < 0x90000000u &&
+                dlen >= 16) {
+                dma_memory_read(&address_space_memory, addr, peek, 48,
                                 MEMTXATTRS_UNSPECIFIED);
-                edma_hexdump("buf@+4", frame, 64);
-            }
-            if ((a8 >= 0x80000000u && a8 < 0x90000000u)) {
-                dma_memory_read(&address_space_memory, a8, frame, 64,
-                                MEMTXATTRS_UNSPECIFIED);
-                edma_hexdump("buf@+8", frame, 64);
+                edma_hexdump("frame", peek, 48);
             }
         }
-        len = lduw_le_p(tpd + 4);
-        e->tx_byte[q] += len;
-        if (ldl_le_p(tpd + 8) & EDMA_TPD_EOP) {
+
+        EDMA_DBG("tpd q=%u slot=%u len=%u addr=%08x word1=%08x word3=%08x\n",
+                 q, cons, dlen, addr, word1, word3);
+        e->tx_byte[q] += dlen;
+        if (dlen && flen + dlen <= EDMA_MAX_FRAME &&
+            addr >= 0x80000000u && addr < 0x90000000u) {
+            dma_memory_read(&address_space_memory, addr, e->txbuf + flen,
+                            dlen, MEMTXATTRS_UNSPECIFIED);
+            flen += dlen;
+        }
+        if (word1 & EDMA_TPD_EOP) {
             e->tx_pkt[q]++;
+            edma_tx_frame(e, e->txbuf, flen, word1, word3);
+            flen = 0;
         }
         cons = (cons + 1) % ring;
     }
@@ -2702,6 +3252,99 @@ static void edma_tx_kick(IPQEdma *e, unsigned q)
     e->regs[EDMA_REG_TPD_IDX_Q(q) / 4] = (cons << EDMA_TPD_CONS_SHIFT) | prod;
     e->regs[EDMA_REG_TX_ISR / 4] |= 1u << q;
     edma_update_irqs(e);
+}
+
+/* ------------------------------------------------------------------ */
+/* The host side: one QEMU net client, one bridged switch port         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The engine's net client.  It is created with qemu_new_nic(), not
+ * qemu_new_net_client(): QEMU's packet delivery path calls qemu_get_nic() on
+ * every client whose type is NET_CLIENT_DRIVER_NIC, and that helper recovers
+ * the NICState by subtracting info->size from the NetClientState -- which is
+ * only correct for the layout qemu_new_nic() allocates.  A plain
+ * qemu_new_net_client() client has no NICState in front of it, so the very
+ * first received frame dereferenced a bogus reentrancy_guard and QEMU died.
+ *
+ * info->size is therefore sizeof(NICState): the per-queue state we need lives
+ * in IPQEdma, and the client is reached through qemu_get_queue(nic).
+ */
+static ssize_t edma_net_receive(NetClientState *nc, const uint8_t *buf,
+                                size_t size)
+{
+    IPQEdma *e = qemu_get_nic_opaque(nc);
+
+    NET_TRACE("rx %zuB\n", size);
+    edma_rx_deliver(e, buf, size);
+    return size;
+}
+
+static bool edma_net_can_receive(NetClientState *nc)
+{
+    IPQEdma *e = qemu_get_nic_opaque(nc);
+
+    /* Keep room for two full-size frames so a burst is not dropped. */
+    return edma_rx_free(e, 0, NULL, NULL, NULL, NULL) >= 2;
+}
+
+static void edma_net_link_status(NetClientState *nc)
+{
+    IPQEdma *e = qemu_get_nic_opaque(nc);
+
+    ipq_eth_set_host_link(e->bridge_port, !nc->link_down);
+}
+
+static NetClientInfo edma_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .receive = edma_net_receive,
+    .can_receive = edma_net_can_receive,
+    .link_status_changed = edma_net_link_status,
+};
+
+/*
+ * Attach the engine to a QEMU network backend.  QEMU_IPQ_NETDEV names the
+ * -netdev (default "net0") and QEMU_IPQ_ETH_BRIDGE_PORT the switch port wired
+ * to it (default 5, the front-panel port the DTS calls lan1).  Without a
+ * matching -netdev the machine still boots and simply drops every frame, the
+ * way it did before there was a packet path at all.
+ */
+static void edma_connect_netdev(IPQEdma *e)
+{
+    const char *id = getenv("QEMU_IPQ_NETDEV");
+    const char *bridge = getenv("QEMU_IPQ_ETH_BRIDGE_PORT");
+    NetClientState *peer;
+    NICState *nic;
+
+    e->bridge_port = bridge ? atoi(bridge) : 5;
+    if (e->bridge_port < 0 || e->bridge_port > 6) {
+        warn_report("ipq4019: bad QEMU_IPQ_ETH_BRIDGE_PORT '%s'", bridge);
+        e->bridge_port = 5;
+    }
+    e->txbuf = g_malloc(EDMA_MAX_FRAME);
+    e->segbuf = g_malloc(EDMA_MAX_FRAME);
+
+    if (!id) {
+        id = "net0";
+    }
+    peer = qemu_find_netdev(id);
+    if (!peer) {
+        if (getenv("QEMU_IPQ_NETDEV")) {
+            warn_report("ipq4019: no -netdev with id '%s'; Ethernet frames "
+                        "are dropped", id);
+        }
+        return;
+    }
+    e->nic.peers.ncs[0] = peer;
+    e->nic.peers.queues = 1;
+    nic = qemu_new_nic(&edma_net_info, &e->nic, "ipqess", "eth0",
+                       &e->rx_guard, e);
+    e->nc = qemu_get_queue(nic);
+    e->host_link = !peer->link_down;
+    ipq_eth_set_host_link(e->bridge_port, e->host_link);
+    info_report("ipq4019: eth0 -> -netdev '%s' on switch port %d (%s)",
+                id, e->bridge_port, ipq_port_name(e->bridge_port));
 }
 
 static uint64_t edma_read(void *opaque, hwaddr off, unsigned size)
@@ -2727,7 +3370,18 @@ static void edma_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 
     for (q = 0; q < IPQ_EDMA_QUEUES; q++) {
         if (off == EDMA_REG_TPD_IDX_Q(q)) {
-            e->regs[off / 4] = (uint32_t)val;   /* the producer index */
+            /*
+             * The driver publishes the producer index with a plain 32-bit
+             * write (ipqess_kick_tx() writes tx_ring->head), so the upper
+             * half of the value is *not* the consumer index -- the engine
+             * owns that half and keeps it across the write.  Storing the
+             * value verbatim reset the consumer to 0 on every kick and made
+             * the engine re-walk descriptor slots the driver had already
+             * freed and reused, which put pages of unrelated guest memory on
+             * the wire as 70-byte "frames".
+             */
+            e->regs[off / 4] = (e->regs[off / 4] & 0xffff0000u) |
+                               ((uint32_t)val & EDMA_TPD_PROD_MASK);
             edma_tx_kick(e, q);
             return;
         }
@@ -3092,6 +3746,47 @@ static IPQPhy *mdio_lookup(IPQMdio *m, int addr)
         }
     }
     return NULL;
+}
+
+/*
+ * The switch port names come from the board's DTS (`ports/port@N/label`), and
+ * the IPQ4019 reference design puts the CPU port at 0, wan on port 1 and the
+ * four LAN ports on 2..5 in reverse order.  That is also the order DSA
+ * registers them, and each user port N is wired to MDIO address N - 1.
+ */
+static const char *ipq_port_name(int port)
+{
+    static const char *const names[] = {
+        "cpu", "wan", "lan4", "lan3", "lan2", "lan1",
+    };
+
+    if (port < 0 || port >= (int)ARRAY_SIZE(names)) {
+        return "?";
+    }
+    return names[port];
+}
+
+/*
+ * Reflect the host backend's carrier on the PHY of the bridged switch port.
+ * A tap or bridge whose link is down should look like an unplugged cable, not
+ * like a port that reports link up and silently eats every frame.
+ */
+static void ipq_eth_set_host_link(int switch_port, bool up)
+{
+    IPQPhy *p;
+
+    if (!ipq_mdio || switch_port < 1) {
+        return;
+    }
+    p = mdio_lookup(ipq_mdio, switch_port - 1);
+    if (!p) {
+        return;
+    }
+    if (p->link != up) {
+        info_report("ipq4019: %s: host link %s",
+                    ipq_port_name(switch_port), up ? "up" : "down");
+    }
+    p->link = up;
 }
 
 static uint64_t mdio_read(void *opaque, hwaddr off, unsigned size)
@@ -4402,6 +5097,13 @@ static void ipq4019_diag(void *opaque)
            h, v, v - ipq_diag_last_virtual,
            (uint32_t)cpu->env.regs[15], cs->halted,
            cs->interrupt_request, (unsigned)cpu->env.daif);
+    if (ipq_edma) {
+        printf("diag: net tx=%" PRIu64 " (noport=%" PRIu64 " nolink=%" PRIu64
+               ") rx=%" PRIu64 " (dropped=%" PRIu64 ")\n",
+               ipq_edma->tx_host, ipq_edma->tx_drop_noport,
+               ipq_edma->tx_drop_nolink, ipq_edma->rx_host,
+               ipq_edma->rx_dropped);
+    }
     fflush(stdout);
     ipq_diag_last_virtual = v;
     timer_mod_ns(ipq_diag_timer, h + 2 * NANOSECONDS_PER_SECOND);
@@ -4855,6 +5557,8 @@ static void ipq4019_init(MachineState *machine)
     if (!getenv("QEMU_IPQ_EDMA_NO_IRQ")) {
         edma_wire_irqs(ipq_gic_device);
     }
+    /* Attach the engine to a host backend, if the user gave us one. */
+    edma_connect_netdev(ipq_edma);
     /* TCSR: SoC revision, boot option and strap registers */
     add_stub(sysmem, 0x1900000, 0x100000, "tcsr");
     /*
