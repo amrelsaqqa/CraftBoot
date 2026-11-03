@@ -114,6 +114,7 @@
 #define IPQ_PRNG_BASE     0x00022000u
 #define IPQ_GCNT_BASE     0x004a1000u
 #define IPQ_PSHOLD_BASE   0x004ab000u
+#define IPQ_WDT_BASE      0x0b017000u
 #define IPQ_TLMM_BASE     0x01000000u
 #define IPQ_TLMM_SIZE     0x00300000u
 #define IPQ_GCC_BASE      0x01800000u
@@ -422,6 +423,169 @@ static void pshold_write(void *opaque, hwaddr off, uint64_t v, unsigned size)
 static const MemoryRegionOps pshold_ops = {
     .read = pshold_read,
     .write = pshold_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/*
+ * KPSS watchdog at 0x0b017000: how RouterBOOT restarts the board.
+ *
+ * Leaving the setup menu calls this and then spins in `b .` waiting for the
+ * chip to go away (0x81001b28):
+ *
+ *   mov r0, #0x100        ; bite time, 32.768 kHz ticks
+ *   bl  0x81001acc
+ *   b   .
+ *
+ * and 0x81001acc is mainline qcom_wdt_restart(), write for write:
+ *
+ *   [0x08] = 0            ; WDT_EN   = 0   disable
+ *   [0x04] = 1            ; WDT_RST  = 1   ping
+ *   [0x14] = r0           ; BITE_TIME      hard reset after r0 ticks
+ *   [0x10] = -1           ; BARK_TIME      pretimeout never
+ *   [0x08] = 1            ; WDT_EN   = 1   enable
+ *
+ * The register layout is the one drivers/watchdog/qcom-wdt.c uses for
+ * "qcom,kpss-wdt" (reg_offset_data_kpss), NOT the older apcs-timer layout:
+ *
+ *   0x04 RST   0x08 EN   0x0c STS   0x10 BARK_TIME   0x14 BITE_TIME
+ *
+ * (an earlier version of this model had RST and EN swapped, which turned the
+ * kernel's "disable" into a re-arm -- see below).
+ *
+ * The same routine, with r0 = 0x10000 (2 s), is also how an ordinary boot
+ * hands over to the kernel:
+ *
+ *   0x810095d0  mov r0, #0x10000
+ *   0x810095d4  bl  0x81001acc
+ *
+ * so the model must not fire that one late: Linux's qcom-wdt probes the block,
+ * sees it running and stops it (measured: [0x04]<-1, [0x08]<-0 from
+ * 0x80127dc4, inside the kernel).  With the correct layout that write clears
+ * EN and disarms the countdown, exactly as the driver intends.  With RST/EN
+ * swapped it looked like "enable + kick", the 2 s bite then fired during a
+ * healthy boot, and the board bootlooped.
+ *
+ * BARK is the pretimeout (an interrupt, SPI 4 on this SoC); nothing in these
+ * images sets it to anything but "never", and the machine does not wire the
+ * bark line to the GIC, so bark only records status.  BITE is the reset.
+ *
+ * QEMU_IPQ_WDT_LOG=1 traces every access; QEMU_IPQ_NO_WDT_RESET=1 keeps the
+ * register file without letting the bite reset the machine.
+ */
+#define WDT_RST        0x04
+#define WDT_EN         0x08
+#define WDT_STATUS     0x0c
+#define WDT_BARK_TIME  0x10
+#define WDT_BITE_TIME  0x14
+
+typedef struct IPQWdt {
+    MemoryRegion mr;
+    uint32_t regs[0x1000 / 4];
+    QEMUTimer *bark;
+    QEMUTimer *bite;
+} IPQWdt;
+
+static IPQWdt *ipq_wdt;
+
+static uint64_t wdt_read(void *opaque, hwaddr off, unsigned size)
+{
+    IPQWdt *w = opaque;
+
+    return w->regs[(off & 0xfff) / 4];
+}
+
+static void wdt_disarm(IPQWdt *w)
+{
+    timer_del(w->bark);
+    timer_del(w->bite);
+}
+
+/*
+ * (Re)start both countdowns from now.
+ *
+ * Every write while the block is enabled counts as a kick: the bootloader
+ * programs the time registers after the disable and finishes with the enable,
+ * while a driver's ping is a write to WDT_RST.  Both end up re-arming here.
+ *
+ * 0xffffffff means "never" (RouterBOOT uses it for BARK) and 0 means the
+ * timeout has not been programmed yet, which must not count as "bite now":
+ * the enable arrives before the time registers, and OpenWrt's U-Boot enables
+ * the block while programming a different, vendor-specific register set
+ * ([0x00]=1 ping, [0x24]=0xea600, [0x08]=1 enable, no BITE_TIME at all), so a
+ * zero timeout there would reset the board during U-Boot's own network
+ * initialisation -- which is exactly the bootloop it caused.
+ */
+static void wdt_arm(IPQWdt *w)
+{
+    uint32_t hz = env_u32("QEMU_IPQ_WDT_HZ", 32768);
+    uint32_t bark, bite;
+    int64_t now;
+
+    wdt_disarm(w);
+    if (!(w->regs[WDT_EN / 4] & 1)) {
+        return;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bark = w->regs[WDT_BARK_TIME / 4];
+    bite = w->regs[WDT_BITE_TIME / 4];
+    if (bark != 0xffffffffu && bark) {
+        timer_mod(w->bark, now + (int64_t)bark * NANOSECONDS_PER_SECOND / hz);
+    }
+    if (bite != 0xffffffffu && bite) {
+        timer_mod(w->bite, now + (int64_t)bite * NANOSECONDS_PER_SECOND / hz);
+    }
+}
+
+static void wdt_bark_expire(void *opaque)
+{
+    IPQWdt *w = opaque;
+
+    /* Pretimeout only: the bark line is not wired to the GIC in this machine. */
+    w->regs[WDT_STATUS / 4] |= 1;
+    if (env_true("QEMU_IPQ_WDT_LOG")) {
+        fprintf(stderr, "wdt: bark (pretimeout), not resetting\n");
+    }
+}
+
+static void wdt_bite_expire(void *opaque)
+{
+    IPQWdt *w = opaque;
+
+    w->regs[WDT_STATUS / 4] |= 1;
+    if (env_true("QEMU_IPQ_WDT_LOG")) {
+        fprintf(stderr, "wdt: bite, %s\n",
+                env_true("QEMU_IPQ_NO_WDT_RESET") ? "not resetting"
+                                                  : "resetting");
+    }
+    if (!env_true("QEMU_IPQ_NO_WDT_RESET")) {
+        wdt_disarm(w);
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
+
+static void wdt_write(void *opaque, hwaddr off, uint64_t v, unsigned size)
+{
+    IPQWdt *w = opaque;
+    hwaddr reg = off & 0xfff;
+
+    if (env_true("QEMU_IPQ_WDT_LOG")) {
+        fprintf(stderr, "wdt: [%02" HWADDR_PRIx "] <- 0x%08" PRIx64 "%s\n",
+                reg, v, trace_pc());
+    }
+    w->regs[reg / 4] = v;
+
+    if (reg == WDT_EN && !(v & 1)) {
+        wdt_disarm(w);
+        return;
+    }
+    wdt_arm(w);
+}
+
+static const MemoryRegionOps wdt_ops = {
+    .read = wdt_read,
+    .write = wdt_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
@@ -5208,6 +5372,11 @@ static void ipq4019_dev_reset(void *opaque)
     if (ipq_pshold) {
         ipq_pshold->val = 1;            /* rails back up */
     }
+
+    if (ipq_wdt) {
+        wdt_disarm(ipq_wdt);
+        memset(ipq_wdt->regs, 0, sizeof(ipq_wdt->regs));
+    }
 }
 
 static void ipq4019_reset(void *opaque)
@@ -5510,6 +5679,16 @@ static void ipq4019_init(MachineState *machine)
         ipq_pshold = ps;
         memory_region_init_io(mr, NULL, &pshold_ops, ps, "pshold", 0x1000);
         memory_region_add_subregion(sysmem, IPQ_PSHOLD_BASE, mr);
+    }
+    {
+        IPQWdt *w = g_new0(IPQWdt, 1);
+
+        w->bark = timer_new_ns(QEMU_CLOCK_VIRTUAL, wdt_bark_expire, w);
+        w->bite = timer_new_ns(QEMU_CLOCK_VIRTUAL, wdt_bite_expire, w);
+        ipq_wdt = w;
+        memory_region_init_io(&w->mr, NULL, &wdt_ops, w, "wdt", 0x1000);
+        /* The page sits inside the 0x0b000000 apcs stub. */
+        memory_region_add_subregion_overlap(sysmem, IPQ_WDT_BASE, &w->mr, 1);
     }
     add_stub(sysmem, 0x400000, 0x1000, "ddr-ctl");
     add_stub(sysmem, 0x4a0000, 0x1000, "timer-ctl");
