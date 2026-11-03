@@ -4354,6 +4354,14 @@ typedef struct IPQUart {
      * middle of a typed line).
      */
     uint32_t rx_total;          /* bytes moved to DRAM since DMRX/read */
+    /*
+     * Set the first time software turns on the BAM receiver on this port, and
+     * cleared only by a device reset.  This is what tells a PIO reader (the
+     * bootloaders, which poll MISR bit 3 and take bytes out of the FIFO word)
+     * from a DMA reader (msm_serial), and it has to be remembered because the
+     * kernel drops RX_BAM_ENABLE in the very read that asks for the snapshot.
+     */
+    bool rx_dma_seen;
     bool rx_stale;              /* partial word waiting for the timeout */
     QEMUTimer *stale_timer;
 } IPQUart;
@@ -4376,6 +4384,41 @@ static DeviceState *ipq_gic_device;
  */
 #define UART_DMEN_RX_BAM_ENABLE (1u << 3)
 
+/*
+ * Is the receiver in PIO mode?
+ *
+ * The two halves of the receiver want different things from the same
+ * registers, and the bootloaders use the other half than the kernel does:
+ *
+ *   PIO (DMEN RX BAM clear)  SBL1, RouterBOOT and U-Boot poll MISR bit 3 and
+ *                            then take bytes straight out of the FIFO word.
+ *                            Nothing else ever looks at the FIFO, so bit 3
+ *                            has to say "a byte is buffered" and RX_TOTAL_SNAP
+ *                            has to be the FIFO depth.
+ *
+ *   BAM (DMEN RX BAM set)     msm_serial never touches the FIFO: it posts a
+ *                            descriptor, the engine moves bytes into DRAM and
+ *                            the idle timeout retires the buffer.  Its
+ *                            interrupt handler services receive on `tst
+ *                            r6,#0x18`, so bit 3 is already part of what it
+ *                            accepts, and RX_TOTAL_SNAP is the bytes moved to
+ *                            DRAM since the buffer was posted.
+ *
+ * Every rule below therefore keys off this: a PIO reader gets the bootloader
+ * contract, a DMA reader keeps the behaviour it has always had.
+ */
+static bool uart_rx_is_pio(const IPQUart *u)
+{
+    /*
+     * Latched, not `u->dmen`: msm_serial clears RX_BAM_ENABLE around its own
+     * housekeeping and then still reads RX_TOTAL_SNAP to learn how many bytes
+     * the engine moved (measured: DMEN clear, one byte moved, so a live test
+     * reports the FIFO's 0 and the driver throws the character away).  Once a
+     * BAM receiver has been armed on this port the reader is that kind of
+     * reader for good; a bootloader never arms it at all.
+     */
+    return !u->rx_dma_seen;
+}
 
 static uint32_t uart_isr(IPQUart *u)
 {
@@ -4386,8 +4429,16 @@ static uint32_t uart_isr(IPQUart *u)
     if (u->rx_count >= 4) {
         isr |= 0x10;                /* RXLEV */
     }
-    if (u->rx_stale) {
-        isr |= 0x08;                /* RXSTALE */
+    /*
+     * Bit 3 is "receive data available" -- the same bit the kernel's handler
+     * accepts as part of `tst r6,#0x18`.  RouterBOOT's getc() (0x81001e48)
+     * and U-Boot's tstc (0x87334b34) test this one bit and nothing else
+     * before taking a character, so a PIO reader that sees it clear never
+     * reads the FIFO and a key press does nothing.  RXSTALE keeps raising it
+     * as well, which is what it meant before.
+     */
+    if (u->rx_stale || (uart_rx_is_pio(u) && u->rx_count)) {
+        isr |= 0x08;                /* RX_READY / RXSTALE */
     }
     return isr;
 }
@@ -4695,11 +4746,20 @@ static uint64_t uart_read(void *opaque, hwaddr off, unsigned size)
          * queued) and then zeroes old_snap_state, so the counter has to
          * restart from zero here or the next stale event would report the
          * bytes that were already handed to the tty.
+         *
+         * A PIO reader wants something else from the same register: the
+         * number of bytes it is about to take out of the FIFO word.
+         * RouterBOOT's getc() (0x81001e84) reads this once, keeps it as its
+         * own byte counter and takes min(snap,4) bytes out of the word, so a
+         * constant 0 turns every key press into a zero-length character that
+         * is silently discarded.
          */
-        uint32_t snap = u->rx_total;
+        uint32_t snap = uart_rx_is_pio(u) ? u->rx_count : u->rx_total;
 
         UART_RX_LOG("%s SNAP -> %u\n", u->name, snap);
-        u->rx_total = 0;
+        if (!uart_rx_is_pio(u)) {
+            u->rx_total = 0;
+        }
         return snap;
     }
     case 0x3c:                  /* DMEN */
@@ -4805,6 +4865,19 @@ static void uart_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         } else if ((val >> 4 & 0xf) == 8) { /* RESET_STALE_INT */
             u->rx_stale = false;
             timer_del(u->stale_timer);
+        } else if (uart_rx_is_pio(u) && (val >> 4 & 0xf) == 3) {
+            /*
+             * RESET_ERROR_STATUS.  RouterBOOT's getc() writes this and
+             * re-initialises the port when it reads a stale receive word, so
+             * the error has to clear here or it would retry against the same
+             * state forever.
+             *
+             * PIO only, deliberately: in DMA mode this timer is what retires
+             * a partially filled receive descriptor, and cancelling it would
+             * strand the driver's posted buffer.
+             */
+            u->rx_stale = false;
+            timer_del(u->stale_timer);
         }
         break;
     case 0x14:                  /* IMR */
@@ -4822,6 +4895,9 @@ static void uart_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         break;
     case 0x3c:
         u->dmen = val;
+        if (val & UART_DMEN_RX_BAM_ENABLE) {
+            u->rx_dma_seen = true;
+        }
         break;
     case 0x40:
         u->ncf_tx = val;
@@ -5097,6 +5173,7 @@ static void ipq4019_dev_reset(void *opaque)
         u->rxq_head = u->rxq_count = 0;
         u->rx_total = 0;
         u->rx_stale = false;
+        u->rx_dma_seen = false;
         uart_update_irq(u);
     }
 
