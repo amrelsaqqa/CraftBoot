@@ -1040,6 +1040,7 @@ static bool nor_range_protected(IPQQupl *q, uint32_t off, uint32_t len)
  * reads 0xff where it used to hold data is worse than a loud failure.
  */
 static int ipq_flash_persist_fd = -1;
+static bool ipq_flash_persist_loaded;   /* the die came from the persist file */
 
 static void nor_persist(const void *src, uint32_t off, uint32_t len)
 {
@@ -1065,15 +1066,26 @@ static void nor_persist(const void *src, uint32_t off, uint32_t len)
     }
 }
 
-static void nor_persist_attach(IPQMem *flash, uint32_t die)
+#define NOR_PERSIST_NONE   (-1)
+#define NOR_PERSIST_EMPTY   0
+#define NOR_PERSIST_LOADED  1
+
+/*
+ * Open the persistent die.  Returns LOADED when the file already holds a die
+ * -- then it has been read into the array and the caller must not load the
+ * dump, because the file *is* the board's flash.  EMPTY means the file was
+ * just created, so the caller loads the dump and calls nor_persist_snapshot()
+ * to make that the initial contents.  NONE means no persist file was asked for.
+ */
+static int nor_persist_preload(IPQMem *flash, uint32_t die, const char *img)
 {
     const char *path = getenv("QEMU_IPQ_FLASH_PERSIST");
-    struct stat st;
+    struct stat st, ist;
     uint32_t done = 0;
     int fd;
 
     if (!path || !*path) {
-        return;
+        return NOR_PERSIST_NONE;
     }
     fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) {
@@ -1086,41 +1098,65 @@ static void nor_persist_attach(IPQMem *flash, uint32_t die)
                      "regular file", path);
         exit(1);
     }
+    /*
+     * Naming the dump itself is allowed -- that is "the chip is the file" --
+     * but it stops being a factory image, so say so once and loudly.
+     */
+    if (img && !stat(img, &ist) && ist.st_dev == st.st_dev &&
+        ist.st_ino == st.st_ino) {
+        warn_report("QEMU_IPQ_FLASH_PERSIST is the dump itself: guest writes "
+                    "will modify %s", img);
+    }
+    ipq_flash_persist_fd = fd;
     if (st.st_size == 0) {
-        while (done < die) {
-            ssize_t n = pwrite(fd, flash->data + done, die - done, done);
-
-            if (n <= 0) {
-                error_report("ipq4019: writing the persist file %s failed: %s",
-                             path, n < 0 ? strerror(errno) : "short write");
-                exit(1);
-            }
-            done += n;
-        }
-        fsync(fd);
-        fprintf(stderr, "ipq4019: flash persist %s created (%u MiB, a copy "
-                "of the dump)\n", path, (unsigned)(die / MiB));
-    } else if ((uint64_t)st.st_size < die) {
+        return NOR_PERSIST_EMPTY;
+    }
+    if ((uint64_t)st.st_size < die) {
         error_report("ipq4019: QEMU_IPQ_FLASH_PERSIST=%s holds %" PRId64
                      " bytes, less than the %u-byte die; remove it to start "
                      "from the dump again", path, (int64_t)st.st_size,
                      (unsigned)die);
         exit(1);
-    } else {
-        while (done < die) {
-            ssize_t n = pread(fd, flash->data + done, die - done, done);
-
-            if (n <= 0) {
-                error_report("ipq4019: reading the persist file %s failed: %s",
-                             path, n < 0 ? strerror(errno) : "short read");
-                exit(1);
-            }
-            done += n;
-        }
-        fprintf(stderr, "ipq4019: flash persist %s loaded (%u MiB)\n", path,
-                (unsigned)(die / MiB));
     }
-    ipq_flash_persist_fd = fd;
+    while (done < die) {
+        ssize_t n = pread(fd, flash->data + done, die - done, done);
+
+        if (n <= 0) {
+            error_report("ipq4019: reading the persist file %s failed: %s",
+                         path, n < 0 ? strerror(errno) : "short read");
+            exit(1);
+        }
+        done += n;
+    }
+    fprintf(stderr, "ipq4019: flash persist %s loaded (%u MiB)\n", path,
+            (unsigned)(die / MiB));
+    ipq_flash_persist_loaded = true;
+    return NOR_PERSIST_LOADED;
+}
+
+/* The file did not exist yet: make it a copy of what the dump produced. */
+static void nor_persist_snapshot(uint32_t die)
+{
+    const char *path = getenv("QEMU_IPQ_FLASH_PERSIST");
+    uint32_t done = 0;
+
+    if (ipq_flash_persist_fd < 0) {
+        return;
+    }
+    while (done < die) {
+        ssize_t n = pwrite(ipq_flash_persist_fd, ipq_flash->data + done,
+                           die - done, done);
+
+        if (n <= 0) {
+            error_report("ipq4019: writing the persist file %s failed: %s",
+                         path, n < 0 ? strerror(errno) : "short write");
+            exit(1);
+        }
+        done += n;
+    }
+    fsync(ipq_flash_persist_fd);
+    fprintf(stderr, "ipq4019: flash persist %s created (%u MiB, a copy of the "
+            "dump)\n", path, (unsigned)(die / MiB));
 }
 
 static void nor_erase(IPQQupl *q, uint32_t off, uint32_t len)
@@ -5330,23 +5366,41 @@ static void ipq_map_ram(MemoryRegion *sysmem, hwaddr base, hwaddr size,
 static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
 {
     const char *path = machine->kernel_filename;
+    bool owned = true;
     gchar *buf;
     gsize len;
     Elf32_Ehdr *eh;
     int i;
 
-    if (!path || !g_file_get_contents(path, &buf, &len, NULL)) {
+    if (path && g_file_get_contents(path, &buf, &len, NULL)) {
+        owned = true;
+    } else if (ipq_flash_persist_loaded && ipq_flash) {
+        /*
+         * No -kernel: the persistent die is the only flash on the board, so
+         * take the boot stage out of it exactly as the PBL would.  This is the
+         * "one file is the chip" mode -- the dump can be absent entirely.
+         */
+        buf = (gchar *)ipq_flash->data;
+        len = ipq_flash_die_size;
+        owned = false;
+        fprintf(stderr, "ipq4019: no -kernel, booting the SBL1 ELF out of the "
+                "persist die\n");
+    } else {
         return false;
     }
     if (len < sizeof(Elf32_Ehdr) || memcmp(buf, ELFMAG, SELFMAG) != 0 ||
         buf[EI_CLASS] != ELFCLASS32 || buf[EI_DATA] != ELFDATA2LSB) {
-        g_free(buf);
+        if (owned) {
+            g_free(buf);
+        }
         return false;
     }
     eh = (Elf32_Ehdr *)buf;
     if (eh->e_machine != EM_ARM ||
         eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > len) {
-        g_free(buf);
+        if (owned) {
+            g_free(buf);
+        }
         return false;
     }
 
@@ -5385,8 +5439,10 @@ static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
 
     ipq4019_elf_entry = eh->e_entry;
     fprintf(stderr, "ipq4019: loaded %s (SBL ELF), entry 0x%08x, %d phdrs\n",
-           path, ipq4019_elf_entry, eh->e_phnum);
-    g_free(buf);
+           path ? path : "the persist die", ipq4019_elf_entry, eh->e_phnum);
+    if (owned) {
+        g_free(buf);
+    }
     return true;
 }
 
@@ -5690,6 +5746,7 @@ static void ipq4019_init(MachineState *machine)
         gchar *buf = NULL;
         gsize len = 0;
         uint32_t die = env_u32("QEMU_IPQ_FLASH_SIZE", IPQ_FLASH_DEFAULT);
+        int pers;
         unsigned int j;
 
         /*
@@ -5714,12 +5771,17 @@ static void ipq4019_init(MachineState *machine)
         ipq_flash_jedec[2] = 31 - clz32(die);
         ipq_flash_jedec_len = 3;
         if (jstr && *jstr) {
-            int n = 0;
             const char *p = jstr;
+            int n = 0;
 
-            while (*p && n < 4) {
-                char *end;
-                unsigned long v;
+            /*
+             * Two hex digits per byte, separators ignored, so "ef4019",
+             * "ef 40 19" and "ef:40:19" all mean the same three bytes.  A
+             * plain strtoul() would swallow "4019" as one number and leave
+             * the RDID one byte long.
+             */
+            while (*p && n < (int)sizeof(ipq_flash_jedec)) {
+                int hi, lo;
 
                 while (*p && !g_ascii_isxdigit(*p)) {
                     p++;
@@ -5727,13 +5789,19 @@ static void ipq4019_init(MachineState *machine)
                 if (!*p) {
                     break;
                 }
-                v = strtoul(p, &end, 16);
-                ipq_flash_jedec[n++] = v & 0xff;
-                p = end;
+                if (!p[1] || !g_ascii_isxdigit(p[1])) {
+                    n = -1;
+                    break;
+                }
+                hi = g_ascii_xdigit_value(p[0]);
+                lo = g_ascii_xdigit_value(p[1]);
+                ipq_flash_jedec[n++] = (hi << 4) | lo;
+                p += 2;
             }
             if (n < 2) {
                 error_report("ipq4019: QEMU_IPQ_FLASH_JEDEC='%s' is not a "
-                             "hex byte string like ef4019", jstr);
+                             "hex byte string like ef4019 or 'ef 40 19'",
+                             jstr);
                 exit(1);
             }
             ipq_flash_jedec_len = n;
@@ -5744,20 +5812,36 @@ static void ipq4019_init(MachineState *machine)
         if (!img || !*img) {
             img = machine->kernel_filename;
         }
-        if (img) {
-            g_file_get_contents(img, &buf, &len, NULL);
-        }
-        if (buf) {
-            memcpy(flash->data, buf, MIN(len, flash->size));
-            g_free(buf);
+        /*
+         * A persist file that already holds a die is the board's flash; the
+         * dump is only the programming source and is not needed (or read) at
+         * all, which is what a real board with no programmer attached looks
+         * like.  An empty file is filled from the dump instead.
+         */
+        pers = nor_persist_preload(flash, die, img);
+        if (pers != NOR_PERSIST_LOADED) {
+            if (img) {
+                g_file_get_contents(img, &buf, &len, NULL);
+            }
+            if (buf) {
+                memcpy(flash->data, buf, MIN(len, flash->size));
+                g_free(buf);
+            }
         }
         fprintf(stderr, "ipq4019: flash die %u MiB, RDID", (unsigned)(die / MiB));
         for (j = 0; j < ipq_flash_jedec_len; j++) {
             fprintf(stderr, " %02x", ipq_flash_jedec[j]);
         }
-        fprintf(stderr, ", window %u MiB <- %s (%zu bytes)\n",
-               (unsigned)(IPQ_FLASH_SIZE / MiB), img ? img : "(none)", len);
-        nor_persist_attach(flash, die);
+        if (pers == NOR_PERSIST_LOADED) {
+            fprintf(stderr, ", window %u MiB <- the persist file\n",
+                   (unsigned)(IPQ_FLASH_SIZE / MiB));
+        } else {
+            fprintf(stderr, ", window %u MiB <- %s (%zu bytes)\n",
+                   (unsigned)(IPQ_FLASH_SIZE / MiB), img ? img : "(none)", len);
+        }
+        if (pers == NOR_PERSIST_EMPTY) {
+            nor_persist_snapshot(die);
+        }
     }
     /*
      * MikroTik's APPSBL ELF header is written with a file-offset-compensated
