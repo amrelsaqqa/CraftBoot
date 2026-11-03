@@ -4690,30 +4690,16 @@ static uint64_t uart_read(void *opaque, hwaddr off, unsigned size)
         return u->dmrx;
     case 0x38: {                /* RX_TOTAL_SNAP */
         /*
-         * What the register counts depends on who is draining the port:
-         *
-         *  - PIO (DMEN RX BAM clear, i.e. the bootloaders): the bytes are
-         *    still in the receive FIFO, and that is exactly what a PIO reader
-         *    wants.  RouterBOOT's getc() (0x81001e84) reads this once, keeps
-         *    it as its own byte counter and takes at most four bytes out of
-         *    the FIFO word, so the value has to be the number of valid bytes
-         *    in the word it is about to read.  A constant 0 made every key
-         *    press a zero-length character that was silently thrown away.
-         *
-         *  - BAM/DMA (DMEN RX BAM set): the bytes never touch the FIFO, they
-         *    go straight into the posted descriptor, so the count is the bytes
-         *    moved to DRAM since that buffer was posted.  msm_serial_dm()
-         *    takes `snap - old_snap_state` (what is still queued) and then
-         *    zeroes its own cached value, so the counter restarts from zero
-         *    here or the next stale event would report bytes that were
-         *    already handed to the tty.
+         * Cumulative byte count since the last snapshot, cleared by the
+         * read: msm_serial_dm() takes `snap - old_snap_state` (what is still
+         * queued) and then zeroes old_snap_state, so the counter has to
+         * restart from zero here or the next stale event would report the
+         * bytes that were already handed to the tty.
          */
-        uint32_t snap = uart_bam_rx_armed() ? u->rx_total : u->rx_count;
+        uint32_t snap = u->rx_total;
 
         UART_RX_LOG("%s SNAP -> %u\n", u->name, snap);
-        if (uart_bam_rx_armed()) {
-            u->rx_total = 0;
-        }
+        u->rx_total = 0;
         return snap;
     }
     case 0x3c:                  /* DMEN */
