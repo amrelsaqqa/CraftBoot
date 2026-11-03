@@ -2570,17 +2570,30 @@ typedef struct IPQTLMM {
 static IPQTLMM *ipq_tlmm;
 static unsigned ipq_tlmm_nor_cs_pin = 54;
 static unsigned ipq_tlmm_nand_cs_pin = 59;
-static int ipq_tlmm_cs_level[2] = { -1, -1 };   /* last level seen, per die */
 
 /*
- * A chip select changed: start a new transaction on that die.
+ * A chip select was driven: start a new transaction on that die.
  *
- * Which die is the only thing the edge decides, never whether the pin went
- * high or low: the vendor DTS writes GPIO_ACTIVE_HIGH for both selects while
- * mainline boards write GPIO_ACTIVE_LOW for CS0, and an edge brackets a
- * transfer under either convention.  The die-level state machine is reset on
- * every edge, so a phantom edge (gpiolib setting the idle level at request
- * time) costs nothing -- there are no bytes clocked in it.
+ * *Every* write to the pin's IO register is a boundary, not just one that
+ * changes the level, and that is not a shortcut -- it is what the hardware
+ * stack actually does.  gpiolib asserts a select by writing the pin, and the
+ * write only changes the level if the pin was in the other state; the QCA boot
+ * chain leaves the NAND's select driven (RouterBOOT sets pin 59 to 0x2 and
+ * never drops it), so Linux's first assertion for `spi-nand@1` writes the same
+ * value again and a level-change detector misses it.  The symptom was the
+ * netinstall kernel reading the NOR's id `ef401900` from CS1:
+ *
+ *     spi-nand spi0.1: unknown raw ID ef401900
+ *     spi-nand: probe of spi0.1 failed with error -524
+ *
+ * The die-level state machine is reset on every boundary, so a write that
+ * carries no bytes (a deassertion, or pinctrl setting the pin's direction)
+ * costs nothing.
+ *
+ * Which die is the only thing the write decides, never which way the pin went:
+ * the vendor DTS writes GPIO_ACTIVE_HIGH for both selects while mainline boards
+ * write GPIO_ACTIVE_LOW for CS0, and a write brackets a transfer under either
+ * convention.
  */
 static void ipq_tlmm_cs_changed(unsigned which)
 {
@@ -2588,17 +2601,11 @@ static void ipq_tlmm_cs_changed(unsigned which)
     unsigned pin = which == NAND_CS_NAND ? ipq_tlmm_nand_cs_pin
                                          : ipq_tlmm_nor_cs_pin;
     uint32_t v;
-    int level;
 
     if (!t || !qup_spi || pin * 0x400 + 1 >= t->nregs) {
         return;
     }
     v = t->regs[(pin * 0x1000 + IPQ_TLMM_IO_OFFSET) >> 2];
-    level = (v >> IPQ_TLMM_IO_OUT_BIT) & 1;
-    if (level == ipq_tlmm_cs_level[which]) {
-        return;
-    }
-    ipq_tlmm_cs_level[which] = level;
     if (die_dbg_on()) {
         die_dbg_log("die: pin%u io=0x%08x %s\n", pin, v,
                     which == NAND_CS_NAND ? "nand" : "nor");
