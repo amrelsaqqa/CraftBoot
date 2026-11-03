@@ -817,6 +817,8 @@ typedef struct IPQQupl {
     int dummy_left;
     int cs;                 /* a die is selected (FORCE_CS or a cs-gpio) */
     int cs_force;           /* QUP_IO_CONTROL FORCE_CS (QCA boot drivers) */
+    int cs_owner;           /* CS_OWNER_*: what selected the current die */
+    int cs_gpio_die;        /* die held by a cs-gpio (CS_OWNER_GPIO) */
     int target;             /* which die the pins selected: NAND_CS_* */
     int nand_read;          /* stream the NAND page cache (READ FROM CACHE) */
     int read_data;          /* stream data out of the flash */
@@ -2356,14 +2358,28 @@ static void qup_bus_reset(IPQQupl *q)
 }
 
 /*
- * The bus has two dies, selected from two places depending on who is talking
- * to the QUP: QCA's boot drivers poke FORCE_CS in SPI_IO_CONTROL (the QUP's
- * native chip select, which is CS0/the NOR), while Linux uses the gpio
- * descriptors from cs-gpios and leaves SPI_IO_CONTROL alone.  Either way an
- * assertion starts a die-level transaction and the matching deassertion ends
- * it, so a decoded command never leaks from one die or one message into the
- * next.
+ * There are two dies and two ways to select them, and they are not
+ * interchangeable.
+ *
+ *   - The QUP has one native chip select of its own, CS0, and QCA's boot
+ *     drivers are its only users: they assert it with FORCE_CS in
+ *     SPI_IO_CONTROL and never look at cs-gpios.  It reaches the NOR.
+ *   - A board whose DTS lists cs-gpios selects each die from a TLMM pin
+ *     (54 = CS0/NOR, 59 = CS1/NAND).  Linux's spi-qup keeps programming the
+ *     QUP chip select as well -- spi_qup_set_cs() is installed even with
+ *     use_gpio_descriptors -- but with the opposite convention (it sets
+ *     FORCE_CS on *deassert*), and on this board that pin is not wired to
+ *     either die.
+ *
+ * So the bus has exactly one owner: whichever source claimed it, and a
+ * source may only claim it while it is free.  FORCE_CS therefore reaches the
+ * NOR only when no cs-gpio holds a die -- which is the boot chain's case and
+ * never the kernel's.
  */
+#define CS_OWNER_NONE   0
+#define CS_OWNER_FORCE  1
+#define CS_OWNER_GPIO   2
+
 static void qup_spi_select(IPQQupl *q, int which)
 {
     if (die_dbg_on()) {
@@ -2378,6 +2394,14 @@ static void qup_spi_select(IPQQupl *q, int which)
     qup_bus_reset(q);
 }
 
+/* Whatever owned the bus let go: the die forgets the command in progress. */
+static void qup_deselect(IPQQupl *q)
+{
+    q->cs = 0;
+    q->cs_owner = CS_OWNER_NONE;
+    qup_bus_reset(q);
+}
+
 static void qup_cs_force(IPQQupl *q, int level)
 {
     if (q->cs_force == level) {
@@ -2385,10 +2409,12 @@ static void qup_cs_force(IPQQupl *q, int level)
     }
     q->cs_force = level;
     if (level) {
-        qup_spi_select(q, NAND_CS_NOR);
-    } else {
-        q->cs = 0;
-        qup_bus_reset(q);
+        if (q->cs_owner == CS_OWNER_NONE) {
+            q->cs_owner = CS_OWNER_FORCE;
+            qup_spi_select(q, NAND_CS_NOR);
+        }
+    } else if (q->cs_owner == CS_OWNER_FORCE) {
+        qup_deselect(q);
     }
 }
 
@@ -2544,16 +2570,20 @@ static void qupl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
  * (pinctrl-ipq4019.c: .ctl_reg = 0x1000 * id, .io_reg = 0x4 + 0x1000 * id.)
  *
  * Only one bit in this block is load-bearing for the machine: the SPI NOR
- * chip select.  The OpenWrt DTS describes it as
+ * chip select.  The vendor DTS (the netinstall kernel's) describes both as
  *
- *     cs-gpios = <&tlmm 54 GPIO_ACTIVE_LOW>;
+ *     cs-gpios = <&tlmm 54 0>, <&tlmm 59 0>;    (both GPIO_ACTIVE_HIGH)
  *
- * so the SPI core leaves host->set_cs alone and drives pin 54 through
- * gpiolib instead.  Modelling the IO register is therefore what gives the
- * flashing die its chip-select edges: without it every QUP state RESET would
- * have to be guessed as a transaction boundary, and one SPI message with a
- * separate command and data transfer (which is exactly how spi-mem issues a
- * read) would be chopped in half.
+ * and its pinctrl state asks for `output-high` on the same two pins, so
+ * modelling the IO register is what gives each die its chip-select edges:
+ * without it every QUP state RESET would have to be guessed as a transaction
+ * boundary, and one SPI message with a separate command and data transfer
+ * (which is exactly how spi-mem issues a read) would be chopped in half.
+ *
+ * Note that Linux still programs SPI_IO_CONTROL's FORCE_CS as well, because
+ * spi_qup_set_cs() is installed even when the controller uses gpio
+ * descriptors -- with the opposite sense to QCA's boot drivers.  See
+ * qup_cs_force().
  *
  * The rest of the block only needs to read back what was written: gpiolib
  * does read-modify-writes on these registers.
@@ -2572,28 +2602,23 @@ static unsigned ipq_tlmm_nor_cs_pin = 54;
 static unsigned ipq_tlmm_nand_cs_pin = 59;
 
 /*
- * A chip select was driven: start a new transaction on that die.
+ * A chip select was driven.  What decides is the *level*, not the edge and
+ * not the rest of the register:
  *
- * *Every* write to the pin's IO register is a boundary, not just one that
- * changes the level, and that is not a shortcut -- it is what the hardware
- * stack actually does.  gpiolib asserts a select by writing the pin, and the
- * write only changes the level if the pin was in the other state; the QCA boot
- * chain leaves the NAND's select driven (RouterBOOT sets pin 59 to 0x2 and
- * never drops it), so Linux's first assertion for `spi-nand@1` writes the same
- * value again and a level-change detector misses it.  The symptom was the
- * netinstall kernel reading the NOR's id `ef401900` from CS1:
+ *   - cs-gpios = <&tlmm 54 0>, <&tlmm 59 0> declares both selects
+ *     GPIO_ACTIVE_HIGH and the node does not set SPI_CS_HIGH, so the SPI core
+ *     drives a select LOW and releases it HIGH (spi_set_cs() inverts before
+ *     handing the value to gpiod).  The pinctrl state agrees: mux_cs asks for
+ *     `output-high`, i.e. every select is released at boot.
+ *   - The pin is therefore asserted while the TLMM IO register's output latch
+ *     (bit 1) is 0.  Everything else in that register is pinctrl's business:
+ *     mux_cs programs the pins with a read-modify-write of a reset value of all
+ *     ones, so a release legitimately lands as 0xffffffff and an assertion as
+ *     0xfffffffd.
  *
- *     spi-nand spi0.1: unknown raw ID ef401900
- *     spi-nand: probe of spi0.1 failed with error -524
- *
- * The die-level state machine is reset on every boundary, so a write that
- * carries no bytes (a deassertion, or pinctrl setting the pin's direction)
- * costs nothing.
- *
- * Which die is the only thing the write decides, never which way the pin went:
- * the vendor DTS writes GPIO_ACTIVE_HIGH for both selects while mainline boards
- * write GPIO_ACTIVE_LOW for CS0, and a write brackets a transfer under either
- * convention.
+ * A select is acted on every time it is written, not only when the level
+ * changes: gpiolib takes the pin for each message, and a deassertion followed
+ * by an assertion of the same die is two boundaries.
  */
 static void ipq_tlmm_cs_changed(unsigned which)
 {
@@ -2601,16 +2626,26 @@ static void ipq_tlmm_cs_changed(unsigned which)
     unsigned pin = which == NAND_CS_NAND ? ipq_tlmm_nand_cs_pin
                                          : ipq_tlmm_nor_cs_pin;
     uint32_t v;
+    int asserted;
 
     if (!t || !qup_spi || pin * 0x400 + 1 >= t->nregs) {
         return;
     }
     v = t->regs[(pin * 0x1000 + IPQ_TLMM_IO_OFFSET) >> 2];
+    asserted = ((v >> IPQ_TLMM_IO_OUT_BIT) & 1) == 0;
     if (die_dbg_on()) {
-        die_dbg_log("die: pin%u io=0x%08x %s\n", pin, v,
+        die_dbg_log("die: pin%u io=0x%08x %s %s\n", pin, v,
+                    asserted ? "assert" : "release",
                     which == NAND_CS_NAND ? "nand" : "nor");
     }
-    qup_spi_select(qup_spi, which);
+    if (asserted) {
+        qup_spi_select(qup_spi, which);
+        qup_spi->cs_owner = CS_OWNER_GPIO;
+        qup_spi->cs_gpio_die = which;
+    } else if (qup_spi->cs_owner == CS_OWNER_GPIO &&
+               qup_spi->cs_gpio_die == which) {
+        qup_deselect(qup_spi);
+    }
 }
 
 static uint64_t tlmm_read(void *opaque, hwaddr off, unsigned size)
