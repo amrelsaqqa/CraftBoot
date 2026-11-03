@@ -114,6 +114,7 @@
 #define IPQ_PRNG_BASE     0x00022000u
 #define IPQ_GCNT_BASE     0x004a1000u
 #define IPQ_PSHOLD_BASE   0x004ab000u
+#define IPQ_WDT_BASE      0x0b017000u
 #define IPQ_TLMM_BASE     0x01000000u
 #define IPQ_TLMM_SIZE     0x00300000u
 #define IPQ_GCC_BASE      0x01800000u
@@ -248,14 +249,20 @@ static uint32_t stub_def_read(const IPQStub *s)
 
 static const char *trace_pc(void)
 {
-    static char buf[32];
+    static char buf[48];
     CPUState *cs = current_cpu;
 
     if (!cs) {
         return "";
     }
-    snprintf(buf, sizeof(buf), " pc=%08x",
-             (uint32_t)ARM_CPU(cs)->env.regs[15]);
+    /*
+     * LR as well as PC: the bootloaders do their MMIO through tiny helpers
+     * (`ldr r0,[r0] / bx lr` at 0x81000050 in RouterBOOT), so the access PC
+     * names the helper and only LR says which loop is asking.
+     */
+    snprintf(buf, sizeof(buf), " pc=%08x lr=%08x",
+             (uint32_t)ARM_CPU(cs)->env.regs[15],
+             (uint32_t)ARM_CPU(cs)->env.regs[14]);
     return buf;
 }
 
@@ -422,6 +429,100 @@ static void pshold_write(void *opaque, hwaddr off, uint64_t v, unsigned size)
 static const MemoryRegionOps pshold_ops = {
     .read = pshold_read,
     .write = pshold_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/*
+ * KPSS watchdog at 0x0b017000: how RouterBOOT restarts the board.
+ *
+ * Exiting the setup menu calls a routine that records a reason and arms this
+ * block, then spins in `b .` waiting for the chip to go away:
+ *
+ *   0x81001acc  [base+0x08] = 0        ; clear status
+ *               [base+0x04] = 1        ; enable
+ *               [base+0x14] = 0x100    ; bite time, 32.768 kHz ticks
+ *               [base+0x10] = -1       ; bark time, never
+ *               [base+0x08] = 1        ; kick
+ *   0x81001b28  bl 0x81001acc(0x100) / b .
+ *
+ * The dump's own device tree says what the block is -- `watchdog@b017000`,
+ * compatible "qcom,kpss-wdt" -- and U-Boot pokes the same page right before
+ * handing over to the kernel ([base] = 1, [base+0x24] = 0xea600) but never
+ * writes the enable at +0x04, so arming on the enable is what tells the two
+ * apart.  Modelling it as a plain stub left the bootloop hung forever after
+ * leaving setup, because nothing ever performed the reset it was waiting for.
+ */
+#define WDT_RST        0x00
+#define WDT_EN         0x04
+#define WDT_STS        0x08
+#define WDT_BARK_TIME  0x10
+#define WDT_BITE_TIME  0x14
+
+typedef struct IPQWdt {
+    MemoryRegion mr;
+    uint32_t regs[0x1000 / 4];
+    uint32_t hz;                /* sleep clock, ticks per second */
+    QEMUTimer *bite;
+} IPQWdt;
+
+static IPQWdt *ipq_wdt;
+
+static uint64_t wdt_read(void *opaque, hwaddr off, unsigned size)
+{
+    IPQWdt *w = opaque;
+
+    return w->regs[(off & 0xfff) / 4];
+}
+
+static void wdt_bite(void *opaque)
+{
+    IPQWdt *w = opaque;
+
+    if (env_true("QEMU_IPQ_WDT_LOG")) {
+        qemu_log_mask(LOG_UNIMP, "wdt: bite, requesting reset\n");
+    }
+    w->regs[WDT_STS / 4] = 1;
+    if (!env_true("QEMU_IPQ_NO_WDT_RESET")) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
+
+static void wdt_write(void *opaque, hwaddr off, uint64_t v, unsigned size)
+{
+    IPQWdt *w = opaque;
+    unsigned idx = (off & 0xfff) / 4;
+
+    if (env_true("QEMU_IPQ_WDT_LOG")) {
+        qemu_log_mask(LOG_UNIMP, "wdt: write off 0x%03" HWADDR_PRIx
+                      " <- 0x%08" PRIx64 "%s\n", off, v, trace_pc());
+    }
+    w->regs[idx] = v;
+
+    /*
+     * The counter runs from the enable, and any later write is a kick: the
+     * bootloader writes the bite time after enabling, so arming on the enable
+     * alone would use the reset value.
+     */
+    if ((off & 0xfff) == WDT_EN && !(v & 1)) {
+        timer_del(w->bite);
+        return;
+    }
+    if (w->regs[WDT_EN / 4] & 1) {
+        uint32_t ticks = w->regs[WDT_BITE_TIME / 4];
+
+        if (!ticks) {
+            ticks = 1;
+        }
+        timer_mod(w->bite, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)ticks * NANOSECONDS_PER_SECOND / w->hz);
+    }
+}
+
+static const MemoryRegionOps wdt_ops = {
+    .read = wdt_read,
+    .write = wdt_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
@@ -4679,7 +4780,15 @@ static uint64_t uart_read(void *opaque, hwaddr off, unsigned size)
     if (env_true("QEMU_IPQ_UART_RX_LOG") &&
         (off == 0x08 || off == 0x0c || off == 0x10 || off == 0x14 ||
          off == 0x34 || off == 0x38 || off == 0x3c ||
-         off == 0x70 || off == 0x100)) {
+         off == 0x70 || off == 0x100) &&
+        /*
+         * Level 2 drops the idle polls.  A bootloader waiting for a key reads
+         * 0x10 millions of times a second, and logging that is what once
+         * filled /tmp; with "nothing buffered" reads filtered out the log is
+         * only the interesting transitions.
+         */
+        (env_u32("QEMU_IPQ_UART_RX_LOG", 1) < 2 ||
+         u->rx_count || u->rx_stale)) {
         UART_RX_LOG("%s read off=%02x size=%u rx_count=%u stale=%d%s\n",
                     u->name, (unsigned)off, size, u->rx_count,
                     u->rx_stale, trace_pc());
@@ -4704,16 +4813,29 @@ static uint64_t uart_read(void *opaque, hwaddr off, unsigned size)
         return u->dmrx;
     case 0x38: {                /* RX_TOTAL_SNAP */
         /*
-         * Cumulative byte count since the last snapshot, cleared by the
-         * read: msm_serial_dm() takes `snap - old_snap_state` (what is still
-         * queued) and then zeroes old_snap_state, so the counter has to
-         * restart from zero here or the next stale event would report the
-         * bytes that were already handed to the tty.
+         * The register means "how many bytes the receiver has taken in", and
+         * what that counts depends on who is draining the port:
+         *
+         *  - PIO (DMEN RX BAM clear): the bytes are still in the FIFO, and
+         *    that is exactly what the bootloaders want.  RouterBOOT's getc()
+         *    (0x81001e84) reads this once, keeps it in its own counter,
+         *    consumes at most four bytes of the FIFO word and decrements it
+         *    per byte, so `min(snap,4)` must be the number of valid bytes in
+         *    the word it is about to read -- returning 0 made every key press
+         *    a zero-length character that was silently thrown away.
+         *
+         *  - BAM/DMA (DMEN RX BAM set): the bytes never touch the FIFO, they
+         *    are written straight into the posted descriptor, so the count is
+         *    the bytes moved to DRAM since the buffer was posted.
+         *    msm_complete_rx_dma() takes `snap - old_snap_state` and then
+         *    zeroes its own cached value, so the counter restarts here.
          */
-        uint32_t snap = u->rx_total;
+        uint32_t snap = uart_bam_rx_armed() ? u->rx_total : u->rx_count;
 
         UART_RX_LOG("%s SNAP -> %u\n", u->name, snap);
-        u->rx_total = 0;
+        if (uart_bam_rx_armed()) {
+            u->rx_total = 0;
+        }
         return snap;
     }
     case 0x3c:                  /* DMEN */
@@ -5153,6 +5275,11 @@ static void ipq4019_dev_reset(void *opaque)
     if (ipq_pshold) {
         ipq_pshold->val = 1;            /* rails back up */
     }
+
+    if (ipq_wdt) {
+        timer_del(ipq_wdt->bite);
+        memset(ipq_wdt->regs, 0, sizeof(ipq_wdt->regs));
+    }
 }
 
 static void ipq4019_reset(void *opaque)
@@ -5455,6 +5582,16 @@ static void ipq4019_init(MachineState *machine)
         ipq_pshold = ps;
         memory_region_init_io(mr, NULL, &pshold_ops, ps, "pshold", 0x1000);
         memory_region_add_subregion(sysmem, IPQ_PSHOLD_BASE, mr);
+    }
+    {
+        IPQWdt *w = g_new0(IPQWdt, 1);
+
+        w->hz = env_u32("QEMU_IPQ_WDT_HZ", 32768);
+        w->bite = timer_new_ns(QEMU_CLOCK_VIRTUAL, wdt_bite, w);
+        ipq_wdt = w;
+        memory_region_init_io(&w->mr, NULL, &wdt_ops, w, "wdt", 0x1000);
+        /* Above the apcs stub that covers 0x0b000000..0x0b01ffff. */
+        memory_region_add_subregion_overlap(sysmem, IPQ_WDT_BASE, &w->mr, 1);
     }
     add_stub(sysmem, 0x400000, 0x1000, "ddr-ctl");
     add_stub(sysmem, 0x4a0000, 0x1000, "timer-ctl");
