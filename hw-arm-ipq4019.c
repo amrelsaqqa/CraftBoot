@@ -60,6 +60,10 @@
  *                        1 MiB..64 MiB (default 32 MiB)
  *   QEMU_IPQ_FLASH_JEDEC RDID bytes as hex, e.g. "ef4019" or "20ba19"
  *                        (default: Winbond "ef40" + log2(size))
+ *   QEMU_IPQ_FLASH_PERSIST=<file> keep the die in this file: created as a copy
+ *                        of the dump on the first run, loaded instead of the
+ *                        dump afterwards, and written through on every erase
+ *                        and program.  The dump itself is never modified.
  *   QEMU_IPQ_BAM_VER     BAM version read back from +0x1000 (default 7)
  *   QEMU_IPQ_BAM_EVENT   PIPE_EVENT bits raised when a transfer completes
  *                        (default 0x100000)
@@ -108,6 +112,7 @@
 #include "net/checksum.h"
 #include "net/eth.h"
 #include <libfdt.h>
+#include <sys/stat.h>
 
 #define IPQ_ROM_BASE      0x00000000u
 #define IPQ_ROM_SIZE      0x00040000u
@@ -1018,6 +1023,106 @@ static bool nor_range_protected(IPQQupl *q, uint32_t off, uint32_t len)
     return top ? off + len > die - prot : off < prot;
 }
 
+/*
+ * QEMU_IPQ_FLASH_PERSIST=<file> turns the die into a real device that keeps
+ * what the guest wrote after QEMU exits.
+ *
+ * The dump named on the command line stays a read-only factory image: it is
+ * read into the die at power-on and never written back, so its checksum cannot
+ * change.  The named file is the die itself.  On the first run it is created as
+ * a copy of what the die holds after the dump was loaded; on every later run it
+ * is loaded instead of the dump.  Each erase and each programmed byte is then
+ * mirrored into it with pwrite(2), which is what makes a manual power cycle --
+ * kill QEMU, start a new one -- retain the write.
+ *
+ * One file per dump, one die per file: a persist file that is smaller than the
+ * configured die is refused rather than extended, because a die that suddenly
+ * reads 0xff where it used to hold data is worse than a loud failure.
+ */
+static int ipq_flash_persist_fd = -1;
+
+static void nor_persist(const void *src, uint32_t off, uint32_t len)
+{
+    uint32_t die = ipq_flash_die_size;
+
+    if (ipq_flash_persist_fd < 0 || off >= die) {
+        return;
+    }
+    len = MIN(len, die - off);
+    while (len) {
+        ssize_t n = pwrite(ipq_flash_persist_fd, src, len, off);
+
+        if (n <= 0) {
+            error_report("ipq4019: flash persist write at 0x%06x failed: %s",
+                         off, n < 0 ? strerror(errno) : "short write");
+            close(ipq_flash_persist_fd);
+            ipq_flash_persist_fd = -1;
+            return;
+        }
+        src = (const uint8_t *)src + n;
+        off += n;
+        len -= n;
+    }
+}
+
+static void nor_persist_attach(IPQMem *flash, uint32_t die)
+{
+    const char *path = getenv("QEMU_IPQ_FLASH_PERSIST");
+    struct stat st;
+    uint32_t done = 0;
+    int fd;
+
+    if (!path || !*path) {
+        return;
+    }
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        error_report("ipq4019: QEMU_IPQ_FLASH_PERSIST=%s: %s", path,
+                     strerror(errno));
+        exit(1);
+    }
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        error_report("ipq4019: QEMU_IPQ_FLASH_PERSIST=%s is not a writable "
+                     "regular file", path);
+        exit(1);
+    }
+    if (st.st_size == 0) {
+        while (done < die) {
+            ssize_t n = pwrite(fd, flash->data + done, die - done, done);
+
+            if (n <= 0) {
+                error_report("ipq4019: writing the persist file %s failed: %s",
+                             path, n < 0 ? strerror(errno) : "short write");
+                exit(1);
+            }
+            done += n;
+        }
+        fsync(fd);
+        fprintf(stderr, "ipq4019: flash persist %s created (%u MiB, a copy "
+                "of the dump)\n", path, (unsigned)(die / MiB));
+    } else if ((uint64_t)st.st_size < die) {
+        error_report("ipq4019: QEMU_IPQ_FLASH_PERSIST=%s holds %" PRId64
+                     " bytes, less than the %u-byte die; remove it to start "
+                     "from the dump again", path, (int64_t)st.st_size,
+                     (unsigned)die);
+        exit(1);
+    } else {
+        while (done < die) {
+            ssize_t n = pread(fd, flash->data + done, die - done, done);
+
+            if (n <= 0) {
+                error_report("ipq4019: reading the persist file %s failed: %s",
+                             path, n < 0 ? strerror(errno) : "short read");
+                exit(1);
+            }
+            done += n;
+        }
+        fprintf(stderr, "ipq4019: flash persist %s loaded (%u MiB)\n", path,
+                (unsigned)(die / MiB));
+    }
+    ipq_flash_persist_fd = fd;
+}
+
 static void nor_erase(IPQQupl *q, uint32_t off, uint32_t len)
 {
     if (!ipq_flash) {
@@ -1033,6 +1138,12 @@ static void nor_erase(IPQQupl *q, uint32_t off, uint32_t len)
         return;
     }
     memset(ipq_flash->data + off, 0xff, len);
+    nor_persist(ipq_flash->data + off, off, len);
+    if (ipq_flash_persist_fd >= 0) {
+        /* An erase is the operation a later read depends on most, so give it
+         * a real durability point rather than relying on the page cache. */
+        fsync(ipq_flash_persist_fd);
+    }
     if (env_true("QEMU_IPQ_SPI_LOG")) {
         qemu_log_mask(LOG_UNIMP, "die: erase 0x%06x +0x%x\n",
                       off, (unsigned)len);
@@ -1052,6 +1163,7 @@ static void nor_program_byte(IPQQupl *q, uint8_t b)
     }
     /* Programming can only clear bits; a set bit needs an erase first. */
     ipq_flash->data[q->pgm_addr] &= b;
+    nor_persist(&ipq_flash->data[q->pgm_addr], q->pgm_addr, 1);
     q->pgm_left--;
     /* Past the 256-byte page the die wraps instead of spilling into the next */
     page = q->pgm_addr & ~(NOR_PAGE_SIZE - 1);
@@ -5645,6 +5757,7 @@ static void ipq4019_init(MachineState *machine)
         }
         fprintf(stderr, ", window %u MiB <- %s (%zu bytes)\n",
                (unsigned)(IPQ_FLASH_SIZE / MiB), img ? img : "(none)", len);
+        nor_persist_attach(flash, die);
     }
     /*
      * MikroTik's APPSBL ELF header is written with a file-offset-compensated
