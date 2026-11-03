@@ -497,6 +497,14 @@ static uint32_t gcnt_hz;
 static uint32_t qtimer_hz;
 static uint32_t xo_hz;
 static uint32_t tsc_hz;
+/*
+ * Every counter here reads "virtual clock * rate", so it counts from the
+ * moment QEMU started.  A machine reset re-bases them, because the boot chain
+ * stamps its own log from one of these: without it, SBL1's first line after a
+ * guest reboot reads "13688788 - SBL1, Start" -- the seconds the machine had
+ * already been up -- instead of something near zero.
+ */
+static uint64_t ipq_counter_epoch_ns;
 
 static uint64_t mem_read(void *opaque, hwaddr off, unsigned size)
 {
@@ -4879,8 +4887,8 @@ static uint64_t gcnt_read(void *opaque, hwaddr off, unsigned size)
     uint32_t hz = *(uint32_t *)opaque;
     uint64_t ticks;
 
-    ticks = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), hz,
-                     NANOSECONDS_PER_SECOND);
+    ticks = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                     ipq_counter_epoch_ns, hz, NANOSECONDS_PER_SECOND);
     /* Delay loops read this thousands of times a second: only at TRACE=3. */
     if (env_u32("QEMU_IPQ_TRACE", 0) > 2) {
         qemu_log_mask(LOG_UNIMP, "counter: read off 0x%x -> 0x%x%s\n",
@@ -5046,6 +5054,10 @@ static void ipq4019_dev_reset(void *opaque)
     if (env_true("QEMU_IPQ_NO_DEV_RESET")) {
         return;
     }
+
+    /* Start the QTIMER/GCNT/XO/TSC frames from zero again (SBL1's log stamps,
+     * udelay() baselines and the kernel's early delays all read them). */
+    ipq_counter_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (qup_spi && !env_true("QEMU_IPQ_NO_RESET_QUP")) {
         IPQQupl *q = qup_spi;
