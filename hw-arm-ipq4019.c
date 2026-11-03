@@ -5209,6 +5209,20 @@ static void uart_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         u->dmen = val;
         if (val & UART_DMEN_RX_BAM_ENABLE) {
             u->rx_dma_seen = true;
+            /*
+             * Arming the receiver starts feeding the posted descriptor.  The
+             * driver clears RX_BAM_ENABLE for its own housekeeping, so bytes
+             * can arrive while the engine is off; the stale timeout they
+             * would otherwise wait for has already been consumed by the PIO
+             * branch of uart_stale_expire (which sets RXSTALE and does not
+             * rearm, because a DMA reader has no FIFO interrupt).  Nothing
+             * would ever move them: the guest stops reading in the middle of
+             * a command line and the console is dead from then on.
+             */
+            bam_uart_rx_kick();
+            if (u->rx_count) {
+                uart_rx_idle_arm();
+            }
         }
         break;
     case 0x40:
