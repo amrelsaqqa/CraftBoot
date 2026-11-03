@@ -4383,11 +4383,25 @@ static uint32_t uart_isr(IPQUart *u)
 
     /* The TX FIFO is always drained by the time software looks at it. */
     isr |= 0x01;                    /* TXLEV */
+    /*
+     * RX_READY.  Both bootloaders poll this one bit, and nothing else, before
+     * reading a character:
+     *
+     *   RouterBOOT  ldr r0,[base+0x10] / tst r0,#8  / beq back
+     *   U-Boot      ldr r3,[r2,#0x10] / tst r3,#8  / bne have-data
+     *
+     * and when the bit is clear they never look at the FIFO again -- a key
+     * press at the "press any key" window or at the U-Boot prompt just stops
+     * the boot dead.  Linux's interrupt handler tests bits 3 and 4 together
+     * (`tst r6,#0x18`, then services receive), so raising bit 3 for "a byte is
+     * buffered" is what all three consumers expect.  Bit 4 is the level flag
+     * it has always been.
+     */
+    if (u->rx_count || u->rx_stale) {
+        isr |= 0x08;                /* RX data available (or a stale word) */
+    }
     if (u->rx_count >= 4) {
         isr |= 0x10;                /* RXLEV */
-    }
-    if (u->rx_stale) {
-        isr |= 0x08;                /* RXSTALE */
     }
     return isr;
 }
@@ -4800,6 +4814,14 @@ static void uart_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
                 bam_uart_rx_idle();
             }
             u->rx_head = u->rx_count = 0;
+            u->rx_stale = false;
+            timer_del(u->stale_timer);
+        } else if ((val >> 4 & 0xf) == 3) { /* RESET_ERROR_STATUS */
+            /*
+             * RouterBOOT's getc() writes CR 0x30 and re-initialises the port
+             * when it reads a stale receive word (SR bit 4), so the error has
+             * to be cleared here or it would retry against the same state.
+             */
             u->rx_stale = false;
             timer_del(u->stale_timer);
         } else if ((val >> 4 & 0xf) == 8) { /* RESET_STALE_INT */
