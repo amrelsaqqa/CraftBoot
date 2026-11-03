@@ -64,6 +64,19 @@
  *                        of the dump on the first run, loaded instead of the
  *                        dump afterwards, and written through on every erase
  *                        and program.  The dump itself is never modified.
+ *   QEMU_IPQ_NAND=1      put a SPI NAND behind chip select 1 (the part the
+ *                        vendor DTS names: MX35LF1G24AD, 136 MiB incl. spare);
+ *                        opt-in because it costs 136 MiB of host RAM
+ *   QEMU_IPQ_NAND_PERSIST=<file> keep that die in this file: created erased on
+ *                        the first run, loaded afterwards, written through on
+ *                        every program and fsync'ed on every erase.  Its length
+ *                        must be exactly pages * (page + spare).
+ *   QEMU_IPQ_NAND_SIZE   die size in bytes, a whole number of erase blocks
+ *                        (default 1024 blocks = 136 MiB including spare)
+ *   QEMU_IPQ_NAND_ID     RDID as hex, manufacturer + device (default "c214")
+ *   QEMU_IPQ_NAND_LOG=1  log NAND commands, page reads and erases
+ *   QEMU_IPQ_CS_GPIO     TLMM pin driving NOR chip select (default 54)
+ *   QEMU_IPQ_NAND_CS_GPIO  TLMM pin driving NAND chip select (default 59)
  *   QEMU_IPQ_BAM_VER     BAM version read back from +0x1000 (default 7)
  *   QEMU_IPQ_BAM_EVENT   PIPE_EVENT bits raised when a transfer completes
  *                        (default 0x100000)
@@ -802,9 +815,10 @@ typedef struct IPQQupl {
     uint32_t addr;
     int addr_left;
     int dummy_left;
-    int cs;                 /* die selected: cs_force || cs_gpio */
+    int cs;                 /* a die is selected (FORCE_CS or a cs-gpio) */
     int cs_force;           /* QUP_IO_CONTROL FORCE_CS (QCA boot drivers) */
-    int cs_gpio;            /* cs-gpios pin driven through the TLMM */
+    int target;             /* which die the pins selected: NAND_CS_* */
+    int nand_read;          /* stream the NAND page cache (READ FROM CACHE) */
     int read_data;          /* stream data out of the flash */
     uint32_t rx_off;        /* next flash offset of the data stream */
     uint8_t rx_buf[8];      /* short replies: JEDEC id, status */
@@ -959,6 +973,16 @@ static bool die_dbg_on(void)
 
     /* "0"/"" mean off, like every other knob here; "1" and paths mean on. */
     return v && *v && strcmp(v, "0") != 0;
+}
+
+/*
+ * The guest's PC for a log line.  current_cpu is NULL when the access comes
+ * from the monitor, the gdb stub or a DMA engine rather than from a vCPU, and
+ * a debug line must never be the thing that crashes the machine.
+ */
+static uint32_t die_dbg_pc(void)
+{
+    return current_cpu ? (uint32_t)ARM_CPU(current_cpu)->env.regs[15] : 0;
 }
 
 static void die_dbg_note(uint8_t v)
@@ -1252,6 +1276,605 @@ static void nor_write_start(IPQQupl *q)
     q->wip_pending = 1;             /* one "busy" status read is owed */
 }
 
+/* ------------------------------------------------------------------ */
+/* SPI NAND behind the second chip select                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The board has two dies on the one QUP: the NOR behind chip select 0 (boot
+ * flash, above) and a Macronix SPI NAND behind chip select 1.  The vendor DTS
+ * describes the pair the way mainline spi-qup consumes it:
+ *
+ *     cs-gpios = <&tlmm 54 GPIO_ACTIVE_HIGH>, <&tlmm 59 GPIO_ACTIVE_HIGH>;
+ *     spi-nand@1 { compatible = "spi-nand"; reg = <1>; };
+ *
+ * spi-qup sets host->use_gpio_descriptors, so spi core drives both selects
+ * through gpiolib and never touches the QUP's FORCE_CS: the pin level, not a
+ * controller register, is what tells the two dies apart.  The model therefore
+ * watches TLMM pins 54 and 59 and treats any level change on either as the
+ * start of a new transaction on that die.  That is polarity-free on purpose --
+ * the vendor DTS marks both pins GPIO_ACTIVE_HIGH while every mainline board
+ * writes GPIO_ACTIVE_LOW for CS0 -- and an edge brackets a transfer either way.
+ *
+ * Geometry is the part the DTS names by compatible string, the MX35LF1G24AD:
+ * 1 Gbit, 2048-byte pages with 128 bytes of spare, 64 pages in a 128 KiB erase
+ * block, 1024 blocks.  The spare area is part of the die and part of the die
+ * file, because that is where the bad-block markers live and where the FTL
+ * keeps its erase counters and volume headers.  On-die ECC is modelled as
+ * "nothing to correct, nothing to report": the status register's ECC bits say
+ * a page came back clean, which is what a fresh part does.
+ */
+#define NAND_CS_NOR   0
+#define NAND_CS_NAND  1
+
+#define NAND_PAGE       2048u
+#define NAND_OOB        128u
+#define NAND_STRIDE     (NAND_PAGE + NAND_OOB)   /* one page incl. spare */
+#define NAND_PPBLK      64u                      /* pages per erase block */
+#define NAND_BLKBYTES   (NAND_STRIDE * NAND_PPBLK)   /* 128 KiB + spare */
+
+#define NAND_BLOCKS_DEF 1024u                    /* 128 MiB of pages */
+#define NAND_BYTES_DEF  (NAND_BLKBYTES * NAND_BLOCKS_DEF)   /* 1 Gbit + spare */
+
+/* SPI NAND opcodes (mainline drivers/mtd/nand/spi/) */
+#define NAND_OP_RESET        0xff
+#define NAND_OP_RDID         0x9f
+#define NAND_OP_GET_FEATURE  0x0f
+#define NAND_OP_SET_FEATURE  0x1f
+#define NAND_OP_WREN         0x06
+#define NAND_OP_WRDI         0x04
+#define NAND_OP_PAGE_READ    0x13
+#define NAND_OP_READ_CACHE   0x03    /* x1, no dummy */
+#define NAND_OP_READ_CACHE_F 0x0b    /* x1 fast, 1 dummy byte */
+#define NAND_OP_READ_CACHE_2 0x3b    /* x2, 1 dummy byte */
+#define NAND_OP_READ_CACHE_4 0x6b    /* x4, 1 dummy byte */
+#define NAND_OP_PROG_LOAD    0x02
+#define NAND_OP_PROG_LOAD_R  0x84    /* same, column not reset */
+#define NAND_OP_PROG_LOAD_4  0x32
+#define NAND_OP_PROG_LOAD_R4 0x34
+#define NAND_OP_PROG_EXEC    0x10
+#define NAND_OP_ERASE        0xd8
+
+/* Feature addresses and the bits inside them */
+#define NAND_FEAT_LOCK       0xa0
+#define NAND_FEAT_CFG        0xb0
+#define NAND_FEAT_STATUS     0xc0
+
+#define NAND_ST_OIP          0x01
+#define NAND_ST_WEL          0x02
+#define NAND_ST_EFAIL        0x04
+#define NAND_ST_PFAIL        0x08
+#define NAND_ST_ECC_MASK     0x30
+#define NAND_ST_ECC_CLEAN    0x00
+#define NAND_ST_ECC_FIXED    0x10
+#define NAND_ST_ECC_UNCOR    0x20
+
+#define NAND_CFG_QE          0x01
+#define NAND_CFG_ECC_EN      0x10
+#define NAND_CFG_OTP_EN      0x40
+
+enum {
+    NAND_WR_NONE = 0,
+    NAND_WR_LOAD,                       /* program load: bytes into the cache */
+    NAND_WR_SET_FEATURE,
+};
+
+typedef struct IPQNand {
+    uint8_t *data;              /* the die: NAND_STRIDE bytes per page */
+    uint32_t bytes;             /* size of that array */
+    uint32_t pages;             /* pages in the part (bytes / stride) */
+    uint8_t id[2];              /* manufacturer, device */
+    int id_len;
+
+    uint8_t status;             /* 0xc0: OIP/WEL/E_FAIL/P_FAIL/ECC */
+    uint8_t cfg;                /* 0xb0: QE, ECC enable, OTP */
+    uint8_t lock;               /* 0xa0: block lock bits */
+    int oip;                    /* busy for exactly one status read */
+    int ecc;                    /* ECC bits reported by that same read */
+
+    uint32_t page;              /* row latched by PAGE READ / PROG EXECUTE */
+    uint32_t col;               /* column inside the page cache */
+    uint8_t cache[NAND_STRIDE]; /* the die's internal page cache */
+    int cache_valid;
+
+    int wr_kind;                /* NAND_WR_*: what the data phase does */
+    uint8_t wr_feature;         /* feature register a SET_FEATURE targets */
+
+    int fd;                     /* QEMU_IPQ_NAND_PERSIST, -1 when RAM only */
+    bool loaded;                /* the die came from the persist file */
+} IPQNand;
+
+static IPQNand *ipq_nand;
+
+/* Erased silicon is 0xff; the factory state of this part is "all erased". */
+static void nand_fill_erased(uint8_t *p, uint32_t len)
+{
+    memset(p, 0xff, len);
+}
+
+/* ---- the NAND die file ------------------------------------------------ */
+
+/*
+ * QEMU_IPQ_NAND_PERSIST=<file> is the same contract as the NOR die: the file
+ * *is* the part.  It is created as an erased part on the first run (there is
+ * no NAND image in these dumps to copy -- the board ships blank) and loaded
+ * instead of one afterwards, and every program and erase is mirrored into it
+ * with pwrite(2).  An erase is fsync'ed, a page program is not: the page
+ * cache survives QEMU exiting, and QEMU exiting is what a power cut is here.
+ */
+static void nand_persist(const void *src, uint32_t off, uint32_t len)
+{
+    IPQNand *n = ipq_nand;
+
+    if (!n || n->fd < 0 || off >= n->bytes) {
+        return;
+    }
+    len = MIN(len, n->bytes - off);
+    while (len) {
+        ssize_t r = pwrite(n->fd, src, len, off);
+
+        if (r <= 0) {
+            error_report("ipq4019: nand persist write at 0x%08x failed: %s",
+                         off, r < 0 ? strerror(errno) : "short write");
+            close(n->fd);
+            n->fd = -1;
+            return;
+        }
+        src = (const uint8_t *)src + r;
+        off += r;
+        len -= r;
+    }
+}
+
+/* Returns true when the file already held a die (so it must not be erased). */
+static bool nand_persist_open(IPQNand *n, const char *path)
+{
+    struct stat st;
+    uint32_t done = 0;
+    int fd;
+
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        error_report("ipq4019: QEMU_IPQ_NAND_PERSIST=%s: %s", path,
+                     strerror(errno));
+        exit(1);
+    }
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        error_report("ipq4019: QEMU_IPQ_NAND_PERSIST=%s is not a writable "
+                     "regular file", path);
+        exit(1);
+    }
+    n->fd = fd;
+    if (st.st_size == 0) {
+        return false;
+    }
+    if ((uint64_t)st.st_size != n->bytes) {
+        /*
+         * Unlike the NOR, the size here is not a choice: a NAND die file
+         * carries the spare area, so its length is pages * (page + spare).
+         * A file of any other length is a different part, not a smaller one.
+         */
+        error_report("ipq4019: QEMU_IPQ_NAND_PERSIST=%s holds %" PRId64
+                     " bytes, but this die is %u bytes (%u pages of %u+%u); "
+                     "remove it to start from an erased part", path,
+                     (int64_t)st.st_size, n->bytes, n->pages,
+                     NAND_PAGE, NAND_OOB);
+        exit(1);
+    }
+    while (done < n->bytes) {
+        ssize_t r = pread(fd, n->data + done, n->bytes - done, done);
+
+        if (r <= 0) {
+            error_report("ipq4019: reading the NAND persist file %s failed: %s",
+                         path, r < 0 ? strerror(errno) : "short read");
+            exit(1);
+        }
+        done += r;
+    }
+    n->loaded = true;
+    return true;
+}
+
+static void nand_persist_snapshot(IPQNand *n, const char *path)
+{
+    uint32_t done = 0;
+
+    if (n->fd < 0) {
+        return;
+    }
+    while (done < n->bytes) {
+        ssize_t r = pwrite(n->fd, n->data + done, n->bytes - done, done);
+
+        if (r <= 0) {
+            error_report("ipq4019: writing the NAND persist file %s failed: %s",
+                         path, r < 0 ? strerror(errno) : "short write");
+            exit(1);
+        }
+        done += r;
+    }
+    fsync(n->fd);
+}
+
+/* ---- the NAND command set -------------------------------------------- */
+
+static void nand_xact_reset(void)
+{
+    IPQNand *n = ipq_nand;
+
+    if (!n) {
+        return;
+    }
+    n->wr_kind = NAND_WR_NONE;
+    n->col = 0;
+}
+
+static uint8_t nand_feature_read(uint8_t reg)
+{
+    IPQNand *n = ipq_nand;
+    uint8_t v;
+
+    switch (reg) {
+    case NAND_FEAT_STATUS:
+        v = n->status;
+        if (n->oip) {
+            v |= NAND_ST_OIP;
+        } else {
+            v |= n->ecc;
+            n->ecc = NAND_ST_ECC_CLEAN;
+        }
+        /*
+         * The die is fast enough to finish between commands, so it reports
+         * busy for exactly one read: a driver that polls has to go round the
+         * loop once, and one that does not is not poisoned by a bit that
+         * never clears.  Same trade as the NOR's wip_pending.
+         */
+        n->oip = 0;
+        n->status &= ~NAND_ST_OIP;
+        break;
+    case NAND_FEAT_CFG:
+        v = n->cfg;
+        break;
+    case NAND_FEAT_LOCK:
+        v = n->lock;
+        break;
+    default:
+        v = 0x00;
+        break;
+    }
+    return v;
+}
+
+static void nand_feature_write(uint8_t reg, uint8_t v)
+{
+    IPQNand *n = ipq_nand;
+
+    switch (reg) {
+    case NAND_FEAT_CFG:
+        n->cfg = v & (NAND_CFG_QE | NAND_CFG_ECC_EN | NAND_CFG_OTP_EN);
+        break;
+    case NAND_FEAT_LOCK:
+        n->lock = v;
+        break;
+    default:
+        break;
+    }
+}
+
+static void nand_page_read(uint32_t page)
+{
+    IPQNand *n = ipq_nand;
+
+    n->page = page;
+    if (page < n->pages) {
+        memcpy(n->cache, n->data + page * NAND_STRIDE, NAND_STRIDE);
+    } else {
+        nand_fill_erased(n->cache, NAND_STRIDE);
+    }
+    n->cache_valid = 1;
+    n->oip = 1;
+    n->ecc = NAND_ST_ECC_CLEAN;         /* on-die ECC: nothing to report */
+    if (env_true("QEMU_IPQ_NAND_LOG")) {
+        qemu_log_mask(LOG_UNIMP, "nand: page read %u\n", page);
+    }
+}
+
+static void nand_program_execute(uint32_t page)
+{
+    IPQNand *n = ipq_nand;
+    uint32_t off;
+    int need_erase = 0;
+
+    n->status &= ~NAND_ST_WEL;
+    n->oip = 1;
+    if (!(n->status & NAND_ST_EFAIL) && page >= n->pages) {
+        n->status = (n->status & ~NAND_ST_PFAIL) | NAND_ST_PFAIL;
+        return;
+    }
+    off = page * NAND_STRIDE;
+    /*
+     * Programming can only clear bits.  Do it bit by bit so a page that was
+     * written without an erase keeps the AND of both writes -- that is what
+     * the silicon does, and it is how a broken FTL shows itself as garbage
+     * rather than as a silently correct page.
+     */
+    for (uint32_t i = 0; i < NAND_STRIDE; i++) {
+        uint8_t old = n->data[off + i];
+        uint8_t want = n->cache[i];
+
+        if ((want & ~old) != 0 && i < NAND_PAGE) {
+            need_erase = 1;
+        }
+        n->data[off + i] = old & want;
+    }
+    nand_persist(n->data + off, off, NAND_STRIDE);
+    if (need_erase && env_true("QEMU_IPQ_NAND_LOG")) {
+        qemu_log_mask(LOG_UNIMP, "nand: page %u programmed over an erased-"
+                      "only area; bits stayed 0\n", page);
+    }
+}
+
+static void nand_block_erase(uint32_t row)
+{
+    IPQNand *n = ipq_nand;
+    uint32_t blk = row / NAND_PPBLK;
+    uint32_t off = blk * NAND_BLKBYTES;
+
+    n->status &= ~NAND_ST_WEL;
+    n->oip = 1;
+    if (!(n->status & NAND_ST_EFAIL) && off + NAND_BLKBYTES > n->bytes) {
+        n->status |= NAND_ST_EFAIL;
+        return;
+    }
+    memset(n->data + off, 0xff, NAND_BLKBYTES);
+    nand_persist(n->data + off, off, NAND_BLKBYTES);
+    if (n->fd >= 0) {
+        fsync(n->fd);
+    }
+    if (env_true("QEMU_IPQ_NAND_LOG")) {
+        qemu_log_mask(LOG_UNIMP, "nand: erase block %u (row %u)\n", blk, row);
+    }
+}
+
+/* Opcode phase for the NAND die.  Sets up addr/dummy counts in the QUP. */
+static void nand_opcode(IPQQupl *q, uint8_t op)
+{
+    IPQNand *n = ipq_nand;
+
+    q->nand_read = 0;
+    n->wr_kind = NAND_WR_NONE;
+
+    switch (op) {
+    case NAND_OP_RDID:
+        /* Macronix answers one dummy byte, then manufacturer and device. */
+        q->dummy_left = 1;
+        q->rx_buf[0] = n->id[0];
+        q->rx_buf[1] = n->id[1];
+        q->rx_len = n->id_len;
+        break;
+    case NAND_OP_GET_FEATURE:
+    case NAND_OP_SET_FEATURE:
+        q->addr_left = 1;
+        break;
+    case NAND_OP_RESET:
+        nand_xact_reset();
+        nand_fill_erased(n->cache, NAND_STRIDE);
+        n->cache_valid = 0;
+        n->status = 0;
+        n->oip = 0;
+        break;
+    case NAND_OP_WREN:
+        n->status |= NAND_ST_WEL;
+        break;
+    case NAND_OP_WRDI:
+        n->status &= ~NAND_ST_WEL;
+        break;
+    case NAND_OP_PAGE_READ:
+    case NAND_OP_PROG_EXEC:
+    case NAND_OP_ERASE:
+        q->addr_left = 3;               /* 24-bit page / block address */
+        break;
+    case NAND_OP_READ_CACHE:
+        q->addr_left = 2;               /* 16-bit column */
+        break;
+    case NAND_OP_READ_CACHE_F:
+    case NAND_OP_READ_CACHE_2:
+    case NAND_OP_READ_CACHE_4:
+        q->addr_left = 2;
+        q->dummy_left = 1;
+        break;
+    case NAND_OP_PROG_LOAD:
+    case NAND_OP_PROG_LOAD_R:
+    case NAND_OP_PROG_LOAD_4:
+    case NAND_OP_PROG_LOAD_R4:
+        q->addr_left = 2;               /* 16-bit column */
+        n->wr_kind = NAND_WR_LOAD;
+        break;
+    default:
+        break;
+    }
+    if (env_true("QEMU_IPQ_NAND_LOG")) {
+        qemu_log_mask(LOG_UNIMP, "nand: op 0x%02x\n", op);
+    }
+}
+
+/* The address phase finished: run whatever the command latched. */
+static void nand_address_done(IPQQupl *q)
+{
+    IPQNand *n = ipq_nand;
+
+    switch (q->opcode) {
+    case NAND_OP_GET_FEATURE:
+        q->rx_buf[0] = nand_feature_read((uint8_t)q->last_addr);
+        q->rx_len = 1;
+        break;
+    case NAND_OP_SET_FEATURE:
+        n->wr_feature = (uint8_t)q->last_addr;
+        n->wr_kind = NAND_WR_SET_FEATURE;
+        break;
+    case NAND_OP_PAGE_READ:
+        nand_page_read(q->last_addr & 0xffffff);
+        break;
+    case NAND_OP_PROG_EXEC:
+        if (!(n->status & NAND_ST_WEL)) {
+            if (env_true("QEMU_IPQ_NAND_LOG")) {
+                qemu_log_mask(LOG_UNIMP, "nand: program without WEL ignored\n");
+            }
+            break;
+        }
+        nand_program_execute(q->last_addr & 0xffffff);
+        break;
+    case NAND_OP_ERASE:
+        if (!(n->status & NAND_ST_WEL)) {
+            if (env_true("QEMU_IPQ_NAND_LOG")) {
+                qemu_log_mask(LOG_UNIMP, "nand: erase without WEL ignored\n");
+            }
+            break;
+        }
+        nand_block_erase(q->last_addr & 0xffffff);
+        break;
+    case NAND_OP_READ_CACHE:
+    case NAND_OP_READ_CACHE_F:
+    case NAND_OP_READ_CACHE_2:
+    case NAND_OP_READ_CACHE_4:
+        n->col = q->last_addr & 0xffff;
+        q->nand_read = 1;
+        break;
+    case NAND_OP_PROG_LOAD:
+    case NAND_OP_PROG_LOAD_R:
+    case NAND_OP_PROG_LOAD_4:
+    case NAND_OP_PROG_LOAD_R4:
+        n->col = q->last_addr & 0xffff;
+        break;
+    default:
+        break;
+    }
+}
+
+/* One byte in the data phase, written by the master. */
+static void nand_data_byte(uint8_t b)
+{
+    IPQNand *n = ipq_nand;
+
+    switch (n->wr_kind) {
+    case NAND_WR_LOAD:
+        n->cache[n->col % NAND_STRIDE] = b;
+        n->col++;
+        break;
+    case NAND_WR_SET_FEATURE:
+        nand_feature_write(n->wr_feature, b);
+        n->wr_kind = NAND_WR_NONE;
+        break;
+    default:
+        break;
+    }
+}
+
+/* One byte out of the data phase, read by the master. */
+static uint8_t nand_miso(IPQQupl *q)
+{
+    IPQNand *n = ipq_nand;
+
+    if (q->nand_read) {
+        uint8_t v = n->cache_valid ? n->cache[n->col % NAND_STRIDE] : 0xff;
+
+        n->col++;
+        q->data_bytes++;
+        die_dbg_note(v);
+        return v;
+    }
+    if (q->rx_pos < q->rx_len) {
+        return q->rx_buf[q->rx_pos++];
+    }
+    return 0x00;
+}
+
+/* ---- instantiation ---------------------------------------------------- */
+
+/*
+ * QEMU_IPQ_NAND=1 puts the part on the board; QEMU_IPQ_NAND_PERSIST=... both
+ * instantiates it and gives it a die file.  Geometry is fixed to the part the
+ * vendor DTS names, because the whole point of the file is that it is a raw
+ * dump of *that* chip: 1024 blocks of 64 pages, 2048+128 bytes each.
+ */
+static void nand_init(void)
+{
+    const char *path = getenv("QEMU_IPQ_NAND_PERSIST");
+    const char *idstr = getenv("QEMU_IPQ_NAND_ID");
+    uint32_t per_page = NAND_STRIDE * NAND_PPBLK;
+    IPQNand *n;
+
+    if ((!path || !*path) && !env_true("QEMU_IPQ_NAND")) {
+        return;
+    }
+    n = g_new0(IPQNand, 1);
+    n->bytes = NAND_BYTES_DEF;
+    if (env_u32("QEMU_IPQ_NAND_SIZE", 0)) {
+        uint32_t want = env_u32("QEMU_IPQ_NAND_SIZE", 0);
+
+        if (want < per_page || want % per_page) {
+            error_report("ipq4019: QEMU_IPQ_NAND_SIZE=%u must be a whole "
+                         "number of %u-byte erase blocks", want, per_page);
+            exit(1);
+        }
+        n->bytes = want;
+    }
+    n->pages = n->bytes / NAND_STRIDE;
+    n->id[0] = 0xc2;                    /* Macronix */
+    n->id[1] = 0x14;                    /* MX35LF1G24AD */
+    n->id_len = 2;
+    if (idstr && *idstr) {
+        const char *p = idstr;
+        int got = 0;
+
+        while (*p && got < (int)sizeof(n->id)) {
+            int hi, lo;
+
+            while (*p && !g_ascii_isxdigit(*p)) {
+                p++;
+            }
+            if (!*p) {
+                break;
+            }
+            if (!p[1] || !g_ascii_isxdigit(p[1])) {
+                got = -1;
+                break;
+            }
+            hi = g_ascii_xdigit_value(p[0]);
+            lo = g_ascii_xdigit_value(p[1]);
+            n->id[got++] = (hi << 4) | lo;
+            p += 2;
+        }
+        if (got != 2) {
+            error_report("ipq4019: QEMU_IPQ_NAND_ID='%s' is not a two-byte "
+                         "id like c214", idstr);
+            exit(1);
+        }
+    }
+    n->data = g_malloc(n->bytes);
+    nand_fill_erased(n->data, n->bytes);
+    nand_fill_erased(n->cache, NAND_STRIDE);
+    n->status = 0;
+    n->fd = -1;
+    ipq_nand = n;
+
+    if (path && *path) {
+        if (!nand_persist_open(n, path)) {
+            nand_persist_snapshot(n, path);
+            fprintf(stderr, "ipq4019: nand persist %s created (%u MiB, %u "
+                    "pages of %u+%u, erased)\n", path,
+                    (unsigned)(n->bytes / MiB), n->pages, NAND_PAGE, NAND_OOB);
+        } else {
+            fprintf(stderr, "ipq4019: nand persist %s loaded (%u MiB, %u "
+                    "pages of %u+%u)\n", path, (unsigned)(n->bytes / MiB),
+                    n->pages, NAND_PAGE, NAND_OOB);
+        }
+    }
+    fprintf(stderr, "ipq4019: nand die %u MiB, RDID c2 %02x, %u pages of %u+%u, "
+            "%u blocks%s\n", (unsigned)(n->bytes / MiB), n->id[1], n->pages,
+            NAND_PAGE, NAND_OOB, n->pages / NAND_PPBLK,
+            (path && *path) ? " <- the persist file" : " (RAM only)");
+}
+
 static void qup_spi_opcode(IPQQupl *q, uint8_t op)
 {
     uint8_t prev_op = q->opcode;
@@ -1273,6 +1896,11 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
                       op, prev_op, q->last_addr, q->data_bytes);
     }
     q->data_bytes = 0;
+
+    if (q->target == NAND_CS_NAND && ipq_nand) {
+        nand_opcode(q, op);
+        return;
+    }
 
     switch (op) {
     case 0x03:                          /* READ */
@@ -1410,14 +2038,15 @@ static void qup_spi_byte(IPQQupl *q, uint8_t b)
             q->rx_off = q->addr;
             q->last_addr = q->addr;
             q->phase = q->dummy_left ? 2 : 3;
-            if (q->wr_kind) {
+            if (q->target == NAND_CS_NAND && ipq_nand) {
+                nand_address_done(q);
+            } else if (q->wr_kind) {
                 nor_write_start(q);
             }
             die_dbg_n = 0;
             if (die_dbg_on()) {
                 die_dbg_log("die: xact op=0x%02x addr=0x%08x pc=%08x\n",
-                            q->opcode, q->addr,
-                            (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+                            q->opcode, q->addr, die_dbg_pc());
             }
             if (env_true("QEMU_IPQ_SPI_LOG")) {
                 qemu_log_mask(LOG_UNIMP, "spi-cmd 0x%02x addr 0x%06x\n",
@@ -1436,7 +2065,9 @@ static void qup_spi_byte(IPQQupl *q, uint8_t b)
          * write (SBL1 clears a block-protect bit during init and reads it
          * back), a page program, or nothing at all.
          */
-        if (q->write_sr) {
+        if (q->target == NAND_CS_NAND && ipq_nand) {
+            nand_data_byte(b);
+        } else if (q->write_sr) {
             int idx = 3 - q->write_sr;
 
             if (idx == 0) {
@@ -1457,6 +2088,9 @@ static uint8_t qup_miso(IPQQupl *q)
 {
     if (q->phase != 3) {
         return 0x00;
+    }
+    if (q->target == NAND_CS_NAND && ipq_nand) {
+        return nand_miso(q);
     }
     if (q->read_data) {
         uint8_t v = qup_flash_byte(q->rx_off++ & (ipq_flash_die_size - 1));
@@ -1483,7 +2117,7 @@ static void qup_clock(IPQQupl *q, uint8_t mosi)
 
     if (die_dbg_on() && q->phase <= 2) {
         die_dbg_log("die: mosi %02x phase=%d pc=%08x\n", mosi, q->phase,
-                    (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+                    die_dbg_pc());
     }
 
     if (q->resp_head + q->resp_len < (int)q->resp_cap) {
@@ -1713,43 +2347,47 @@ static void qup_bus_reset(IPQQupl *q)
     q->addr_left = 0;
     q->dummy_left = 0;
     q->read_data = 0;
+    q->nand_read = 0;
     q->rx_off = 0;
     q->rx_len = 0;
     q->rx_pos = 0;
     qup_fifo_flush(q);
+    nand_xact_reset();
 }
 
 /*
- * The die has exactly one chip select, driven from two places depending on
- * who is talking to the QUP: QCA's boot drivers poke FORCE_CS in
- * SPI_IO_CONTROL, while Linux uses the gpio descriptor from cs-gpios and
- * leaves SPI_IO_CONTROL alone.  Both are ORed into the same pin, and an edge
- * of the result is what starts or ends a die-level transaction.
+ * The bus has two dies, selected from two places depending on who is talking
+ * to the QUP: QCA's boot drivers poke FORCE_CS in SPI_IO_CONTROL (the QUP's
+ * native chip select, which is CS0/the NOR), while Linux uses the gpio
+ * descriptors from cs-gpios and leaves SPI_IO_CONTROL alone.  Either way an
+ * assertion starts a die-level transaction and the matching deassertion ends
+ * it, so a decoded command never leaks from one die or one message into the
+ * next.
  */
-static void qup_cs_source(IPQQupl *q, int *src, int level)
+static void qup_spi_select(IPQQupl *q, int which)
 {
-    int cs;
+    if (die_dbg_on()) {
+        die_dbg_log("die: select %s op=0x%02x addr=0x%08x n=%u"
+                    " first=%02x %02x %02x %02x\n",
+                    which == NAND_CS_NAND ? "nand" : "nor", q->opcode,
+                    q->last_addr, die_dbg_n, die_dbg_first[0],
+                    die_dbg_first[1], die_dbg_first[2], die_dbg_first[3]);
+    }
+    q->target = which;
+    q->cs = 1;
+    qup_bus_reset(q);
+}
 
-    if (*src == level) {
+static void qup_cs_force(IPQQupl *q, int level)
+{
+    if (q->cs_force == level) {
         return;
     }
-    *src = level;
-    cs = q->cs_force || q->cs_gpio;
-    if (cs != q->cs) {
-        q->cs = cs;
-        if (die_dbg_on()) {
-            /*
-             * "sel" is the assertion state of the NOR's chip select, not its
-             * index: the die sits on CS0 and CS0 is active low, so sel=1
-             * means CS0 is driven low and the die is listening.  The line
-             * itself is printed by the pin54 tracer above.
-             */
-            die_dbg_log("die: cs0 sel=%d op=0x%02x addr=0x%08x n=%u"
-                        " first=%02x %02x %02x %02x\n", cs, qup_spi->opcode,
-                        qup_spi->last_addr, die_dbg_n,
-                        die_dbg_first[0], die_dbg_first[1],
-                        die_dbg_first[2], die_dbg_first[3]);
-        }
+    q->cs_force = level;
+    if (level) {
+        qup_spi_select(q, NAND_CS_NOR);
+    } else {
+        q->cs = 0;
         qup_bus_reset(q);
     }
 }
@@ -1763,7 +2401,7 @@ static void qupl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         die_dbg_log("die: qup-w off=0x%03x val=0x%08x size=%u cs=%d state=%u"
                     " pc=%08x\n",
                     (unsigned)off, (uint32_t)val, size, q->cs, q->state,
-                    (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+                    die_dbg_pc());
     }
 
     if (env_true("QEMU_IPQ_TRACE") || env_true("QEMU_IPQ_QUP_TRACE")) {
@@ -1783,8 +2421,7 @@ static void qupl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
          * spi_xfer(), so a CS edge -- not a QUP state write -- is what starts
          * and ends a die-level SPI transaction.
          */
-        qup_cs_source(q, &q->cs_force,
-                      (val & QUP_IO_CONTROL_FORCE_CS) != 0);
+        qup_cs_force(q, (val & QUP_IO_CONTROL_FORCE_CS) != 0);
     }
     if (off == QUP_REG_STATE) {
         uint32_t st = val & 0x3;
@@ -1931,26 +2568,42 @@ typedef struct IPQTLMM {
 } IPQTLMM;
 
 static IPQTLMM *ipq_tlmm;
-static unsigned ipq_tlmm_cs_pin = 54;
+static unsigned ipq_tlmm_nor_cs_pin = 54;
+static unsigned ipq_tlmm_nand_cs_pin = 59;
+static int ipq_tlmm_cs_level[2] = { -1, -1 };   /* last level seen, per die */
 
-/* Chip select changed: an active-low CS edge starts/ends a die transaction. */
-static void ipq_tlmm_cs_changed(void)
+/*
+ * A chip select changed: start a new transaction on that die.
+ *
+ * Which die is the only thing the edge decides, never whether the pin went
+ * high or low: the vendor DTS writes GPIO_ACTIVE_HIGH for both selects while
+ * mainline boards write GPIO_ACTIVE_LOW for CS0, and an edge brackets a
+ * transfer under either convention.  The die-level state machine is reset on
+ * every edge, so a phantom edge (gpiolib setting the idle level at request
+ * time) costs nothing -- there are no bytes clocked in it.
+ */
+static void ipq_tlmm_cs_changed(unsigned which)
 {
     IPQTLMM *t = ipq_tlmm;
+    unsigned pin = which == NAND_CS_NAND ? ipq_tlmm_nand_cs_pin
+                                         : ipq_tlmm_nor_cs_pin;
     uint32_t v;
-    int assert;
+    int level;
 
-    if (!t || !qup_spi || t->nregs <= ipq_tlmm_cs_pin * 0x400 + 1) {
+    if (!t || !qup_spi || pin * 0x400 + 1 >= t->nregs) {
         return;
     }
-    v = t->regs[(ipq_tlmm_cs_pin * 0x1000 + IPQ_TLMM_IO_OFFSET) >> 2];
-    /* GPIO_ACTIVE_LOW: the pin low is the asserted chip select */
-    assert = !((v >> IPQ_TLMM_IO_OUT_BIT) & 1);
-    if (die_dbg_on()) {
-        die_dbg_log("die: pin%u io=0x%08x cs-gpio=%d\n",
-                    ipq_tlmm_cs_pin, v, assert);
+    v = t->regs[(pin * 0x1000 + IPQ_TLMM_IO_OFFSET) >> 2];
+    level = (v >> IPQ_TLMM_IO_OUT_BIT) & 1;
+    if (level == ipq_tlmm_cs_level[which]) {
+        return;
     }
-    qup_cs_source(qup_spi, &qup_spi->cs_gpio, assert);
+    ipq_tlmm_cs_level[which] = level;
+    if (die_dbg_on()) {
+        die_dbg_log("die: pin%u io=0x%08x %s\n", pin, v,
+                    which == NAND_CS_NAND ? "nand" : "nor");
+    }
+    qup_spi_select(qup_spi, which);
 }
 
 static uint64_t tlmm_read(void *opaque, hwaddr off, unsigned size)
@@ -1979,8 +2632,14 @@ static void tlmm_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     if (idx < t->nregs) {
         t->regs[idx] = val;
     }
-    if ((off & 0xfff) == IPQ_TLMM_IO_OFFSET && pin == ipq_tlmm_cs_pin) {
-        ipq_tlmm_cs_changed();
+    if ((off & 0xfff) != IPQ_TLMM_IO_OFFSET) {
+        return;
+    }
+    if (pin == ipq_tlmm_nor_cs_pin) {
+        ipq_tlmm_cs_changed(NAND_CS_NOR);
+    }
+    if (pin == ipq_tlmm_nand_cs_pin) {
+        ipq_tlmm_cs_changed(NAND_CS_NAND);
     }
 }
 
@@ -2431,7 +3090,7 @@ static void bam_pipe_run(IPQBam *b, int n)
                         " pc=%08x head=", n,
                         (p->ctrl & BAM_CTRL_DIR_BAM2SYS) ? "qup->ram" :
                         "ram->qup", addr, len,
-                        (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+                        die_dbg_pc());
             for (k = 0; k < 8; k++) {
                 die_dbg_log("%02x", head[k]);
             }
@@ -2774,7 +3433,7 @@ static void bam_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         if (die_dbg_on()) {
             die_dbg_log("die: bam ring pipe=%d base=0x%08x pc=%08x\n",
                         n, (unsigned)val,
-                        (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+                        die_dbg_pc());
         }
         break;
     case BAM_P_FIFO_SIZES:
@@ -2782,7 +3441,7 @@ static void bam_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         if (die_dbg_on()) {
             die_dbg_log("die: bam sizes pipe=%d val=0x%08x pc=%08x\n",
                         n, (unsigned)val,
-                        (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+                        die_dbg_pc());
         }
         break;
     case BAM_P_EVNT_REG: {
@@ -2795,7 +3454,7 @@ static void bam_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
                         " pc=%08x\n", n, (unsigned)val, p->cons, p->prod,
                         p->ring_base, p->ring_size,
                         bam_client_name(p->client, p->ctrl), p->ctrl,
-                        (uint32_t)ARM_CPU(current_cpu)->env.regs[15]);
+                        die_dbg_pc());
         }
         bam_pipe_run(b, n);
         break;
@@ -5857,6 +6516,11 @@ static void ipq4019_init(MachineState *machine)
             nor_persist_snapshot(die);
         }
     }
+    /* The second die on the bus: a blank SPI NAND behind chip select 1.  It is
+     * opt-in (QEMU_IPQ_NAND=1 or a NAND die file) because the boards whose
+     * dumps are here have only the NOR, and a part nobody probes still costs
+     * 136 MiB of RAM. */
+    nand_init();
     /*
      * MikroTik's APPSBL ELF header is written with a file-offset-compensated
      * p_paddr: the segment starts at 0x7fffffac so that file offset 0x54 (the
@@ -5915,7 +6579,8 @@ static void ipq4019_init(MachineState *machine)
     memory_region_init_io(qtimer, NULL, &gcnt_ops, &qtimer_hz, "qtimer", 8);
     memory_region_add_subregion(sysmem, 0x4a2000, qtimer);
     add_stub(sysmem, 0x4a3000, 0x8000, "timer-misc");
-    ipq_tlmm_cs_pin = env_u32("QEMU_IPQ_CS_GPIO", 54);
+    ipq_tlmm_nor_cs_pin = env_u32("QEMU_IPQ_CS_GPIO", 54);
+    ipq_tlmm_nand_cs_pin = env_u32("QEMU_IPQ_NAND_CS_GPIO", 59);
     add_tlmm(sysmem, IPQ_TLMM_BASE, IPQ_TLMM_SIZE, "tlmm");
     /*
      * Clock blocks: bit 0 behaves as a self-clearing trigger on written
