@@ -484,7 +484,15 @@ static void wdt_bite(void *opaque)
         qemu_log_mask(LOG_UNIMP, "wdt: bite, requesting reset\n");
     }
     w->regs[WDT_STS / 4] = 1;
-    if (!env_true("QEMU_IPQ_NO_WDT_RESET")) {
+    /*
+     * Off by default.  RouterBOOT arms this watchdog at the end of its normal
+     * boot too: a reset here is how it hands over to the image it just loaded,
+     * and SBL1 then jumps into that image instead of reloading APPSBL from
+     * flash -- behaviour that needs the boot-reason registers modelled.  Until
+     * they are, honouring the bite just restarts SBL1 and loops the board, and
+     * the kernel's own qcom-wdt re-arms it on every boot as well.
+     */
+    if (env_true("QEMU_IPQ_WDT_RESET")) {
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
 }
