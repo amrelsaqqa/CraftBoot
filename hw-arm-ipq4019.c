@@ -49,6 +49,9 @@
  *   QEMU_IPQ_NO_PMU_FIX=1  do not set PMCR.E at reset
  *   QEMU_IPQ_NO_TB_FLUSH=1  keep the previous boot's translated code (the
  *                        model's I-cache) across a reset
+ *   QEMU_IPQ_QSEE=run    do not intercept the SBL1 -> QSEE handover (default
+ *                        is to resume at the APPSBL entry the boot image
+ *                        names, with r0 = 0; see ipq_qsee_redirect())
  *   QEMU_IPQ_BOOTINFO    address of the synthesized PBL shared data handed to
  *                        SBL1 in r0 (default 0x08680000)
  *   QEMU_IPQ_BOOTCFG     value of the SoC boot-config word (0x5e02c, bits 9:0)
@@ -6164,6 +6167,198 @@ static void ipq_map_ram(MemoryRegion *sysmem, hwaddr base, hwaddr size,
  * every PT_LOAD p_paddr and copy the segment there.  Returns false if the
  * file is not an ELF32/ARM image.
  */
+/*
+ * Boot stages.
+ *
+ * The boot flash holds a chain of ELF images: SBL1 first, the TZ/QSEE image it
+ * loads next, and then the APPSBL that runs when TZ returns.  Each image
+ * carries its own entry point, so the machine can read the handover addresses
+ * out of the image it was given instead of being told three literals by the
+ * harness.  The order in the flash is the order SBL1 walks them, which is why
+ * the scan below is positional: first image at offset 0, next one after it,
+ * next one after that.
+ *
+ * This is layout, not policy: nothing here knows or cares what the images do.
+ */
+#define IPQ_MAX_STAGES 3
+
+typedef struct IPQBootStage {
+    const char *name;
+    uint32_t image_offset;      /* where the image starts in the boot image */
+    uint32_t entry;             /* ELF e_entry: where the stage is started   */
+    uint32_t load;              /* first PT_LOAD address, for the log        */
+    uint32_t size;              /* its memsz, for the log                    */
+} IPQBootStage;
+
+static IPQBootStage ipq_boot_stages[IPQ_MAX_STAGES];
+static int ipq_boot_stage_count;
+static const IPQBootStage *ipq_qsee_stage;
+static const IPQBootStage *ipq_appsbl_stage;
+static unsigned ipq_qsee_skips;
+
+/*
+ * Is there an ELF32/ARM executable image at @off?  On success fills in the
+ * entry point and the first PT_LOAD's address and size.  Images embedded in a
+ * flash dump are not necessarily aligned to anything, but they are word
+ * aligned, so the caller walks the buffer four bytes at a time.
+ */
+static bool ipq_elf_image_at(const uint8_t *img, size_t len, size_t off,
+                             uint32_t *entry, uint32_t *load, uint32_t *size)
+{
+    const Elf32_Ehdr *eh;
+    uint32_t load_addr = 0, load_size = 0;
+    int i;
+
+    if (off + sizeof(*eh) > len) {
+        return false;
+    }
+    eh = (const Elf32_Ehdr *)(img + off);
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0 ||
+        eh->e_ident[EI_CLASS] != ELFCLASS32 ||
+        eh->e_ident[EI_DATA] != ELFDATA2LSB ||
+        eh->e_type != ET_EXEC || eh->e_machine != EM_ARM ||
+        eh->e_ehsize != sizeof(*eh) || eh->e_entry == 0) {
+        return false;
+    }
+    if (eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize >
+        len - off) {
+        return false;
+    }
+    for (i = 0; i < eh->e_phnum; i++) {
+        const Elf32_Phdr *ph = (const Elf32_Phdr *)(img + off + eh->e_phoff +
+                                                    (size_t)i * eh->e_phentsize);
+
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) {
+            continue;
+        }
+        if (load_addr == 0 || ph->p_paddr < load_addr) {
+            load_addr = ph->p_paddr;
+            load_size = ph->p_memsz;
+        }
+    }
+    *entry = eh->e_entry;
+    *load = load_addr;
+    *size = load_size;
+    return true;
+}
+
+static void ipq4019_scan_stages(const uint8_t *img, size_t len)
+{
+    static const char *const names[IPQ_MAX_STAGES] = { "sbl1", "qsee", "appsbl" };
+    uint32_t entry, load, size;
+    size_t off;
+    int i;
+
+    ipq_boot_stage_count = 0;
+    ipq_qsee_stage = ipq_appsbl_stage = NULL;
+
+    if (!ipq_elf_image_at(img, len, 0, &entry, &load, &size)) {
+        return;
+    }
+    ipq_boot_stages[0] = (IPQBootStage){ names[0], 0, entry, load, size };
+    ipq_boot_stage_count = 1;
+
+    /*
+     * Every later image belongs to the DRAM the SoC maps at 0x80000000 (the
+     * kernel images further down the flash do too, but the scan stops once
+     * the boot chain is complete, long before them).
+     */
+    for (off = 4; off + sizeof(Elf32_Ehdr) <= len &&
+                  ipq_boot_stage_count < IPQ_MAX_STAGES; off += 4) {
+        if (!ipq_elf_image_at(img, len, off, &entry, &load, &size) ||
+            entry < 0x80000000) {
+            continue;
+        }
+        i = ipq_boot_stage_count;
+        ipq_boot_stages[i] = (IPQBootStage){ names[i], off, entry, load, size };
+        ipq_boot_stage_count++;
+    }
+
+    ipq_qsee_stage = ipq_boot_stage_count == 3 ? &ipq_boot_stages[1] : NULL;
+    ipq_appsbl_stage = ipq_boot_stage_count == 3 ? &ipq_boot_stages[2] : NULL;
+
+    fprintf(stderr, "ipq4019: stages:");
+    for (i = 0; i < ipq_boot_stage_count; i++) {
+        fprintf(stderr, " %s@0x%08x", ipq_boot_stages[i].name,
+                ipq_boot_stages[i].entry);
+    }
+    if (ipq_boot_stage_count < IPQ_MAX_STAGES) {
+        fprintf(stderr, " (boot chain incomplete)");
+    }
+    fprintf(stderr, "\n");
+}
+
+/*
+ * QSEE policy.
+ *
+ * SBL1 branches into QSEE (the vendor TZ blob).  Its early bring-up performs
+ * an access that it expects the QCOM protection fabric -- NoC/XPU/VMIDMT -- to
+ * deny, and this machine does not model that fabric yet, so letting QSEE run
+ * ends in its panic.  Until it is modelled the policy is to treat the TZ round
+ * trip as "returned OK": resume at the APPSBL entry the same image would have
+ * started, with r0 = 0.
+ *
+ * The breakpoint is BP_MACHINE, i.e. it lives in QEMU's breakpoint list and is
+ * serviced by the hook below, not by a debugger: nothing is patched in the
+ * guest, no host process has to stay attached, and because it is not guest
+ * memory it survives SBL1 reloading QSEE on every boot -- including a guest
+ * reboot, where the machine starts again at SBL1 and the same redirect has to
+ * happen with no harness involvement.
+ *
+ * QEMU_IPQ_QSEE=run leaves QSEE alone (Step 2 of the bring-up: model the
+ * fabric and delete this policy).
+ */
+static bool ipq_qsee_redirect(CPUState *cs, CPUBreakpoint *bp)
+{
+    ARMCPU *cpu = ARM_CPU(cs);
+    CPUARMState *env = &cpu->env;
+
+    if (!ipq_appsbl_stage) {
+        return false;
+    }
+    ipq_qsee_skips++;
+    fprintf(stderr, "ipq4019: qsee: skip %s@0x%08x -> %s@0x%08x "
+            "(lr=0x%08x, skip #%u)\n",
+            ipq_qsee_stage->name, ipq_qsee_stage->entry,
+            ipq_appsbl_stage->name, ipq_appsbl_stage->entry,
+            env->regs[14], ipq_qsee_skips);
+
+    env->regs[15] = ipq_appsbl_stage->entry;
+    env->regs[0] = 0;
+    /*
+     * APPSBL is ARM code and SBL1 called QSEE from Thumb state, so the mode
+     * has to be switched back explicitly -- the same thing the harness used
+     * to do with `$cpsr &= ~0x20`.
+     */
+    env->thumb = 0;
+    env->uncached_cpsr &= ~CPSR_T;
+    return true;
+}
+
+static void ipq4019_arm_qsee_policy(void)
+{
+    const char *policy = getenv("QEMU_IPQ_QSEE");
+    CPUState *cs;
+
+    if (!ipq_qsee_stage || !ipq_appsbl_stage) {
+        return;
+    }
+    if (policy && (strcmp(policy, "run") == 0 || strcmp(policy, "0") == 0)) {
+        fprintf(stderr, "ipq4019: qsee: QEMU_IPQ_QSEE=%s, leaving %s@0x%08x "
+                "to run\n", policy, ipq_qsee_stage->name,
+                ipq_qsee_stage->entry);
+        return;
+    }
+    cpu_breakpoint_hook = ipq_qsee_redirect;
+    for (cs = first_cpu; cs; cs = CPU_NEXT(cs)) {
+        cpu_breakpoint_insert(cs, ipq_qsee_stage->entry, BP_MACHINE, NULL);
+    }
+    fprintf(stderr, "ipq4019: qsee: %s@0x%08x needs an XPU this machine does "
+            "not model; will resume at %s@0x%08x (QEMU_IPQ_QSEE=run keeps "
+            "it)\n", ipq_qsee_stage->name, ipq_qsee_stage->entry,
+            ipq_appsbl_stage->name, ipq_appsbl_stage->entry);
+}
+
 static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
 {
     const char *path = machine->kernel_filename;
@@ -6241,6 +6436,13 @@ static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
     ipq4019_elf_entry = eh->e_entry;
     fprintf(stderr, "ipq4019: loaded %s (SBL ELF), entry 0x%08x, %d phdrs\n",
            path ? path : "the persist die", ipq4019_elf_entry, eh->e_phnum);
+
+    /*
+     * The same buffer holds the rest of the boot chain (QSEE and the APPSBL),
+     * so read their entry points from the images themselves now that the
+     * buffer is known to be a boot image.
+     */
+    ipq4019_scan_stages((const uint8_t *)buf, len);
     if (owned) {
         g_free(buf);
     }
@@ -7665,6 +7867,12 @@ static void ipq4019_init(MachineState *machine)
     } else {
         arm_load_kernel(ARM_CPU(first_cpu), machine, &ipq4019_binfo);
     }
+
+    /*
+     * The QSEE handover policy, if the image has a QSEE stage.  Installed
+     * before the machine starts, and after the CPUs exist.
+     */
+    ipq4019_arm_qsee_policy();
 
     /*
      * Registered after arm_load_kernel() so that it runs after the CPUs'
