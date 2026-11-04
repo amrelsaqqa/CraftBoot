@@ -102,7 +102,9 @@
 #include "qemu/osdep.h"
 #include <elf.h>
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/units.h"
+#include "qemu/cutils.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qemu/host-utils.h"
@@ -167,6 +169,23 @@
 #define IPQ_FLASH_SIZE    (64 * MiB)      /* address window */
 #define IPQ_FLASH_MIN     (1 * MiB)       /* smallest die modelled */
 #define IPQ_FLASH_DEFAULT (32 * MiB)      /* W25Q256, the common ipq40xx part */
+
+#define NAND_PAGE       2048u
+/*
+ * 2048+64, not 2048+128: the part on this board is a MX35LF1GE4AB, whose own
+ * read-id answer was measured as `id=C212C212` -- manufacturer c2, device 12,
+ * then the same two bytes again because the die repeats its id while it keeps
+ * being clocked.  64 is also what the spare-area tags and the 128 MiB capacity
+ * in that survey imply.
+ */
+#define NAND_OOB        64u
+#define NAND_STRIDE     (NAND_PAGE + NAND_OOB)   /* one page incl. spare */
+#define NAND_PPBLK      64u                      /* pages per erase block */
+#define NAND_BLKBYTES   (NAND_STRIDE * NAND_PPBLK)   /* 128 KiB + spare */
+
+#define NAND_BLOCKS_DEF 1024u                    /* 128 MiB of pages */
+#define NAND_BYTES_DEF  (NAND_BLKBYTES * NAND_BLOCKS_DEF)   /* 1 Gbit + spare */
+
 
 static uint32_t env_u32(const char *name, uint32_t def)
 {
@@ -239,6 +258,321 @@ typedef struct IPQBoardState {
 
 static IPQ4019State *ipq;       /* the SoC this machine is */
 static IPQBoardState *ipq_board;/* the parts wired to it */
+
+/* ------------------------------------------------------------------ */
+/* the board: what is soldered around the SoC                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The SoC model above is fixed: the same die, the same controllers, the same
+ * addresses.  Everything outside it is a board question -- which dies hang off
+ * the QUP, how big they are, what they identify as, which one the boot chain
+ * comes from -- and a board question belongs in configuration, not in code.
+ *
+ *   -machine ipq4019,board=default          today's wiring (a preset)
+ *   -machine ipq4019,board=none             no die at all: the pure SoC
+ *   -machine ipq4019,nor=on,nand=on,boot=spi-nand,...
+ *
+ * A preset is a compiled-in data table, nothing more: it fills the same
+ * IPQBoardConfig that the explicit properties fill, and an explicit property
+ * always wins over the preset, whatever order they were given in.  That is
+ * why the setters only record what was given (ipq_cfg_set): the merge happens
+ * once, in ipq_board_config_resolve(), when the machine starts.
+ *
+ * The environment knobs (QEMU_IPQ_FLASH_*, QEMU_IPQ_NAND_*) keep working as a
+ * deprecated shim over the same struct, so every command line written before
+ * this existed still selects the same board.
+ */
+
+/* the mask-ROM flash types SBL1 is told about (boot_pbl_v1.c switches on it) */
+#define IPQ_FLASH_TYPE_NONE   0
+#define IPQ_FLASH_TYPE_NAND   2
+#define IPQ_FLASH_TYPE_SPI    6
+
+typedef enum IPQBootDev {
+    IPQ_BOOT_NONE = 0,
+    IPQ_BOOT_SPI_NOR,           /* SPI NOR behind the QUP, flash type 6 */
+    IPQ_BOOT_SPI_NAND,          /* SPI NAND behind the QUP, still type 6 */
+} IPQBootDev;
+
+typedef struct IPQBoardConfig {
+    bool nor;                   /* is there a NOR die on chip select 0? */
+    uint32_t nor_size;          /* die bytes, power of two */
+    const char *nor_id;         /* RDID as hex, e.g. "ef4019" */
+    const char *nor_file;       /* the die itself (persist file) */
+    const char *nor_image;      /* content for a die that is not programmed */
+
+    bool nand;                  /* ... and a SPI NAND on chip select 1? */
+    uint32_t nand_size;
+    const char *nand_id;
+    const char *nand_file;
+    const char *nand_image;
+
+    IPQBootDev boot;            /* which die the boot chain comes from */
+} IPQBoardConfig;
+
+/* which fields an explicit -machine property (or the env shim) provided */
+enum {
+    IPQ_CFG_NOR        = 1u << 0,
+    IPQ_CFG_NOR_SIZE   = 1u << 1,
+    IPQ_CFG_NOR_ID     = 1u << 2,
+    IPQ_CFG_NOR_FILE   = 1u << 3,
+    IPQ_CFG_NOR_IMAGE  = 1u << 4,
+    IPQ_CFG_NAND       = 1u << 5,
+    IPQ_CFG_NAND_SIZE  = 1u << 6,
+    IPQ_CFG_NAND_ID    = 1u << 7,
+    IPQ_CFG_NAND_FILE  = 1u << 8,
+    IPQ_CFG_NAND_IMAGE = 1u << 9,
+    IPQ_CFG_BOOT       = 1u << 10,
+};
+
+typedef struct IPQBoardPreset {
+    const char *name;
+    IPQBoardConfig cfg;
+} IPQBoardPreset;
+
+/*
+ * The presets.  `default` is the board this machine has always built: a
+ * 32 MiB W25Q256 NOR behind chip select 0, no NAND, booting from the NOR.
+ * `none` is the bare SoC -- every part has to be named on the command line.
+ * Named boards (kt708, hap-ac2, ...) belong here too, but only once their
+ * wiring is read from their own DTS rather than guessed.
+ */
+static const IPQBoardPreset ipq_board_presets[] = {
+    { "default", {
+        .nor = true,
+        .nor_size = IPQ_FLASH_DEFAULT,
+        .nor_id = "ef4019",
+        .nand = false,
+        .boot = IPQ_BOOT_SPI_NOR,
+    } },
+    { "none", {
+        .nor = false,
+        .nand = false,
+        .boot = IPQ_BOOT_NONE,
+    } },
+};
+
+/* what the machine was asked for, before presets and env are merged in */
+static IPQBoardConfig ipq_cfg_pending;
+static uint32_t ipq_cfg_set;
+static const char *ipq_cfg_board;
+/* the resolved answer, built once when the machine starts */
+static IPQBoardConfig ipq_cfg;
+static bool ipq_cfg_ready;
+
+static const IPQBoardPreset *ipq_board_preset(const char *name)
+{
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(ipq_board_presets); i++) {
+        if (g_strcmp0(ipq_board_presets[i].name, name) == 0) {
+            return &ipq_board_presets[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Hex bytes the way a datasheet writes an ID: "ef4019", "ef 40 19" and
+ * "ef:40:19" all mean the same three bytes.  A plain strtoul() would swallow
+ * "4019" as one number and leave the ID one byte long, so parse in pairs.
+ */
+static int ipq_parse_hex_bytes(const char *s, uint8_t *out, int max,
+                               const char *what)
+{
+    const char *p = s;
+    int n = 0;
+
+    while (*p && n < max) {
+        int hi, lo;
+
+        while (*p && !g_ascii_isxdigit(*p)) {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        if (!p[1] || !g_ascii_isxdigit(p[1])) {
+            n = -1;
+            break;
+        }
+        hi = g_ascii_xdigit_value(p[0]);
+        lo = g_ascii_xdigit_value(p[1]);
+        out[n++] = (hi << 4) | lo;
+        p += 2;
+    }
+    if (n <= 0) {
+        error_report("ipq4019: %s='%s' is not a hex byte string like ef4019",
+                     what, s);
+        exit(1);
+    }
+    return n;
+}
+
+static void ipq_board_config_resolve(MachineState *machine)
+{
+    const IPQBoardPreset *p;
+    const char *env;
+    uint32_t env_set = 0;
+    IPQBoardConfig want = ipq_cfg_pending;
+
+    if (ipq_cfg_ready) {
+        return;
+    }
+
+    /* 1. the preset (board=<name>, default when nothing was said) */
+    p = ipq_board_preset(ipq_cfg_board ? ipq_cfg_board : "default");
+    if (!p) {
+        error_report("ipq4019: no such board '%s'; known boards: default, none",
+                     ipq_cfg_board);
+        exit(1);
+    }
+    ipq_cfg = p->cfg;
+
+    /* 2. explicit properties, which win over the preset */
+    if (ipq_cfg_set & IPQ_CFG_NOR)        { ipq_cfg.nor        = want.nor; }
+    if (ipq_cfg_set & IPQ_CFG_NOR_SIZE)   { ipq_cfg.nor_size   = want.nor_size; }
+    if (ipq_cfg_set & IPQ_CFG_NOR_ID)     { ipq_cfg.nor_id     = want.nor_id; }
+    if (ipq_cfg_set & IPQ_CFG_NOR_FILE)   { ipq_cfg.nor_file   = want.nor_file; }
+    if (ipq_cfg_set & IPQ_CFG_NOR_IMAGE)  { ipq_cfg.nor_image  = want.nor_image; }
+    if (ipq_cfg_set & IPQ_CFG_NAND)       { ipq_cfg.nand       = want.nand; }
+    if (ipq_cfg_set & IPQ_CFG_NAND_SIZE)  { ipq_cfg.nand_size  = want.nand_size; }
+    if (ipq_cfg_set & IPQ_CFG_NAND_ID)    { ipq_cfg.nand_id    = want.nand_id; }
+    if (ipq_cfg_set & IPQ_CFG_NAND_FILE)  { ipq_cfg.nand_file  = want.nand_file; }
+    if (ipq_cfg_set & IPQ_CFG_NAND_IMAGE) { ipq_cfg.nand_image = want.nand_image; }
+    if (ipq_cfg_set & IPQ_CFG_BOOT)       { ipq_cfg.boot      = want.boot; }
+
+    /*
+     * 3. the deprecated environment shim.  It overwrites, because that is what
+     *    it did before: a harness that exports QEMU_IPQ_NAND_PERSIST expects a
+     *    NAND, whatever the machine type says.
+     */
+    if ((env = getenv("QEMU_IPQ_FLASH_PERSIST")) && *env) {
+        ipq_cfg.nor_file = env;
+        env_set |= IPQ_CFG_NOR_FILE | IPQ_CFG_NOR;
+        if (ipq_cfg_set & IPQ_CFG_NOR && !want.nor) {
+            fprintf(stderr, "ipq4019: nor=off is overridden by "
+                    "QEMU_IPQ_FLASH_PERSIST\n");
+        }
+        ipq_cfg.nor = true;
+    }
+    if ((env = getenv("QEMU_IPQ_FLASH_IMAGE")) && *env) {
+        ipq_cfg.nor_image = env;
+        env_set |= IPQ_CFG_NOR_IMAGE | IPQ_CFG_NOR;
+        ipq_cfg.nor = true;
+    }
+    if ((env = getenv("QEMU_IPQ_FLASH_SIZE")) && *env) {
+        ipq_cfg.nor_size = strtoul(env, NULL, 0);
+        env_set |= IPQ_CFG_NOR_SIZE;
+    }
+    if ((env = getenv("QEMU_IPQ_FLASH_JEDEC")) && *env) {
+        ipq_cfg.nor_id = env;
+        env_set |= IPQ_CFG_NOR_ID;
+    }
+    if ((env = getenv("QEMU_IPQ_NAND_PERSIST")) && *env) {
+        ipq_cfg.nand_file = env;
+        ipq_cfg.nand = true;
+        env_set |= IPQ_CFG_NAND_FILE | IPQ_CFG_NAND;
+    } else if (env_true("QEMU_IPQ_NAND")) {
+        ipq_cfg.nand = true;
+        env_set |= IPQ_CFG_NAND;
+    }
+    if ((env = getenv("QEMU_IPQ_NAND_SIZE")) && *env) {
+        ipq_cfg.nand_size = strtoul(env, NULL, 0);
+        env_set |= IPQ_CFG_NAND_SIZE;
+    }
+    if ((env = getenv("QEMU_IPQ_NAND_ID")) && *env) {
+        ipq_cfg.nand_id = env;
+        env_set |= IPQ_CFG_NAND_ID;
+    }
+    ipq_cfg_set |= env_set;
+
+    /* 4. defaults and sanity, so the rest of the machine can trust the struct */
+    if (ipq_cfg.nor) {
+        if (!ipq_cfg.nor_size) {
+            ipq_cfg.nor_size = IPQ_FLASH_DEFAULT;
+        }
+        if (!ipq_cfg.nor_id) {
+            ipq_cfg.nor_id = "ef4019";
+        }
+        if (ipq_cfg.nor_size < IPQ_FLASH_MIN ||
+            ipq_cfg.nor_size > IPQ_FLASH_SIZE ||
+            (ipq_cfg.nor_size & (ipq_cfg.nor_size - 1))) {
+            error_report("ipq4019: nor-size=%u must be a power of two between "
+                         "%u and %u bytes", ipq_cfg.nor_size,
+                         (unsigned)IPQ_FLASH_MIN, (unsigned)IPQ_FLASH_SIZE);
+            exit(1);
+        }
+    }
+    if (ipq_cfg.nand) {
+        if (!ipq_cfg.nand_size) {
+            ipq_cfg.nand_size = NAND_BYTES_DEF;
+        }
+        if (!ipq_cfg.nand_id) {
+            ipq_cfg.nand_id = "c212";       /* MX35LF1GE4AB */
+        }
+    }
+    /* its geometry is checked where the part is built (ipq_board_add_nand) */
+
+    /* the boot device has to exist: that is the whole point of naming it */
+    if (ipq_cfg.boot != IPQ_BOOT_NONE) {
+        bool boot_nor = ipq_cfg.boot == IPQ_BOOT_SPI_NOR;
+
+        if (boot_nor ? !ipq_cfg.nor : !ipq_cfg.nand) {
+            error_report("ipq4019: boot-device=%s but no %s die is configured "
+                         "(add %s=on, or pick another boot device)",
+                         boot_nor ? "spi-nor" : "spi-nand",
+                         boot_nor ? "NOR" : "NAND",
+                         boot_nor ? "nor" : "nand");
+            exit(1);
+        }
+    } else if (ipq_cfg.nor || ipq_cfg.nand) {
+        /* a board with dies but no boot strap: the NOR is what a strap does */
+        ipq_cfg.boot = ipq_cfg.nor ? IPQ_BOOT_SPI_NOR : IPQ_BOOT_SPI_NAND;
+    }
+
+    /*
+     * -kernel is content, not wiring: it fills the boot device's die.  A
+     * machine with no boot device at all cannot use it, and says so instead of
+     * quietly inventing a NOR the way it used to.
+     */
+    if (machine->kernel_filename && ipq_cfg.boot == IPQ_BOOT_NONE) {
+        error_report("ipq4019: -kernel %s given, but this board has no boot "
+                     "device to put it in (board=none); add nor=on or "
+                     "nand=on, or use -machine board=default",
+                     machine->kernel_filename);
+        exit(1);
+    }
+    if (machine->kernel_filename && !ipq_cfg.nor_image && !ipq_cfg.nand_image) {
+        if (ipq_cfg.boot == IPQ_BOOT_SPI_NOR) {
+            ipq_cfg.nor_image = machine->kernel_filename;
+        } else if (ipq_cfg.boot == IPQ_BOOT_SPI_NAND) {
+            ipq_cfg.nand_image = machine->kernel_filename;
+        }
+    }
+
+    fprintf(stderr, "ipq4019: board %s: nor ", ipq_cfg_board ? ipq_cfg_board
+            : "default");
+    if (ipq_cfg.nor) {
+        fprintf(stderr, "%u MiB%s, ", (unsigned)(ipq_cfg.nor_size / MiB),
+                ipq_cfg.nor_file ? " (persist)" : "");
+    } else {
+        fprintf(stderr, "none, ");
+    }
+    fprintf(stderr, "nand ");
+    if (ipq_cfg.nand) {
+        fprintf(stderr, "%u MiB%s, ", (unsigned)(ipq_cfg.nand_size / MiB),
+                ipq_cfg.nand_file ? " (persist)" : "");
+    } else {
+        fprintf(stderr, "none, ");
+    }
+    fprintf(stderr, "boot-device %s\n",
+            ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? "spi-nor" :
+            ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? "spi-nand" : "none");
+
+    ipq_cfg_ready = true;
+}
 
 /* ------------------------------------------------------------------ */
 /* generic shadowed stub                                               */
@@ -1173,9 +1507,9 @@ static void nor_persist(const void *src, uint32_t off, uint32_t len)
  * just created, so the caller loads the dump and calls nor_persist_snapshot()
  * to make that the initial contents.  NONE means no persist file was asked for.
  */
-static int nor_persist_preload(IPQMem *flash, uint32_t die, const char *img)
+static int nor_persist_preload(IPQMem *flash, uint32_t die, const char *img,
+                               const char *path)
 {
-    const char *path = getenv("QEMU_IPQ_FLASH_PERSIST");
     struct stat st, ist;
     uint32_t done = 0;
     int fd;
@@ -1185,12 +1519,12 @@ static int nor_persist_preload(IPQMem *flash, uint32_t die, const char *img)
     }
     fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) {
-        error_report("ipq4019: QEMU_IPQ_FLASH_PERSIST=%s: %s", path,
+        error_report("ipq4019: nor-file=%s: %s", path,
                      strerror(errno));
         exit(1);
     }
     if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
-        error_report("ipq4019: QEMU_IPQ_FLASH_PERSIST=%s is not a writable "
+        error_report("ipq4019: nor-file=%s is not a writable "
                      "regular file", path);
         exit(1);
     }
@@ -1378,22 +1712,6 @@ static void nor_write_start(IPQQupl *q)
 #define NAND_CS_NOR   0
 #define NAND_CS_NAND  1
 
-#define NAND_PAGE       2048u
-/*
- * 2048+64, not 2048+128: the part on this board is a MX35LF1GE4AB, whose own
- * read-id answer was measured as `id=C212C212` -- manufacturer c2, device 12,
- * then the same two bytes again because the die repeats its id while it keeps
- * being clocked.  64 is also what the spare-area tags and the 128 MiB capacity
- * in that survey imply.
- */
-#define NAND_OOB        64u
-#define NAND_STRIDE     (NAND_PAGE + NAND_OOB)   /* one page incl. spare */
-#define NAND_PPBLK      64u                      /* pages per erase block */
-#define NAND_BLKBYTES   (NAND_STRIDE * NAND_PPBLK)   /* 128 KiB + spare */
-
-#define NAND_BLOCKS_DEF 1024u                    /* 128 MiB of pages */
-#define NAND_BYTES_DEF  (NAND_BLKBYTES * NAND_BLOCKS_DEF)   /* 1 Gbit + spare */
-
 /* SPI NAND opcodes (mainline drivers/mtd/nand/spi/) */
 #define NAND_OP_RESET        0xff
 #define NAND_OP_RDID         0x9f
@@ -1512,12 +1830,12 @@ static bool nand_persist_open(IPQNand *n, const char *path)
 
     fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) {
-        error_report("ipq4019: QEMU_IPQ_NAND_PERSIST=%s: %s", path,
+        error_report("ipq4019: nand-file=%s: %s", path,
                      strerror(errno));
         exit(1);
     }
     if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
-        error_report("ipq4019: QEMU_IPQ_NAND_PERSIST=%s is not a writable "
+        error_report("ipq4019: nand-file=%s is not a writable "
                      "regular file", path);
         exit(1);
     }
@@ -1900,60 +2218,101 @@ static uint8_t nand_miso(IPQQupl *q)
  * vendor DTS names, because the whole point of the file is that it is a raw
  * dump of *that* chip: 1024 blocks of 64 pages, 2048+64 bytes each.
  */
-static void nand_init(void)
+/*
+ * The SPI NOR on chip select 0, as the board configuration describes it.
+ *
+ * Three things are the board's, not the SoC's: whether the part exists at all,
+ * its die geometry and RDID, and the file that *is* the part when the board
+ * has to keep its programming across a power cut.  The dump is only the
+ * programming source for a fresh die -- once the die file holds a board, the
+ * dump is not read, which is what a board with no programmer attached looks
+ * like.
+ */
+static void ipq_board_add_nor(MemoryRegion *sysmem)
 {
-    const char *path = getenv("QEMU_IPQ_NAND_PERSIST");
-    const char *idstr = getenv("QEMU_IPQ_NAND_ID");
-    uint32_t per_page = NAND_STRIDE * NAND_PPBLK;
-    IPQNand *n;
+    const char *img;
+    IPQMem *flash;
+    gchar *buf = NULL;
+    gsize len = 0;
+    int pers;
+    unsigned int j;
 
-    if ((!path || !*path) && !env_true("QEMU_IPQ_NAND")) {
+    if (!ipq_cfg.nor) {
         return;
     }
+
+    flash = add_mem(sysmem, IPQ_FLASH_BASE, IPQ_FLASH_SIZE, "flash");
+    ipq_board->nor = flash;
+
+    ipq_flash_die_size = ipq_cfg.nor_size;
+    ipq_flash_jedec_len = ipq_parse_hex_bytes(ipq_cfg.nor_id,
+                                              ipq_flash_jedec,
+                                              sizeof(ipq_flash_jedec),
+                                              "nor-id");
+
+    /* Unwritten flash reads 0xff, not 0x00. */
+    memset(flash->data, 0xff, flash->size);
+
+    img = ipq_cfg.nor_image;
+    pers = nor_persist_preload(flash, ipq_flash_die_size, img,
+                               ipq_cfg.nor_file);
+    if (pers != NOR_PERSIST_LOADED) {
+        if (img) {
+            g_file_get_contents(img, &buf, &len, NULL);
+        }
+        if (buf) {
+            memcpy(flash->data, buf, MIN(len, flash->size));
+            g_free(buf);
+        }
+    }
+    fprintf(stderr, "ipq4019: flash die %u MiB, RDID",
+            (unsigned)(ipq_flash_die_size / MiB));
+    for (j = 0; j < ipq_flash_jedec_len; j++) {
+        fprintf(stderr, " %02x", ipq_flash_jedec[j]);
+    }
+    if (pers == NOR_PERSIST_LOADED) {
+        fprintf(stderr, ", window %u MiB <- the persist file\n",
+                (unsigned)(IPQ_FLASH_SIZE / MiB));
+    } else {
+        fprintf(stderr, ", window %u MiB <- %s (%zu bytes)\n",
+                (unsigned)(IPQ_FLASH_SIZE / MiB), img ? img : "(none)", len);
+    }
+    if (pers == NOR_PERSIST_EMPTY) {
+        nor_persist_snapshot(ipq_flash_die_size);
+    }
+}
+
+/*
+ * The SPI NAND on chip select 1, as the board configuration describes it.
+ * Absent unless the board has one: a part nobody probes still costs its whole
+ * die in host RAM (132 MiB for the MX35LF1GE4AB), which is why the default
+ * preset has no NAND.
+ */
+static void ipq_board_add_nand(void)
+{
+    uint32_t per_block = NAND_STRIDE * NAND_PPBLK;
+    IPQNand *n;
+    int id_len;
+
+    if (!ipq_cfg.nand) {
+        return;
+    }
+    if (!ipq_cfg.nand_size) {
+        ipq_cfg.nand_size = NAND_BYTES_DEF;
+    }
+    if (ipq_cfg.nand_size < per_block || ipq_cfg.nand_size % per_block) {
+        error_report("ipq4019: nand-size=%u must be a whole number of "
+                     "%u-byte erase blocks", ipq_cfg.nand_size, per_block);
+        exit(1);
+    }
+
     n = g_new0(IPQNand, 1);
-    n->bytes = NAND_BYTES_DEF;
-    if (env_u32("QEMU_IPQ_NAND_SIZE", 0)) {
-        uint32_t want = env_u32("QEMU_IPQ_NAND_SIZE", 0);
-
-        if (want < per_page || want % per_page) {
-            error_report("ipq4019: QEMU_IPQ_NAND_SIZE=%u must be a whole "
-                         "number of %u-byte erase blocks", want, per_page);
-            exit(1);
-        }
-        n->bytes = want;
-    }
+    n->bytes = ipq_cfg.nand_size;
     n->pages = n->bytes / NAND_STRIDE;
-    n->id[0] = 0xc2;                    /* Macronix */
-    n->id[1] = 0x12;                    /* MX35LF1GE4AB, 128 MiB 2048+64 */
-    n->id_len = 2;
-    if (idstr && *idstr) {
-        const char *p = idstr;
-        int got = 0;
+    id_len = ipq_parse_hex_bytes(ipq_cfg.nand_id ? ipq_cfg.nand_id : "c212",
+                                 n->id, sizeof(n->id), "nand-id");
+    n->id_len = id_len;
 
-        while (*p && got < (int)sizeof(n->id)) {
-            int hi, lo;
-
-            while (*p && !g_ascii_isxdigit(*p)) {
-                p++;
-            }
-            if (!*p) {
-                break;
-            }
-            if (!p[1] || !g_ascii_isxdigit(p[1])) {
-                got = -1;
-                break;
-            }
-            hi = g_ascii_xdigit_value(p[0]);
-            lo = g_ascii_xdigit_value(p[1]);
-            n->id[got++] = (hi << 4) | lo;
-            p += 2;
-        }
-        if (got != 2) {
-            error_report("ipq4019: QEMU_IPQ_NAND_ID='%s' is not a two-byte "
-                         "id like c212", idstr);
-            exit(1);
-        }
-    }
     n->data = g_malloc(n->bytes);
     nand_fill_erased(n->data, n->bytes);
     nand_fill_erased(n->cache, NAND_STRIDE);
@@ -1961,22 +2320,47 @@ static void nand_init(void)
     n->fd = -1;
     ipq_board->nand = n;
 
-    if (path && *path) {
-        if (!nand_persist_open(n, path)) {
-            nand_persist_snapshot(n, path);
+    /*
+     * A die file is the part: if it already holds a die, that is the NAND,
+     * and a dump is not needed.  Otherwise the file is created (erased) and,
+     * when the board names one, filled from the image.
+     */
+    if (ipq_cfg.nand_file && *ipq_cfg.nand_file) {
+        if (!nand_persist_open(n, ipq_cfg.nand_file)) {
+            nand_persist_snapshot(n, ipq_cfg.nand_file);
             fprintf(stderr, "ipq4019: nand persist %s created (%u MiB, %u "
-                    "pages of %u+%u, erased)\n", path,
+                    "pages of %u+%u, erased)\n", ipq_cfg.nand_file,
                     (unsigned)(n->bytes / MiB), n->pages, NAND_PAGE, NAND_OOB);
         } else {
             fprintf(stderr, "ipq4019: nand persist %s loaded (%u MiB, %u "
-                    "pages of %u+%u)\n", path, (unsigned)(n->bytes / MiB),
-                    n->pages, NAND_PAGE, NAND_OOB);
+                    "pages of %u+%u)\n", ipq_cfg.nand_file,
+                    (unsigned)(n->bytes / MiB), n->pages, NAND_PAGE, NAND_OOB);
         }
     }
-    fprintf(stderr, "ipq4019: nand die %u MiB, RDID c2 %02x, %u pages of %u+%u, "
-            "%u blocks%s\n", (unsigned)(n->bytes / MiB), n->id[1], n->pages,
-            NAND_PAGE, NAND_OOB, n->pages / NAND_PPBLK,
-            (path && *path) ? " <- the persist file" : " (RAM only)");
+    if (ipq_cfg.nand_image && *ipq_cfg.nand_image && n->fd < 0) {
+        gchar *buf = NULL;
+        gsize len = 0;
+
+        if (g_file_get_contents(ipq_cfg.nand_image, &buf, &len, NULL)) {
+            uint32_t off;
+
+            /* page data only: the spare area stays erased */
+            for (off = 0; off < len && off / NAND_STRIDE < n->pages; off++) {
+                if (off % NAND_STRIDE < NAND_PAGE) {
+                    n->data[(off / NAND_STRIDE) * NAND_STRIDE +
+                            (off % NAND_STRIDE)] = (uint8_t)buf[off];
+                }
+            }
+            fprintf(stderr, "ipq4019: nand die programmed from %s (%zu bytes)\n",
+                    ipq_cfg.nand_image, len);
+            g_free(buf);
+        }
+    }
+    fprintf(stderr, "ipq4019: nand die %u MiB, RDID %02x %02x, %u pages of %u+%u, "
+            "%u blocks%s\n", (unsigned)(n->bytes / MiB), n->id[0], n->id[1],
+            n->pages, NAND_PAGE, NAND_OOB, n->pages / NAND_PPBLK,
+            (ipq_cfg.nand_file && *ipq_cfg.nand_file) ? " <- the persist file"
+                                                       : " (RAM only)");
 }
 
 static void qup_spi_opcode(IPQQupl *q, uint8_t op)
@@ -6398,29 +6782,54 @@ static void ipq4019_arm_qsee_policy(void)
             ipq->appsbl_stage->name, ipq->appsbl_stage->entry);
 }
 
+/*
+ * The boot chain as the configured boot device presents it.
+ *
+ * A NOR die is directly addressable, so the image is the die.  A NAND is not:
+ * every 2048-byte page carries 64 spare bytes the boot loader drops, so the
+ * logical image is the page data with the spare area removed -- exactly what
+ * the ROM's NAND path would hand to SBL1.
+ */
+static gchar *ipq_boot_image(gsize *lenp, bool *owned, const char **what)
+{
+    IPQNand *n = ipq_board->nand;
+    IPQMem *nor = ipq_board->nor;
+    gchar *buf;
+    uint32_t p;
+
+    switch (ipq_cfg.boot) {
+    case IPQ_BOOT_SPI_NOR:
+        *lenp = ipq_flash_die_size;
+        *owned = false;
+        *what = "the NOR die";
+        return (gchar *)nor->data;
+    case IPQ_BOOT_SPI_NAND:
+        buf = g_malloc((gsize)n->pages * NAND_PAGE);
+        for (p = 0; p < n->pages; p++) {
+            memcpy(buf + (gsize)p * NAND_PAGE, n->data + (gsize)p * NAND_STRIDE,
+                   NAND_PAGE);
+        }
+        *lenp = (gsize)n->pages * NAND_PAGE;
+        *owned = true;
+        *what = "the NAND die";
+        return buf;
+    default:
+        return NULL;
+    }
+}
+
 static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
 {
-    const char *path = machine->kernel_filename;
+    const char *what = NULL;
     bool owned = true;
     gchar *buf;
     gsize len;
     Elf32_Ehdr *eh;
     int i;
 
-    if (path && g_file_get_contents(path, &buf, &len, NULL)) {
-        owned = true;
-    } else if (ipq_flash_persist_loaded && ipq_board->nor) {
-        /*
-         * No -kernel: the persistent die is the only flash on the board, so
-         * take the boot stage out of it exactly as the PBL would.  This is the
-         * "one file is the chip" mode -- the dump can be absent entirely.
-         */
-        buf = (gchar *)ipq_board->nor->data;
-        len = ipq_flash_die_size;
-        owned = false;
-        fprintf(stderr, "ipq4019: no -kernel, booting the SBL1 ELF out of the "
-                "persist die\n");
-    } else {
+    buf = ipq_boot_image(&len, &owned, &what);
+    if (!buf) {
+        /* No boot device: nothing to boot.  The board config already said so. */
         return false;
     }
     if (len < sizeof(Elf32_Ehdr) || memcmp(buf, ELFMAG, SELFMAG) != 0 ||
@@ -6474,7 +6883,7 @@ static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
 
     ipq4019_elf_entry = eh->e_entry;
     fprintf(stderr, "ipq4019: loaded %s (SBL ELF), entry 0x%08x, %d phdrs\n",
-           path ? path : "the persist die", ipq4019_elf_entry, eh->e_phnum);
+            what, ipq4019_elf_entry, eh->e_phnum);
 
     /*
      * The same buffer holds the rest of the boot chain (QSEE and the APPSBL),
@@ -7118,7 +7527,6 @@ static void ipq4019_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *rom;
-    IPQMem *flash;
     IPQMem *bootctx;
     IPQMem *bootdev;
     IPQBam *bam;
@@ -7131,6 +7539,7 @@ static void ipq4019_init(MachineState *machine)
 
     ipq = g_new0(IPQ4019State, 1);
     ipq_board = g_new0(IPQBoardState, 1);
+    ipq_board_config_resolve(machine);
 
     for (i = 0; i < machine->smp.cpus; i++) {
         cpu_create(machine->cpu_type);
@@ -7202,116 +7611,12 @@ static void ipq4019_init(MachineState *machine)
     ipq_dram_size = machine->ram_size;
     qemu_register_reset(ipq_reset_dump, NULL);
 
-    flash = add_mem(sysmem, IPQ_FLASH_BASE, IPQ_FLASH_SIZE, "flash");
-    ipq_board->nor = flash;
-    {
-        const char *img = getenv("QEMU_IPQ_FLASH_IMAGE");
-        const char *jstr = getenv("QEMU_IPQ_FLASH_JEDEC");
-        gchar *buf = NULL;
-        gsize len = 0;
-        uint32_t die = env_u32("QEMU_IPQ_FLASH_SIZE", IPQ_FLASH_DEFAULT);
-        int pers;
-        unsigned int j;
-
-        /*
-         * Die geometry belongs to the board, not to the firmware image, so it
-         * is configuration: QEMU_IPQ_FLASH_SIZE (bytes) and
-         * QEMU_IPQ_FLASH_JEDEC (RDID bytes).  Defaults describe a 32 MiB
-         * Winbond W25Q256, the part most ipq40xx boards ship with.
-         */
-        if (die < IPQ_FLASH_MIN || die > IPQ_FLASH_SIZE ||
-            (die & (die - 1)) != 0) {
-            error_report("ipq4019: QEMU_IPQ_FLASH_SIZE=%u must be a power of "
-                         "two between %u and %u bytes",
-                         die, (unsigned)IPQ_FLASH_MIN,
-                         (unsigned)IPQ_FLASH_SIZE);
-            exit(1);
-        }
-        ipq_flash_die_size = die;
-
-        /* Default RDID: Winbond ef 40 <log2(bytes)>. */
-        ipq_flash_jedec[0] = 0xef;
-        ipq_flash_jedec[1] = 0x40;
-        ipq_flash_jedec[2] = 31 - clz32(die);
-        ipq_flash_jedec_len = 3;
-        if (jstr && *jstr) {
-            const char *p = jstr;
-            int n = 0;
-
-            /*
-             * Two hex digits per byte, separators ignored, so "ef4019",
-             * "ef 40 19" and "ef:40:19" all mean the same three bytes.  A
-             * plain strtoul() would swallow "4019" as one number and leave
-             * the RDID one byte long.
-             */
-            while (*p && n < (int)sizeof(ipq_flash_jedec)) {
-                int hi, lo;
-
-                while (*p && !g_ascii_isxdigit(*p)) {
-                    p++;
-                }
-                if (!*p) {
-                    break;
-                }
-                if (!p[1] || !g_ascii_isxdigit(p[1])) {
-                    n = -1;
-                    break;
-                }
-                hi = g_ascii_xdigit_value(p[0]);
-                lo = g_ascii_xdigit_value(p[1]);
-                ipq_flash_jedec[n++] = (hi << 4) | lo;
-                p += 2;
-            }
-            if (n < 2) {
-                error_report("ipq4019: QEMU_IPQ_FLASH_JEDEC='%s' is not a "
-                             "hex byte string like ef4019 or 'ef 40 19'",
-                             jstr);
-                exit(1);
-            }
-            ipq_flash_jedec_len = n;
-        }
-
-        /* Unwritten flash reads 0xff, not 0x00. */
-        memset(flash->data, 0xff, flash->size);
-        if (!img || !*img) {
-            img = machine->kernel_filename;
-        }
-        /*
-         * A persist file that already holds a die is the board's flash; the
-         * dump is only the programming source and is not needed (or read) at
-         * all, which is what a real board with no programmer attached looks
-         * like.  An empty file is filled from the dump instead.
-         */
-        pers = nor_persist_preload(flash, die, img);
-        if (pers != NOR_PERSIST_LOADED) {
-            if (img) {
-                g_file_get_contents(img, &buf, &len, NULL);
-            }
-            if (buf) {
-                memcpy(flash->data, buf, MIN(len, flash->size));
-                g_free(buf);
-            }
-        }
-        fprintf(stderr, "ipq4019: flash die %u MiB, RDID", (unsigned)(die / MiB));
-        for (j = 0; j < ipq_flash_jedec_len; j++) {
-            fprintf(stderr, " %02x", ipq_flash_jedec[j]);
-        }
-        if (pers == NOR_PERSIST_LOADED) {
-            fprintf(stderr, ", window %u MiB <- the persist file\n",
-                   (unsigned)(IPQ_FLASH_SIZE / MiB));
-        } else {
-            fprintf(stderr, ", window %u MiB <- %s (%zu bytes)\n",
-                   (unsigned)(IPQ_FLASH_SIZE / MiB), img ? img : "(none)", len);
-        }
-        if (pers == NOR_PERSIST_EMPTY) {
-            nor_persist_snapshot(die);
-        }
-    }
+    ipq_board_add_nor(sysmem);
     /* The second die on the bus: a blank SPI NAND behind chip select 1.  It is
      * opt-in (QEMU_IPQ_NAND=1 or a NAND die file) because the boards whose
      * dumps are here have only the NOR, and a part nobody probes still costs
      * 132 MiB of RAM. */
-    nand_init();
+    ipq_board_add_nand();
     /*
      * MikroTik's APPSBL ELF header is written with a file-offset-compensated
      * p_paddr: the segment starts at 0x7fffffac so that file offset 0x54 (the
@@ -7824,7 +8129,11 @@ static void ipq4019_init(MachineState *machine)
          * Types 0/1 skip the flash probe entirely, so SBL1 then never loads
          * the later images and falls into Sahara download mode.
          */
-        *(uint32_t *)(bi + 0x000) = env_u32("QEMU_IPQ_BOOTDEV_TYPE", 6);
+        *(uint32_t *)(bi + 0x000) =
+            env_u32("QEMU_IPQ_BOOTDEV_TYPE",
+                    ipq_cfg.boot == IPQ_BOOT_SPI_NOR ||
+                    ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? IPQ_FLASH_TYPE_SPI :
+                    IPQ_FLASH_TYPE_NONE);
         *(uint32_t *)(bi + 0x018) = 0;         /* cold boot */
         rom_add_blob_fixed("ipq.pbl", bi, 0x200, ipq4019_bootinfo + 0x300);
         g_free(bi);
@@ -7924,6 +8233,159 @@ static void ipq4019_init(MachineState *machine)
     qemu_register_reset(ipq4019_dev_reset, NULL);
 }
 
+/*
+ * -machine ipq4019,<property>=<value>
+ *
+ * Every one of these only *records* what was asked for; ipq_board_config_resolve()
+ * merges it with the preset and the deprecated environment knobs when the
+ * machine starts.  That keeps `board=kt708,nor=off` and `nor=off,board=kt708`
+ * meaning the same thing, and lets the same property set describe a board that
+ * has no preset at all.
+ */
+typedef struct IPQBoardProp {
+    const char *name;
+    size_t off;                 /* field in ipq_cfg_pending */
+    uint32_t bit;               /* which IPQ_CFG_* it sets */
+} IPQBoardProp;
+
+static void ipq_prop_bool(Object *obj, Visitor *v, const char *name,
+                          void *opaque, Error **errp)
+{
+    const IPQBoardProp *p = opaque;
+    bool *field = (bool *)((char *)&ipq_cfg_pending + p->off);
+
+    if (!visit_type_bool(v, name, field, errp)) {
+        return;
+    }
+    ipq_cfg_set |= p->bit;
+}
+
+/*
+ * Sizes are strings so that the usual QEMU suffixes work: nor-size=32M reads
+ * the way -m 256M does, instead of demanding 33554432.
+ */
+static void ipq_prop_size(Object *obj, Visitor *v, const char *name,
+                          void *opaque, Error **errp)
+{
+    const IPQBoardProp *p = opaque;
+    uint32_t *field = (uint32_t *)((char *)&ipq_cfg_pending + p->off);
+    char *s = NULL;
+    uint64_t val;
+
+    if (!visit_type_str(v, name, &s, errp)) {
+        return;
+    }
+    if (qemu_strtosz(s, NULL, &val) < 0 || val > UINT32_MAX) {
+        error_setg(errp, "%s='%s' is not a size", name, s);
+        g_free(s);
+        return;
+    }
+    g_free(s);
+    *field = val;
+    ipq_cfg_set |= p->bit;
+}
+
+static void ipq_prop_str(Object *obj, Visitor *v, const char *name,
+                         void *opaque, Error **errp)
+{
+    const IPQBoardProp *p = opaque;
+    const char **field = (const char **)((char *)&ipq_cfg_pending + p->off);
+    char *s = NULL;
+
+    if (!visit_type_str(v, name, &s, errp)) {
+        return;
+    }
+    g_free((char *)*field);
+    *field = g_strdup(s);
+    g_free(s);
+    ipq_cfg_set |= p->bit;
+}
+
+static void ipq_prop_boot(Object *obj, Visitor *v, const char *name,
+                          void *opaque, Error **errp)
+{
+    char *s = NULL;
+
+    if (!visit_type_str(v, name, &s, errp)) {
+        return;
+    }
+    if (g_strcmp0(s, "none") == 0) {
+        ipq_cfg_pending.boot = IPQ_BOOT_NONE;
+    } else if (g_strcmp0(s, "spi-nor") == 0) {
+        ipq_cfg_pending.boot = IPQ_BOOT_SPI_NOR;
+    } else if (g_strcmp0(s, "spi-nand") == 0) {
+        ipq_cfg_pending.boot = IPQ_BOOT_SPI_NAND;
+    } else {
+        error_setg(errp, "boot='%s' is not one of none, spi-nor, spi-nand", s);
+        g_free(s);
+        return;
+    }
+    g_free(s);
+    ipq_cfg_set |= IPQ_CFG_BOOT;
+}
+
+static char *ipq_prop_board_get(Object *obj, Error **errp)
+{
+    return g_strdup(ipq_cfg_board ? ipq_cfg_board : "default");
+}
+
+static void ipq_prop_board_set(Object *obj, const char *value, Error **errp)
+{
+    g_free((char *)ipq_cfg_board);
+    ipq_cfg_board = g_strdup(value);
+}
+
+static void ipq4019_machine_add_props(MachineClass *mc)
+{
+    static const IPQBoardProp props[] = {
+        { "nor",        offsetof(IPQBoardConfig, nor),        IPQ_CFG_NOR },
+        { "nor-size",   offsetof(IPQBoardConfig, nor_size),   IPQ_CFG_NOR_SIZE },
+        { "nor-id",     offsetof(IPQBoardConfig, nor_id),     IPQ_CFG_NOR_ID },
+        { "nor-file",   offsetof(IPQBoardConfig, nor_file),   IPQ_CFG_NOR_FILE },
+        { "nand",       offsetof(IPQBoardConfig, nand),       IPQ_CFG_NAND },
+        { "nand-size",  offsetof(IPQBoardConfig, nand_size),  IPQ_CFG_NAND_SIZE },
+        { "nand-id",    offsetof(IPQBoardConfig, nand_id),    IPQ_CFG_NAND_ID },
+        { "nand-file",  offsetof(IPQBoardConfig, nand_file),  IPQ_CFG_NAND_FILE },
+    };
+    static const char *const desc[ARRAY_SIZE(props)] = {
+        "attach the SPI NOR die on chip select 0 (on/off)",
+        "NOR die size in bytes (power of two, 1M..64M)",
+        "NOR RDID as hex, e.g. ef4019",
+        "file that is the NOR part (survives a power cut)",
+        "attach the SPI NAND die on chip select 1 (on/off)",
+        "NAND die size in bytes, a whole number of erase blocks",
+        "NAND RDID as hex, e.g. c212",
+        "file that is the NAND part (survives a power cut)",
+    };
+    ObjectClass *oc = OBJECT_CLASS(mc);
+    size_t i;
+
+    object_class_property_add_str(oc, "board", ipq_prop_board_get,
+                                  ipq_prop_board_set);
+    object_class_property_set_description(oc, "board",
+        "board preset: default, none (or a command-line property set)");
+    /*
+     * "boot" already exists on MachineState (the structured -machine boot=
+     * configuration), so the strap is named for what it is.
+     */
+    object_class_property_add(oc, "boot-device", "string", NULL, ipq_prop_boot,
+                              NULL, NULL);
+    object_class_property_set_description(oc, "boot-device",
+        "which die the boot chain comes from: none, spi-nor, spi-nand");
+
+    for (i = 0; i < ARRAY_SIZE(props); i++) {
+        void (*set)(Object *, Visitor *, const char *, void *, Error **) =
+            strstr(props[i].name, "size") ? ipq_prop_size :
+            strstr(props[i].name, "id") || strstr(props[i].name, "file") ?
+            ipq_prop_str : ipq_prop_bool;
+        const char *type = set == ipq_prop_bool ? "bool" : "string";
+
+        object_class_property_add(oc, props[i].name, type, NULL, set,
+                                  NULL, (void *)&props[i]);
+        object_class_property_set_description(oc, props[i].name, desc[i]);
+    }
+}
+
 static void ipq4019_machine_init(MachineClass *mc)
 {
     mc->desc = "Qualcomm IPQ4018/IPQ4019 (ipq40xx) bring-up board";
@@ -7933,6 +8395,7 @@ static void ipq4019_machine_init(MachineClass *mc)
     mc->default_ram_size = 256 * MiB;
     mc->default_ram_id = "ipq4019.dram";
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");
+    ipq4019_machine_add_props(mc);
 }
 
 DEFINE_MACHINE_ARM("ipq4019", ipq4019_machine_init)
