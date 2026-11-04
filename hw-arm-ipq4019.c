@@ -183,11 +183,68 @@ static bool env_true(const char *name)
     return env_u32(name, 0) != 0;
 }
 
+/*
+ * The machine's devices, in two groups.
+ *
+ * IPQ4019State is the SoC: the controllers that exist on the die regardless of
+ * which board the die is soldered to.  IPQBoardState is everything wired to it
+ * from outside, which is the part that must become configuration.  Both are
+ * owned by ipq4019_init() and handed to the MMIO callbacks as their opaque
+ * pointer; the file-scope pointers below exist only so the device models can
+ * reach their siblings, and they go away as each part becomes a qdev device
+ * with properties.
+ */
+typedef struct IPQStub IPQStub;
+typedef struct IPQPsHold IPQPsHold;
+typedef struct IPQWdt IPQWdt;
+typedef struct IPQMem IPQMem;
+typedef struct IPQQupl IPQQupl;
+typedef struct IPQNand IPQNand;
+typedef struct IPQTLMM IPQTLMM;
+typedef struct IPQBam IPQBam;
+typedef struct IPQRegFile IPQRegFile;
+typedef struct IPQEdma IPQEdma;
+typedef struct IPQMdio IPQMdio;
+typedef struct IPQUart IPQUart;
+typedef struct IPQBootStage IPQBootStage;
+
+typedef struct IPQ4019State {
+    /* on-die buses and controllers */
+    IPQQupl *qup_spi;           /* the one QUP the BAM pipes are wired to */
+    IPQMdio *mdio;              /* MDIO master; the PHYs on it are board */
+    IPQEdma *edma;
+    IPQTLMM *tlmm;
+    IPQBam *blsp1_bam;
+    IPQUart *console_uart;
+    DeviceState *gic;
+    MemoryRegion *dram;
+    GArray *mapped;             /* window table, for the state dump */
+    GPtrArray *stub_list;       /* register-file stubs, for the state dump */
+    GPtrArray *regfile_list;
+    IPQPsHold *pshold;
+    IPQWdt *wdt;
+
+    /* the boot chain, read out of the configured boot device */
+    const IPQBootStage *qsee_stage;
+    const IPQBootStage *appsbl_stage;
+
+    QEMUTimer *timer_dbg;
+    QEMUTimer *diag_timer;
+} IPQ4019State;
+
+typedef struct IPQBoardState {
+    IPQMem *nor;                /* the die behind the QUP's chip select 0 */
+    IPQNand *nand;              /* ... and chip select 1 */
+} IPQBoardState;
+
+static IPQ4019State *ipq;       /* the SoC this machine is */
+static IPQBoardState *ipq_board;/* the parts wired to it */
+
 /* ------------------------------------------------------------------ */
 /* generic shadowed stub                                               */
 /* ------------------------------------------------------------------ */
 
-typedef struct IPQStub {
+struct IPQStub {
     MemoryRegion mr;
     const char *name;
     uint32_t *shadow;
@@ -240,7 +297,7 @@ typedef struct IPQStub {
         uint32_t val;
     } pin[8];
     int npin;
-} IPQStub;
+};
 
 static void stub_pin(IPQStub *s, uint32_t off, uint32_t val)
 {
@@ -381,7 +438,6 @@ static const MemoryRegionOps stub_ops = {
 };
 
 /* Every stub register file, so a system reset can clear what software left */
-static GPtrArray *ipq_stub_list;
 
 /* QEMU_IPQ_STATE_DUMP=<path>: dump the whole model state at the handoff. */
 static void ipq_state_dump(const char *tag);
@@ -394,7 +450,6 @@ static void state_note_tx(const uint8_t *buf, unsigned n);
  * "Switch id detected ..." out of an id field the previous OS already
  * rewrote.
  */
-static GPtrArray *ipq_regfile_list;
 
 static IPQStub *add_stub_ex(MemoryRegion *parent, hwaddr base, hwaddr size,
                             const char *name, uint32_t read_mask)
@@ -412,10 +467,10 @@ static IPQStub *add_stub_ex(MemoryRegion *parent, hwaddr base, hwaddr size,
     }
     memory_region_init_io(&s->mr, NULL, &stub_ops, s, name, size);
     memory_region_add_subregion(parent, base, &s->mr);
-    if (!ipq_stub_list) {
-        ipq_stub_list = g_ptr_array_new();
+    if (!ipq->stub_list) {
+        ipq->stub_list = g_ptr_array_new();
     }
-    g_ptr_array_add(ipq_stub_list, s);
+    g_ptr_array_add(ipq->stub_list, s);
     return s;
 }
 
@@ -430,11 +485,10 @@ static IPQStub *add_stub_ex(MemoryRegion *parent, hwaddr base, hwaddr size,
  * it the kernel prints "Reboot failed -- System halted", and there is no way
  * for the guest to ever check that its NOR writes survived a restart.
  */
-typedef struct IPQPsHold {
+struct IPQPsHold {
     uint32_t val;
-} IPQPsHold;
+};
 
-static IPQPsHold *ipq_pshold;
 
 static uint64_t pshold_read(void *opaque, hwaddr off, unsigned size)
 {
@@ -517,14 +571,13 @@ static const MemoryRegionOps pshold_ops = {
 #define WDT_BARK_TIME  0x10
 #define WDT_BITE_TIME  0x14
 
-typedef struct IPQWdt {
+struct IPQWdt {
     MemoryRegion mr;
     uint32_t regs[0x1000 / 4];
     QEMUTimer *bark;
     QEMUTimer *bite;
-} IPQWdt;
+};
 
-static IPQWdt *ipq_wdt;
 
 static uint64_t wdt_read(void *opaque, hwaddr off, unsigned size)
 {
@@ -642,7 +695,6 @@ static const MemoryRegionOps wdt_ops = {
  *   QEMU_IPQ_RESET_DUMP=/tmp/ram.bin ./run.sh
  *   strings -n 8 /tmp/ram.bin | grep -n "Kernel panic"
  */
-static MemoryRegion *ipq_dram_mr;
 static uint64_t ipq_dram_size;
 
 static void ipq_reset_dump(void *opaque)
@@ -651,10 +703,10 @@ static void ipq_reset_dump(void *opaque)
     const void *ram;
     FILE *f;
 
-    if (!path || !*path || !ipq_dram_mr) {
+    if (!path || !*path || !ipq->dram) {
         return;
     }
-    ram = memory_region_get_ram_ptr(ipq_dram_mr);
+    ram = memory_region_get_ram_ptr(ipq->dram);
     f = fopen(path, "wb");
     if (!f) {
         fprintf(stderr, "ipq4019: cannot write reset dump %s\n", path);
@@ -682,12 +734,12 @@ static void add_stub(MemoryRegion *parent, hwaddr base, hwaddr size,
  * {source, length} read descriptors.  Kept as a plain byte array (no SPI/NAND
  * protocol model) because SBL1's boot_flash_read() is a memcpy out of these.
  */
-typedef struct IPQMem {
+struct IPQMem {
     MemoryRegion mr;
     const char *name;
     uint8_t *data;
     uint64_t size;
-} IPQMem;
+};
 
 /*
  * Clock rates handed to the gcnt/xo read handler as its opaque pointer.  These
@@ -824,7 +876,7 @@ static IPQMem *add_mem(MemoryRegion *parent, hwaddr base, uint64_t size,
 #define QUP_OP_OUT_BLOCK_WRITE_REQ 0x1000
 #define QUP_OP_IN_BLOCK_READ_REQ   0x2000
 
-typedef struct IPQQupl {
+struct IPQQupl {
     MemoryRegion mr;
     uint32_t shadow[0x1000 / 4];
 
@@ -885,13 +937,11 @@ typedef struct IPQQupl {
     uint32_t max_in_done;       /* sticky MAX_INPUT_DONE */
     uint32_t max_out_done;      /* sticky MAX_OUTPUT_DONE */
     qemu_irq irq;               /* SPI 95, level high */
-} IPQQupl;
+};
 
-static IPQMem *ipq_flash;
 static uint32_t ipq_flash_die_size = IPQ_FLASH_DEFAULT;
 static uint8_t ipq_flash_jedec[4] = { 0xef, 0x40, 0x19, 0x00 };
 static int ipq_flash_jedec_len = 3;
-static IPQQupl *qup_spi;         /* the one QUP the BAM pipes are wired to */
 
 /*
  * QEMU_IPQ_DIE_LOG=1: a one-line summary per chip-select transaction, on
@@ -1017,10 +1067,10 @@ static void die_dbg_note(uint8_t v)
 
 static uint8_t qup_flash_byte(uint32_t off)
 {
-    if (!ipq_flash || off >= ipq_flash->size) {
+    if (!ipq_board->nor || off >= ipq_board->nor->size) {
         return 0xff;
     }
-    return ipq_flash->data[off];
+    return ipq_board->nor->data[off];
 }
 
 /* ---- NOR die write path ------------------------------------------------ */
@@ -1190,7 +1240,7 @@ static void nor_persist_snapshot(uint32_t die)
         return;
     }
     while (done < die) {
-        ssize_t n = pwrite(ipq_flash_persist_fd, ipq_flash->data + done,
+        ssize_t n = pwrite(ipq_flash_persist_fd, ipq_board->nor->data + done,
                            die - done, done);
 
         if (n <= 0) {
@@ -1207,20 +1257,20 @@ static void nor_persist_snapshot(uint32_t die)
 
 static void nor_erase(IPQQupl *q, uint32_t off, uint32_t len)
 {
-    if (!ipq_flash) {
+    if (!ipq_board->nor) {
         return;
     }
     off &= ipq_flash_die_size - 1;
-    if (off >= ipq_flash->size) {
+    if (off >= ipq_board->nor->size) {
         return;
     }
-    len = MIN(len, (uint32_t)(ipq_flash->size - off));
+    len = MIN(len, (uint32_t)(ipq_board->nor->size - off));
     if (nor_range_protected(q, off, len)) {
         q->status2 |= NOR_SR2_EFAIL;
         return;
     }
-    memset(ipq_flash->data + off, 0xff, len);
-    nor_persist(ipq_flash->data + off, off, len);
+    memset(ipq_board->nor->data + off, 0xff, len);
+    nor_persist(ipq_board->nor->data + off, off, len);
     if (ipq_flash_persist_fd >= 0) {
         /* An erase is the operation a later read depends on most, so give it
          * a real durability point rather than relying on the page cache. */
@@ -1236,7 +1286,7 @@ static void nor_program_byte(IPQQupl *q, uint8_t b)
 {
     uint32_t page;
 
-    if (!ipq_flash || !q->pgm_left || q->pgm_addr >= ipq_flash->size) {
+    if (!ipq_board->nor || !q->pgm_left || q->pgm_addr >= ipq_board->nor->size) {
         return;
     }
     if (nor_range_protected(q, q->pgm_addr, 1)) {
@@ -1244,8 +1294,8 @@ static void nor_program_byte(IPQQupl *q, uint8_t b)
         return;
     }
     /* Programming can only clear bits; a set bit needs an erase first. */
-    ipq_flash->data[q->pgm_addr] &= b;
-    nor_persist(&ipq_flash->data[q->pgm_addr], q->pgm_addr, 1);
+    ipq_board->nor->data[q->pgm_addr] &= b;
+    nor_persist(&ipq_board->nor->data[q->pgm_addr], q->pgm_addr, 1);
     q->pgm_left--;
     /* Past the 256-byte page the die wraps instead of spilling into the next */
     page = q->pgm_addr & ~(NOR_PAGE_SIZE - 1);
@@ -1387,7 +1437,7 @@ enum {
     NAND_WR_SET_FEATURE,
 };
 
-typedef struct IPQNand {
+struct IPQNand {
     uint8_t *data;              /* the die: NAND_STRIDE bytes per page */
     uint32_t bytes;             /* size of that array */
     uint32_t pages;             /* pages in the part (bytes / stride) */
@@ -1410,9 +1460,8 @@ typedef struct IPQNand {
 
     int fd;                     /* QEMU_IPQ_NAND_PERSIST, -1 when RAM only */
     bool loaded;                /* the die came from the persist file */
-} IPQNand;
+};
 
-static IPQNand *ipq_nand;
 
 /* Erased silicon is 0xff; the factory state of this part is "all erased". */
 static void nand_fill_erased(uint8_t *p, uint32_t len)
@@ -1432,7 +1481,7 @@ static void nand_fill_erased(uint8_t *p, uint32_t len)
  */
 static void nand_persist(const void *src, uint32_t off, uint32_t len)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
 
     if (!n || n->fd < 0 || off >= n->bytes) {
         return;
@@ -1527,7 +1576,7 @@ static void nand_persist_snapshot(IPQNand *n, const char *path)
 
 static void nand_xact_reset(void)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
 
     if (!n) {
         return;
@@ -1538,7 +1587,7 @@ static void nand_xact_reset(void)
 
 static uint8_t nand_feature_read(uint8_t reg)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
     uint8_t v;
 
     switch (reg) {
@@ -1574,7 +1623,7 @@ static uint8_t nand_feature_read(uint8_t reg)
 
 static void nand_feature_write(uint8_t reg, uint8_t v)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
 
     switch (reg) {
     case NAND_FEAT_CFG:
@@ -1590,7 +1639,7 @@ static void nand_feature_write(uint8_t reg, uint8_t v)
 
 static void nand_page_read(uint32_t page)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
 
     n->page = page;
     if (page < n->pages) {
@@ -1608,7 +1657,7 @@ static void nand_page_read(uint32_t page)
 
 static void nand_program_execute(uint32_t page)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
     uint32_t off;
     int need_erase = 0;
 
@@ -1643,7 +1692,7 @@ static void nand_program_execute(uint32_t page)
 
 static void nand_block_erase(uint32_t row)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
     uint32_t blk = row / NAND_PPBLK;
     uint32_t off = blk * NAND_BLKBYTES;
 
@@ -1666,7 +1715,7 @@ static void nand_block_erase(uint32_t row)
 /* Opcode phase for the NAND die.  Sets up addr/dummy counts in the QUP. */
 static void nand_opcode(IPQQupl *q, uint8_t op)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
 
     q->nand_read = 0;
     n->wr_kind = NAND_WR_NONE;
@@ -1752,7 +1801,7 @@ static void nand_opcode(IPQQupl *q, uint8_t op)
 /* The address phase finished: run whatever the command latched. */
 static void nand_address_done(IPQQupl *q)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
 
     switch (q->opcode) {
     case NAND_OP_GET_FEATURE:
@@ -1805,7 +1854,7 @@ static void nand_address_done(IPQQupl *q)
 /* One byte in the data phase, written by the master. */
 static void nand_data_byte(uint8_t b)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
 
     switch (n->wr_kind) {
     case NAND_WR_LOAD:
@@ -1824,7 +1873,7 @@ static void nand_data_byte(uint8_t b)
 /* One byte out of the data phase, read by the master. */
 static uint8_t nand_miso(IPQQupl *q)
 {
-    IPQNand *n = ipq_nand;
+    IPQNand *n = ipq_board->nand;
 
     if (q->nand_read) {
         uint8_t v = n->cache_valid ? n->cache[n->col % NAND_STRIDE] : 0xff;
@@ -1910,7 +1959,7 @@ static void nand_init(void)
     nand_fill_erased(n->cache, NAND_STRIDE);
     n->status = 0;
     n->fd = -1;
-    ipq_nand = n;
+    ipq_board->nand = n;
 
     if (path && *path) {
         if (!nand_persist_open(n, path)) {
@@ -1952,7 +2001,7 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
     }
     q->data_bytes = 0;
 
-    if (q->target == NAND_CS_NAND && ipq_nand) {
+    if (q->target == NAND_CS_NAND && ipq_board->nand) {
         nand_opcode(q, op);
         return;
     }
@@ -2099,7 +2148,7 @@ static void qup_spi_byte(IPQQupl *q, uint8_t b)
             q->rx_off = q->addr;
             q->last_addr = q->addr;
             q->phase = q->dummy_left ? 2 : 3;
-            if (q->target == NAND_CS_NAND && ipq_nand) {
+            if (q->target == NAND_CS_NAND && ipq_board->nand) {
                 nand_address_done(q);
             } else if (q->wr_kind) {
                 nor_write_start(q);
@@ -2126,7 +2175,7 @@ static void qup_spi_byte(IPQQupl *q, uint8_t b)
          * write (SBL1 clears a block-protect bit during init and reads it
          * back), a page program, or nothing at all.
          */
-        if (q->target == NAND_CS_NAND && ipq_nand) {
+        if (q->target == NAND_CS_NAND && ipq_board->nand) {
             nand_data_byte(b);
         } else if (q->write_sr) {
             int idx = 3 - q->write_sr;
@@ -2150,7 +2199,7 @@ static uint8_t qup_miso(IPQQupl *q)
     if (q->phase != 3) {
         return 0x00;
     }
-    if (q->target == NAND_CS_NAND && ipq_nand) {
+    if (q->target == NAND_CS_NAND && ipq_board->nand) {
         return nand_miso(q);
     }
     if (q->read_data) {
@@ -2663,13 +2712,12 @@ static void qupl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
  */
 #define IPQ_TLMM_RESET_VAL   0xffffffffu
 
-typedef struct IPQTLMM {
+struct IPQTLMM {
     MemoryRegion mr;
     uint32_t *regs;
     uint32_t nregs;
-} IPQTLMM;
+};
 
-static IPQTLMM *ipq_tlmm;
 static unsigned ipq_tlmm_nor_cs_pin = 54;
 static unsigned ipq_tlmm_nand_cs_pin = 59;
 
@@ -2694,13 +2742,13 @@ static unsigned ipq_tlmm_nand_cs_pin = 59;
  */
 static void ipq_tlmm_cs_changed(unsigned which)
 {
-    IPQTLMM *t = ipq_tlmm;
+    IPQTLMM *t = ipq->tlmm;
     unsigned pin = which == NAND_CS_NAND ? ipq_tlmm_nand_cs_pin
                                          : ipq_tlmm_nor_cs_pin;
     uint32_t v;
     int asserted;
 
-    if (!t || !qup_spi || pin * 0x400 + 1 >= t->nregs) {
+    if (!t || !ipq->qup_spi || pin * 0x400 + 1 >= t->nregs) {
         return;
     }
     v = t->regs[(pin * 0x1000 + IPQ_TLMM_IO_OFFSET) >> 2];
@@ -2711,12 +2759,12 @@ static void ipq_tlmm_cs_changed(unsigned which)
                     which == NAND_CS_NAND ? "nand" : "nor");
     }
     if (asserted) {
-        qup_spi_select(qup_spi, which);
-        qup_spi->cs_owner = CS_OWNER_GPIO;
-        qup_spi->cs_gpio_die = which;
-    } else if (qup_spi->cs_owner == CS_OWNER_GPIO &&
-               qup_spi->cs_gpio_die == which) {
-        qup_deselect(qup_spi);
+        qup_spi_select(ipq->qup_spi, which);
+        ipq->qup_spi->cs_owner = CS_OWNER_GPIO;
+        ipq->qup_spi->cs_gpio_die = which;
+    } else if (ipq->qup_spi->cs_owner == CS_OWNER_GPIO &&
+               ipq->qup_spi->cs_gpio_die == which) {
+        qup_deselect(ipq->qup_spi);
     }
 }
 
@@ -2784,7 +2832,7 @@ static void add_tlmm(MemoryRegion *parent, hwaddr base, hwaddr size,
     }
     memory_region_init_io(&t->mr, NULL, &tlmm_ops, t, name, size);
     memory_region_add_subregion(parent, base, &t->mr);
-    ipq_tlmm = t;
+    ipq->tlmm = t;
 }
 
 /* A system reset puts every pin back to its reset value. */
@@ -2820,7 +2868,7 @@ static IPQQupl *add_qupl(MemoryRegion *parent, hwaddr base, hwaddr size,
     /* QUP configuration registers come up cleared, not "nothing here" */
     memory_region_init_io(&q->mr, NULL, &qupl_ops, q, name, size);
     memory_region_add_subregion(parent, base, &q->mr);
-    qup_spi = q;
+    ipq->qup_spi = q;
     return q;
 }
 
@@ -2957,7 +3005,7 @@ typedef struct IPQBamPipe {
     bool rx_desc_open;
 } IPQBamPipe;
 
-typedef struct IPQBam {
+struct IPQBam {
     MemoryRegion mr;
     uint32_t *shadow;           /* everything not explicitly modelled */
     uint8_t *valid;
@@ -2965,7 +3013,7 @@ typedef struct IPQBam {
     uint32_t irq_srcs_msk;      /* BAM_IRQ_SRCS_MSK of EE0 */
     qemu_irq irq;               /* SPI 238, level high */
     IPQBamPipe pipe[BAM_PIPE_COUNT];
-} IPQBam;
+};
 
 /*
  * Pipe wiring: which peripheral each BAM pipe belongs to.  Defaults are the
@@ -3084,7 +3132,6 @@ static void bam_uart_rx_input_ready(void);
 static void uart_rx_idle_arm(void);
 
 /* The BLSP1 BAM, so the UART model can kick the RX pipe when input lands. */
-static IPQBam *ipq_blsp1_bam;
 
 static const char *bam_client_name(BAMClient c, uint32_t ctrl)
 {
@@ -3122,12 +3169,12 @@ static void bam_pipe_xfer(IPQBam *b, int n, uint32_t addr, uint32_t len)
         return;
     }
 
-    if (!qup_spi) {
+    if (!ipq->qup_spi) {
         return;
     }
     if (p->ctrl & BAM_CTRL_DIR_BAM2SYS) {
         for (i = 0; i < len; i++) {
-            uint8_t v = qup_bam_rx(qup_spi);
+            uint8_t v = qup_bam_rx(ipq->qup_spi);
 
             address_space_write(&address_space_memory, addr + i,
                                 MEMTXATTRS_UNSPECIFIED, &v, 1);
@@ -3138,7 +3185,7 @@ static void bam_pipe_xfer(IPQBam *b, int n, uint32_t addr, uint32_t len)
             address_space_read(&address_space_memory, addr + done,
                                MEMTXATTRS_UNSPECIFIED, buf, i);
             for (uint32_t j = 0; j < i; j++) {
-                qup_bam_tx(qup_spi, buf[j]);
+                qup_bam_tx(ipq->qup_spi, buf[j]);
             }
         }
     }
@@ -3351,7 +3398,7 @@ static bool bam_uart_rx_move(IPQBam *b, int n)
 /* The line went idle: flush the FIFO and retire the open descriptor. */
 static void bam_uart_rx_idle(void)
 {
-    IPQBam *b = ipq_blsp1_bam;
+    IPQBam *b = ipq->blsp1_bam;
     int i;
 
     if (!b) {
@@ -3371,7 +3418,7 @@ static void bam_uart_rx_idle(void)
 /* Called from the UART when console input has been sitting idle. */
 static void bam_uart_rx_kick(void)
 {
-    IPQBam *b = ipq_blsp1_bam;
+    IPQBam *b = ipq->blsp1_bam;
     int i;
 
     if (!b) {
@@ -3626,7 +3673,7 @@ static IPQBam *add_bam(MemoryRegion *parent, hwaddr base, hwaddr size,
  * those, and it is what the switch (0x0c000000) and EDMA (0x0c080000)
  * blocks need for their configuration/status registers.
  */
-typedef struct IPQRegFile {
+struct IPQRegFile {
     MemoryRegion mr;
     uint32_t *regs;
     uint32_t nregs;
@@ -3642,7 +3689,7 @@ typedef struct IPQRegFile {
         uint32_t mask;
     } clr[8];
     int nclr;
-} IPQRegFile;
+};
 
 static uint64_t regfile_read(void *opaque, hwaddr off, unsigned size)
 {
@@ -3715,10 +3762,10 @@ static IPQRegFile *add_regfile(MemoryRegion *parent, hwaddr base, hwaddr size,
     memory_region_add_subregion(parent, base, &r->mr);
 
     /* Worth resetting to its power-on values on the next system reset. */
-    if (!ipq_regfile_list) {
-        ipq_regfile_list = g_ptr_array_new();
+    if (!ipq->regfile_list) {
+        ipq->regfile_list = g_ptr_array_new();
     }
-    g_ptr_array_add(ipq_regfile_list, r);
+    g_ptr_array_add(ipq->regfile_list, r);
     return r;
 }
 
@@ -3855,7 +3902,7 @@ static void ipq_eth_set_host_link(int switch_port, bool up);
         }                                                                 \
     } while (0)
 
-typedef struct IPQEdma {
+struct IPQEdma {
     MemoryRegion mr;
     uint32_t *regs;                 /* plain register file for everything else */
     uint32_t nregs;
@@ -3878,9 +3925,8 @@ typedef struct IPQEdma {
     uint64_t tx_drop_nolink;        /* netdev client down / detached */
     uint64_t rx_host;               /* frames taken from the netdev */
     uint64_t rx_dropped;
-} IPQEdma;
+};
 
-static IPQEdma *ipq_edma;
 
 static void edma_update_irqs(IPQEdma *e)
 {
@@ -4658,7 +4704,7 @@ static IPQEdma *add_edma(MemoryRegion *parent, hwaddr base, hwaddr size)
     e->regs = g_new0(uint32_t, e->nregs);
     memory_region_init_io(&e->mr, NULL, &edma_ops, e, "edma", size);
     memory_region_add_subregion(parent, base, &e->mr);
-    ipq_edma = e;
+    ipq->edma = e;
     return e;
 }
 
@@ -4667,12 +4713,12 @@ static void edma_wire_irqs(DeviceState *gicdev)
 {
     unsigned q;
 
-    if (!ipq_edma || !gicdev) {
+    if (!ipq->edma || !gicdev) {
         return;
     }
     for (q = 0; q < IPQ_EDMA_QUEUES; q++) {
-        ipq_edma->irq_tx[q] = qdev_get_gpio_in(gicdev, 0x41 + q);
-        ipq_edma->irq_rx[q] = qdev_get_gpio_in(gicdev, 0xf0 + q);
+        ipq->edma->irq_tx[q] = qdev_get_gpio_in(gicdev, 0x41 + q);
+        ipq->edma->irq_rx[q] = qdev_get_gpio_in(gicdev, 0xf0 + q);
     }
 }
 
@@ -4760,7 +4806,7 @@ typedef struct IPQPhy {
     int nmmd;
 } IPQPhy;
 
-typedef struct IPQMdio {
+struct IPQMdio {
     MemoryRegion mr;
     uint32_t mode;
     uint32_t addr;
@@ -4769,9 +4815,7 @@ typedef struct IPQMdio {
     uint32_t cmd;
     int nphy;
     IPQPhy phy[IPQ_MDIO_MAX_PHYS];
-} IPQMdio;
-
-static IPQMdio *ipq_mdio;        /* set by add_mdio(), reset with the SoC */
+};
 
 static int mmd_find(IPQPhy *p, uint32_t key)
 {
@@ -5002,10 +5046,10 @@ static void ipq_eth_set_host_link(int switch_port, bool up)
 {
     IPQPhy *p;
 
-    if (!ipq_mdio || switch_port < 1) {
+    if (!ipq->mdio || switch_port < 1) {
         return;
     }
-    p = mdio_lookup(ipq_mdio, switch_port - 1);
+    p = mdio_lookup(ipq->mdio, switch_port - 1);
     if (!p) {
         return;
     }
@@ -5373,7 +5417,7 @@ static IPQMdio *add_mdio(MemoryRegion *parent, const char *dtb_path)
         mdio_parse_ports(m, IPQ_ETH_DEFAULT_PORTS);
     }
 
-    ipq_mdio = m;
+    ipq->mdio = m;
     memory_region_init_io(&m->mr, NULL, &mdio_ops, m, "mdio", IPQ_MDIO_SIZE);
     memory_region_add_subregion(parent, IPQ_MDIO_BASE, &m->mr);
 
@@ -5414,7 +5458,7 @@ static IPQMdio *add_mdio(MemoryRegion *parent, const char *dtb_path)
  * in RFWR/RXFS; a partial word raises RXSTALE (bit 3) after the stale
  * timeout and is counted by RX_TOTAL_SNAP.
  */
-typedef struct IPQUart {
+struct IPQUart {
     MemoryRegion mr;
     CharFrontend chr;
     const char *name;
@@ -5465,14 +5509,12 @@ typedef struct IPQUart {
     bool rx_dma_seen;
     bool rx_stale;              /* partial word waiting for the timeout */
     QEMUTimer *stale_timer;
-} IPQUart;
+};
 
 /* The console UART, so the BAM UART TX pipe can drive the same backend. */
-static IPQUart *ipq_console_uart;
 
 /* Set when the machine instantiates the GIC, so devices added later can
  * claim their SPI input line. */
-static DeviceState *ipq_gic_device;
 
 #define UART_RX_FIFO_SIZE   (sizeof(((IPQUart *)0)->rxbuf))
 
@@ -5641,13 +5683,13 @@ static void uart_rx_room(IPQUart *u);
 /* Called by the BAM when the driver posts a receive buffer. */
 static void bam_uart_rx_input_ready(void)
 {
-    uart_rx_fill(ipq_console_uart);
+    uart_rx_fill(ipq->console_uart);
 }
 
 /* Run the idle timeout that retires a partially filled receive descriptor. */
 static void uart_rx_idle_arm(void)
 {
-    IPQUart *u = ipq_console_uart;
+    IPQUart *u = ipq->console_uart;
 
     if (u) {
         timer_mod(u->stale_timer,
@@ -5728,18 +5770,18 @@ static void uart_rx_room(IPQUart *u)
 
 static bool uart_bam_rx_armed(void)
 {
-    return ipq_console_uart &&
-           (ipq_console_uart->dmen & UART_DMEN_RX_BAM_ENABLE);
+    return ipq->console_uart &&
+           (ipq->console_uart->dmen & UART_DMEN_RX_BAM_ENABLE);
 }
 
 static size_t uart_bam_rx_pending(void)
 {
-    return ipq_console_uart ? ipq_console_uart->rx_count : 0;
+    return ipq->console_uart ? ipq->console_uart->rx_count : 0;
 }
 
 static size_t uart_bam_rx_pull(uint8_t *buf, size_t n)
 {
-    IPQUart *u = ipq_console_uart;
+    IPQUart *u = ipq->console_uart;
     size_t i;
 
     if (!u) {
@@ -5764,8 +5806,8 @@ static size_t uart_bam_rx_pull(uint8_t *buf, size_t n)
 /* Bytes the BAM receiver just wrote into the posted descriptor. */
 static void uart_bam_rx_account(size_t n)
 {
-    if (ipq_console_uart) {
-        ipq_console_uart->rx_total += n;
+    if (ipq->console_uart) {
+        ipq->console_uart->rx_total += n;
     }
 }
 
@@ -6051,8 +6093,8 @@ static void add_uart(MemoryRegion *parent, hwaddr base, const char *name,
                              NULL, NULL, u, NULL, true);
     memory_region_init_io(&u->mr, NULL, &uart_ops, u, name, 0x1000);
     memory_region_add_subregion(parent, base, &u->mr);
-    if (!ipq_console_uart) {
-        ipq_console_uart = u;
+    if (!ipq->console_uart) {
+        ipq->console_uart = u;
     }
 }
 
@@ -6061,13 +6103,13 @@ static void uart_bam_write(const uint8_t *buf, size_t n)
 {
     size_t i;
 
-    if (!ipq_console_uart) {
+    if (!ipq->console_uart) {
         return;
     }
     for (i = 0; i < n; i++) {
         die_dbg_ser(buf[i]);
     }
-    qemu_chr_fe_write_all(&ipq_console_uart->chr, buf, n);
+    qemu_chr_fe_write_all(&ipq->console_uart->chr, buf, n);
 }
 
 /* ------------------------------------------------------------------ */
@@ -6129,17 +6171,16 @@ typedef struct IPQRange {
 } IPQRange;
 
 /* every RAM window handed out by ipq_map_ram(), so ELF segments don't remap */
-static GArray *ipq_mapped;
 
 static bool ipq_range_covered(hwaddr base, hwaddr size)
 {
     int i;
 
-    if (!ipq_mapped) {
+    if (!ipq->mapped) {
         return false;
     }
-    for (i = 0; i < ipq_mapped->len; i++) {
-        IPQRange *r = &g_array_index(ipq_mapped, IPQRange, i);
+    for (i = 0; i < ipq->mapped->len; i++) {
+        IPQRange *r = &g_array_index(ipq->mapped, IPQRange, i);
 
         if (base >= r->base && base + size <= r->base + r->size) {
             return true;
@@ -6156,10 +6197,10 @@ static void ipq_map_ram(MemoryRegion *sysmem, hwaddr base, hwaddr size,
 
     memory_region_init_ram(mr, NULL, name, size, &error_fatal);
     memory_region_add_subregion(sysmem, base, mr);
-    if (!ipq_mapped) {
-        ipq_mapped = g_array_new(FALSE, FALSE, sizeof(IPQRange));
+    if (!ipq->mapped) {
+        ipq->mapped = g_array_new(FALSE, FALSE, sizeof(IPQRange));
     }
-    g_array_append_val(ipq_mapped, r);
+    g_array_append_val(ipq->mapped, r);
 }
 
 /*
@@ -6192,8 +6233,6 @@ typedef struct IPQBootStage {
 
 static IPQBootStage ipq_boot_stages[IPQ_MAX_STAGES];
 static int ipq_boot_stage_count;
-static const IPQBootStage *ipq_qsee_stage;
-static const IPQBootStage *ipq_appsbl_stage;
 static unsigned ipq_qsee_skips;
 
 /*
@@ -6250,7 +6289,7 @@ static void ipq4019_scan_stages(const uint8_t *img, size_t len)
     int i;
 
     ipq_boot_stage_count = 0;
-    ipq_qsee_stage = ipq_appsbl_stage = NULL;
+    ipq->qsee_stage = ipq->appsbl_stage = NULL;
 
     if (!ipq_elf_image_at(img, len, 0, &entry, &load, &size)) {
         return;
@@ -6274,8 +6313,8 @@ static void ipq4019_scan_stages(const uint8_t *img, size_t len)
         ipq_boot_stage_count++;
     }
 
-    ipq_qsee_stage = ipq_boot_stage_count == 3 ? &ipq_boot_stages[1] : NULL;
-    ipq_appsbl_stage = ipq_boot_stage_count == 3 ? &ipq_boot_stages[2] : NULL;
+    ipq->qsee_stage = ipq_boot_stage_count == 3 ? &ipq_boot_stages[1] : NULL;
+    ipq->appsbl_stage = ipq_boot_stage_count == 3 ? &ipq_boot_stages[2] : NULL;
 
     fprintf(stderr, "ipq4019: stages:");
     for (i = 0; i < ipq_boot_stage_count; i++) {
@@ -6313,17 +6352,17 @@ static bool ipq_qsee_redirect(CPUState *cs, CPUBreakpoint *bp)
     ARMCPU *cpu = ARM_CPU(cs);
     CPUARMState *env = &cpu->env;
 
-    if (!ipq_appsbl_stage) {
+    if (!ipq->appsbl_stage) {
         return false;
     }
     ipq_qsee_skips++;
     fprintf(stderr, "ipq4019: qsee: skip %s@0x%08x -> %s@0x%08x "
             "(lr=0x%08x, skip #%u)\n",
-            ipq_qsee_stage->name, ipq_qsee_stage->entry,
-            ipq_appsbl_stage->name, ipq_appsbl_stage->entry,
+            ipq->qsee_stage->name, ipq->qsee_stage->entry,
+            ipq->appsbl_stage->name, ipq->appsbl_stage->entry,
             env->regs[14], ipq_qsee_skips);
 
-    env->regs[15] = ipq_appsbl_stage->entry;
+    env->regs[15] = ipq->appsbl_stage->entry;
     env->regs[0] = 0;
     /*
      * APPSBL is ARM code and SBL1 called QSEE from Thumb state, so the mode
@@ -6340,23 +6379,23 @@ static void ipq4019_arm_qsee_policy(void)
     const char *policy = getenv("QEMU_IPQ_QSEE");
     CPUState *cs;
 
-    if (!ipq_qsee_stage || !ipq_appsbl_stage) {
+    if (!ipq->qsee_stage || !ipq->appsbl_stage) {
         return;
     }
     if (policy && (strcmp(policy, "run") == 0 || strcmp(policy, "0") == 0)) {
         fprintf(stderr, "ipq4019: qsee: QEMU_IPQ_QSEE=%s, leaving %s@0x%08x "
-                "to run\n", policy, ipq_qsee_stage->name,
-                ipq_qsee_stage->entry);
+                "to run\n", policy, ipq->qsee_stage->name,
+                ipq->qsee_stage->entry);
         return;
     }
     cpu_breakpoint_hook = ipq_qsee_redirect;
     for (cs = first_cpu; cs; cs = CPU_NEXT(cs)) {
-        cpu_breakpoint_insert(cs, ipq_qsee_stage->entry, BP_MACHINE, NULL);
+        cpu_breakpoint_insert(cs, ipq->qsee_stage->entry, BP_MACHINE, NULL);
     }
     fprintf(stderr, "ipq4019: qsee: %s@0x%08x needs an XPU this machine does "
             "not model; will resume at %s@0x%08x (QEMU_IPQ_QSEE=run keeps "
-            "it)\n", ipq_qsee_stage->name, ipq_qsee_stage->entry,
-            ipq_appsbl_stage->name, ipq_appsbl_stage->entry);
+            "it)\n", ipq->qsee_stage->name, ipq->qsee_stage->entry,
+            ipq->appsbl_stage->name, ipq->appsbl_stage->entry);
 }
 
 static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
@@ -6370,13 +6409,13 @@ static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
 
     if (path && g_file_get_contents(path, &buf, &len, NULL)) {
         owned = true;
-    } else if (ipq_flash_persist_loaded && ipq_flash) {
+    } else if (ipq_flash_persist_loaded && ipq_board->nor) {
         /*
          * No -kernel: the persistent die is the only flash on the board, so
          * take the boot stage out of it exactly as the PBL would.  This is the
          * "one file is the chip" mode -- the dump can be absent entirely.
          */
-        buf = (gchar *)ipq_flash->data;
+        buf = (gchar *)ipq_board->nor->data;
         len = ipq_flash_die_size;
         owned = false;
         fprintf(stderr, "ipq4019: no -kernel, booting the SBL1 ELF out of the "
@@ -6518,8 +6557,8 @@ static void ipq_state_dump(const char *tag)
     }
     fprintf(f, "== %s\n", tag);
 
-    if (qup_spi) {
-        IPQQupl *q = qup_spi;
+    if (ipq->qup_spi) {
+        IPQQupl *q = ipq->qup_spi;
 
         state_regs(f, "qup.shadow", q->shadow, 0x1000 / 4);
         fprintf(f, "qup.slave      phase=%d op=%02x addr=%06x al=%d dl=%d cs=%d "
@@ -6536,8 +6575,8 @@ static void ipq_state_dump(const char *tag)
                 "mid=%x mod=%x\n", q->state, q->op_mask, q->tx_bytes,
                 q->rx_bytes, q->clocks, q->max_in_done, q->max_out_done);
     }
-    if (ipq_blsp1_bam) {
-        IPQBam *b = ipq_blsp1_bam;
+    if (ipq->blsp1_bam) {
+        IPQBam *b = ipq->blsp1_bam;
 
         state_regs(f, "bam.shadow", b->shadow, b->nregs);
         fprintf(f, "bam.mask       %08x\n", b->irq_srcs_msk);
@@ -6555,8 +6594,8 @@ static void ipq_state_dump(const char *tag)
             }
         }
     }
-    if (ipq_console_uart) {
-        IPQUart *u = ipq_console_uart;
+    if (ipq->console_uart) {
+        IPQUart *u = ipq->console_uart;
 
         fprintf(f, "uart           mr1=%08x mr2=%08x imr=%08x cr=%x tfwr=%x "
                 "rfwr=%x dmrx=%x dmen=%x ncf=%x rxhead=%u rxcount=%u "
@@ -6565,8 +6604,8 @@ static void ipq_state_dump(const char *tag)
                 u->dmen, u->ncf_tx, u->rx_head, u->rx_count, u->rxq_count,
                 u->rx_total, u->rx_dma_seen, u->rx_stale);
     }
-    if (ipq_edma) {
-        IPQEdma *e = ipq_edma;
+    if (ipq->edma) {
+        IPQEdma *e = ipq->edma;
 
         state_regs(f, "edma.regs", e->regs, e->nregs);
         for (i = 0; i < IPQ_EDMA_QUEUES; i++) {
@@ -6576,8 +6615,8 @@ static void ipq_state_dump(const char *tag)
             }
         }
     }
-    if (ipq_mdio) {
-        IPQMdio *m = ipq_mdio;
+    if (ipq->mdio) {
+        IPQMdio *m = ipq->mdio;
 
         fprintf(f, "mdio           mode=%08x addr=%08x wdata=%08x "
                 "rdata=%08x cmd=%x\n", m->mode, m->addr, m->wdata, m->rdata,
@@ -6586,39 +6625,39 @@ static void ipq_state_dump(const char *tag)
             state_regs16(f, "mdio.phy", m->phy[i].reg, 32);
         }
     }
-    if (ipq_tlmm) {
-        state_regs_diff(f, "tlmm", ipq_tlmm->regs, ipq_tlmm->nregs,
+    if (ipq->tlmm) {
+        state_regs_diff(f, "tlmm", ipq->tlmm->regs, ipq->tlmm->nregs,
                         IPQ_TLMM_RESET_VAL);
     }
-    if (ipq_regfile_list) {
-        for (i = 0; i < (int)ipq_regfile_list->len; i++) {
-            IPQRegFile *r = g_ptr_array_index(ipq_regfile_list, i);
+    if (ipq->regfile_list) {
+        for (i = 0; i < (int)ipq->regfile_list->len; i++) {
+            IPQRegFile *r = g_ptr_array_index(ipq->regfile_list, i);
 
             state_regs(f, memory_region_name(&r->mr), r->regs, r->nregs);
         }
     }
-    if (ipq_stub_list) {
-        for (i = 0; i < (int)ipq_stub_list->len; i++) {
-            IPQStub *st = g_ptr_array_index(ipq_stub_list, i);
+    if (ipq->stub_list) {
+        for (i = 0; i < (int)ipq->stub_list->len; i++) {
+            IPQStub *st = g_ptr_array_index(ipq->stub_list, i);
 
             if (st->nregs) {
                 state_regs(f, st->name, st->shadow, st->nregs);
             }
         }
     }
-    if (ipq_nand) {
-        IPQNand *n = ipq_nand;
+    if (ipq_board->nand) {
+        IPQNand *n = ipq_board->nand;
 
         fprintf(f, "nand           st=%02x cfg=%02x lock=%02x oip=%d ecc=%d "
                 "page=%u col=%u cache_valid=%d wr=%d feat=%02x\n",
                 n->status, n->cfg, n->lock, n->oip, n->ecc, n->page, n->col,
                 n->cache_valid, n->wr_kind, n->wr_feature);
     }
-    if (ipq_wdt) {
-        state_regs(f, "wdt", ipq_wdt->regs, 0x1000 / 4);
+    if (ipq->wdt) {
+        state_regs(f, "wdt", ipq->wdt->regs, 0x1000 / 4);
     }
-    if (ipq_pshold) {
-        fprintf(f, "pshold         val=%x\n", ipq_pshold->val);
+    if (ipq->pshold) {
+        fprintf(f, "pshold         val=%x\n", ipq->pshold->val);
     }
     if (current_cpu) {
         CPUARMState *e = &ARM_CPU(current_cpu)->env;
@@ -6738,7 +6777,7 @@ static void reset_counter(void)
 
 static void reset_qup(void)
 {
-    IPQQupl *q = qup_spi;
+    IPQQupl *q = ipq->qup_spi;
     uint8_t *resp;
     uint32_t resp_cap;
     qemu_irq irq;
@@ -6766,7 +6805,7 @@ static void reset_qup(void)
 
 static void reset_bam(void)
 {
-    IPQBam *b = ipq_blsp1_bam;
+    IPQBam *b = ipq->blsp1_bam;
     int i;
 
     if (!b) {
@@ -6793,7 +6832,7 @@ static void reset_bam(void)
 
 static void reset_uart(void)
 {
-    IPQUart *u = ipq_console_uart;
+    IPQUart *u = ipq->console_uart;
 
     if (!u) {
         return;
@@ -6813,13 +6852,13 @@ static void reset_mdio(void)
 {
     int i;
 
-    if (!ipq_mdio) {
+    if (!ipq->mdio) {
         return;
     }
-    ipq_mdio->mode = ipq_mdio->addr = ipq_mdio->wdata = 0;
-    ipq_mdio->rdata = ipq_mdio->cmd = 0;
-    for (i = 0; i < ipq_mdio->nphy; i++) {
-        phy_reset_regs(&ipq_mdio->phy[i]);
+    ipq->mdio->mode = ipq->mdio->addr = ipq->mdio->wdata = 0;
+    ipq->mdio->rdata = ipq->mdio->cmd = 0;
+    for (i = 0; i < ipq->mdio->nphy; i++) {
+        phy_reset_regs(&ipq->mdio->phy[i]);
     }
 }
 
@@ -6827,16 +6866,16 @@ static void reset_edma(void)
 {
     int i;
 
-    if (!ipq_edma) {
+    if (!ipq->edma) {
         return;
     }
-    memset(ipq_edma->regs, 0, ipq_edma->nregs * sizeof(uint32_t));
-    memset(ipq_edma->tx_pkt, 0, sizeof(ipq_edma->tx_pkt));
-    memset(ipq_edma->tx_byte, 0, sizeof(ipq_edma->tx_byte));
-    memset(ipq_edma->tx_level, 0, sizeof(ipq_edma->tx_level));
+    memset(ipq->edma->regs, 0, ipq->edma->nregs * sizeof(uint32_t));
+    memset(ipq->edma->tx_pkt, 0, sizeof(ipq->edma->tx_pkt));
+    memset(ipq->edma->tx_byte, 0, sizeof(ipq->edma->tx_byte));
+    memset(ipq->edma->tx_level, 0, sizeof(ipq->edma->tx_level));
     for (i = 0; i < IPQ_EDMA_QUEUES; i++) {
-        qemu_set_irq(ipq_edma->irq_tx[i], 0);
-        qemu_set_irq(ipq_edma->irq_rx[i], 0);
+        qemu_set_irq(ipq->edma->irq_tx[i], 0);
+        qemu_set_irq(ipq->edma->irq_rx[i], 0);
     }
 }
 
@@ -6844,8 +6883,8 @@ static void reset_stubs(void)
 {
     int i;
 
-    for (i = 0; ipq_stub_list && i < (int)ipq_stub_list->len; i++) {
-        IPQStub *st = g_ptr_array_index(ipq_stub_list, i);
+    for (i = 0; ipq->stub_list && i < (int)ipq->stub_list->len; i++) {
+        IPQStub *st = g_ptr_array_index(ipq->stub_list, i);
 
         if (st->nregs) {
             memset(st->shadow, 0, st->nregs * sizeof(uint32_t));
@@ -6857,15 +6896,15 @@ static void reset_stubs(void)
 
 static void reset_tlmm(void)
 {
-    if (ipq_tlmm) {
-        tlmm_dev_reset(ipq_tlmm);
+    if (ipq->tlmm) {
+        tlmm_dev_reset(ipq->tlmm);
     }
 }
 
 static void reset_nand(void)
 {
-    if (ipq_nand) {
-        nand_dev_reset(ipq_nand);
+    if (ipq_board->nand) {
+        nand_dev_reset(ipq_board->nand);
     }
 }
 
@@ -6873,11 +6912,11 @@ static void reset_regfiles(void)
 {
     int i;
 
-    if (!ipq_regfile_list) {
+    if (!ipq->regfile_list) {
         return;
     }
-    for (i = 0; i < (int)ipq_regfile_list->len; i++) {
-        IPQRegFile *r = g_ptr_array_index(ipq_regfile_list, i);
+    for (i = 0; i < (int)ipq->regfile_list->len; i++) {
+        IPQRegFile *r = g_ptr_array_index(ipq->regfile_list, i);
 
         memset(r->regs, 0, r->nregs * sizeof(uint32_t));
     }
@@ -6885,16 +6924,16 @@ static void reset_regfiles(void)
 
 static void reset_pshold(void)
 {
-    if (ipq_pshold) {
-        ipq_pshold->val = 1;            /* rails back up */
+    if (ipq->pshold) {
+        ipq->pshold->val = 1;            /* rails back up */
     }
 }
 
 static void reset_wdt(void)
 {
-    if (ipq_wdt) {
-        wdt_disarm(ipq_wdt);
-        memset(ipq_wdt->regs, 0, sizeof(ipq_wdt->regs));
+    if (ipq->wdt) {
+        wdt_disarm(ipq->wdt);
+        memset(ipq->wdt->regs, 0, sizeof(ipq->wdt->regs));
     }
 }
 
@@ -7018,7 +7057,6 @@ static void ipq4019_reset(void *opaque)
  * tick: it shows whether the timer was programmed, whether ISTATUS is set, and
  * when QEMU intends to expire it.
  */
-static QEMUTimer *ipq_timer_dbg;
 
 static void ipq4019_timer_dbg(void *opaque)
 {
@@ -7040,7 +7078,7 @@ static void ipq4019_timer_dbg(void *opaque)
                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
     fflush(stdout);
-    timer_mod_ns(ipq_timer_dbg,
+    timer_mod_ns(ipq->timer_dbg,
                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NANOSECONDS_PER_SECOND);
 }
 
@@ -7049,7 +7087,6 @@ static void ipq4019_timer_dbg(void *opaque)
  * that it keeps printing even if the virtual clock has stopped, which is the
  * only way to tell "guest spins" from "guest waits for a timer forever".
  */
-static QEMUTimer *ipq_diag_timer;
 static int64_t ipq_diag_last_virtual;
 
 static void ipq4019_diag(void *opaque)
@@ -7065,16 +7102,16 @@ static void ipq4019_diag(void *opaque)
            h, v, v - ipq_diag_last_virtual,
            (uint32_t)cpu->env.regs[15], cs->halted,
            cs->interrupt_request, (unsigned)cpu->env.daif);
-    if (ipq_edma) {
+    if (ipq->edma) {
         fprintf(stderr, "diag: net tx=%" PRIu64 " (noport=%" PRIu64 " nolink=%" PRIu64
                ") rx=%" PRIu64 " (dropped=%" PRIu64 ")\n",
-               ipq_edma->tx_host, ipq_edma->tx_drop_noport,
-               ipq_edma->tx_drop_nolink, ipq_edma->rx_host,
-               ipq_edma->rx_dropped);
+               ipq->edma->tx_host, ipq->edma->tx_drop_noport,
+               ipq->edma->tx_drop_nolink, ipq->edma->rx_host,
+               ipq->edma->rx_dropped);
     }
     fflush(stdout);
     ipq_diag_last_virtual = v;
-    timer_mod_ns(ipq_diag_timer, h + 2 * NANOSECONDS_PER_SECOND);
+    timer_mod_ns(ipq->diag_timer, h + 2 * NANOSECONDS_PER_SECOND);
 }
 
 static void ipq4019_init(MachineState *machine)
@@ -7092,22 +7129,25 @@ static void ipq4019_init(MachineState *machine)
     uint32_t entry = env_u32("QEMU_IPQ_ENTRY", 0);
     int i;
 
+    ipq = g_new0(IPQ4019State, 1);
+    ipq_board = g_new0(IPQBoardState, 1);
+
     for (i = 0; i < machine->smp.cpus; i++) {
         cpu_create(machine->cpu_type);
     }
 
     if (env_true("QEMU_IPQ_DIAG")) {
         ipq_diag_last_virtual = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        ipq_diag_timer = timer_new_ns(QEMU_CLOCK_HOST, ipq4019_diag, NULL);
-        timer_mod_ns(ipq_diag_timer,
+        ipq->diag_timer = timer_new_ns(QEMU_CLOCK_HOST, ipq4019_diag, NULL);
+        timer_mod_ns(ipq->diag_timer,
                      qemu_clock_get_ns(QEMU_CLOCK_HOST) +
                      2 * NANOSECONDS_PER_SECOND);
     }
 
     if (env_true("QEMU_IPQ_TIMER_DBG")) {
-        ipq_timer_dbg = timer_new_ns(QEMU_CLOCK_VIRTUAL, ipq4019_timer_dbg,
+        ipq->timer_dbg = timer_new_ns(QEMU_CLOCK_VIRTUAL, ipq4019_timer_dbg,
                                      NULL);
-        timer_mod_ns(ipq_timer_dbg, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+        timer_mod_ns(ipq->timer_dbg, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                      NANOSECONDS_PER_SECOND);
     }
 
@@ -7158,12 +7198,12 @@ static void ipq4019_init(MachineState *machine)
     }
 
     memory_region_add_subregion(sysmem, IPQ_RAM_BASE, machine->ram);
-    ipq_dram_mr = machine->ram;
+    ipq->dram = machine->ram;
     ipq_dram_size = machine->ram_size;
     qemu_register_reset(ipq_reset_dump, NULL);
 
     flash = add_mem(sysmem, IPQ_FLASH_BASE, IPQ_FLASH_SIZE, "flash");
-    ipq_flash = flash;
+    ipq_board->nor = flash;
     {
         const char *img = getenv("QEMU_IPQ_FLASH_IMAGE");
         const char *jstr = getenv("QEMU_IPQ_FLASH_JEDEC");
@@ -7302,7 +7342,7 @@ static void ipq4019_init(MachineState *machine)
         MemoryRegion *mr = g_new0(MemoryRegion, 1);
 
         ps->val = 1;                    /* rails held up out of reset */
-        ipq_pshold = ps;
+        ipq->pshold = ps;
         memory_region_init_io(mr, NULL, &pshold_ops, ps, "pshold", 0x1000);
         memory_region_add_subregion(sysmem, IPQ_PSHOLD_BASE, mr);
     }
@@ -7311,7 +7351,7 @@ static void ipq4019_init(MachineState *machine)
 
         w->bark = timer_new_ns(QEMU_CLOCK_VIRTUAL, wdt_bark_expire, w);
         w->bite = timer_new_ns(QEMU_CLOCK_VIRTUAL, wdt_bite_expire, w);
-        ipq_wdt = w;
+        ipq->wdt = w;
         memory_region_init_io(&w->mr, NULL, &wdt_ops, w, "wdt", 0x1000);
         /* The page sits inside the 0x0b000000 apcs stub. */
         memory_region_add_subregion_overlap(sysmem, IPQ_WDT_BASE, &w->mr, 1);
@@ -7412,7 +7452,7 @@ static void ipq4019_init(MachineState *machine)
      */
     bam = add_bam(sysmem, IPQ_BLSP1_BAM_BASE, IPQ_BLSP1_BAM_SIZE, "blsp1-bam");
     bam_wire_pipes(bam);
-    ipq_blsp1_bam = bam;
+    ipq->blsp1_bam = bam;
     bam_seed_id(bam);
     add_qupl(sysmem, IPQ_QUP_BASE, 0x1000, "qup-spi");
     add_stub(sysmem, IPQ_QPIC_BASE, IPQ_QPIC_SIZE, "qpic-nand");
@@ -7500,10 +7540,10 @@ static void ipq4019_init(MachineState *machine)
              * gic_set_irq(), so input line n is SPI n.
              */
             bam->irq = qdev_get_gpio_in(gicdev, 238);
-            if (qup_spi) {
-                qup_spi->irq = qdev_get_gpio_in(gicdev, 95);
+            if (ipq->qup_spi) {
+                ipq->qup_spi->irq = qdev_get_gpio_in(gicdev, 95);
             }
-            ipq_gic_device = gicdev;
+            ipq->gic = gicdev;
 
             for (n = 0; n < machine->smp.cpus; n++) {
                 DeviceState *cpudev = DEVICE(qemu_get_cpu(n));
@@ -7622,10 +7662,10 @@ static void ipq4019_init(MachineState *machine)
     }
     add_edma(sysmem, 0x0c080000, 0x00080000);
     if (!getenv("QEMU_IPQ_EDMA_NO_IRQ")) {
-        edma_wire_irqs(ipq_gic_device);
+        edma_wire_irqs(ipq->gic);
     }
     /* Attach the engine to a host backend, if the user gave us one. */
-    edma_connect_netdev(ipq_edma);
+    edma_connect_netdev(ipq->edma);
     /* TCSR: SoC revision, boot option and strap registers */
     add_stub(sysmem, 0x1900000, 0x100000, "tcsr");
     /*
@@ -7674,10 +7714,10 @@ static void ipq4019_init(MachineState *machine)
      * SPI n, same mapping as the BAM and QUP above.
      */
     add_uart(sysmem, IPQ_UART0_BASE, "uart0", serial_hd(0),
-             ipq_gic_device ? qdev_get_gpio_in(ipq_gic_device, 107) : NULL);
+             ipq->gic ? qdev_get_gpio_in(ipq->gic, 107) : NULL);
     if (serial_hd(1)) {
         add_uart(sysmem, IPQ_UART1_BASE, "uart1", serial_hd(1),
-                 ipq_gic_device ? qdev_get_gpio_in(ipq_gic_device, 108) : NULL);
+                 ipq->gic ? qdev_get_gpio_in(ipq->gic, 108) : NULL);
     } else {
         add_stub(sysmem, IPQ_UART1_BASE, 0x1000, "uart1");
     }
