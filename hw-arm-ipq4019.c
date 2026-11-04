@@ -47,6 +47,8 @@
  *                        (default 48000000)
  *   QEMU_IPQ_GCNT_HZ     qca-gcnt sleep counter tick rate (default 32768)
  *   QEMU_IPQ_NO_PMU_FIX=1  do not set PMCR.E at reset
+ *   QEMU_IPQ_NO_TB_FLUSH=1  keep the previous boot's translated code (the
+ *                        model's I-cache) across a reset
  *   QEMU_IPQ_BOOTINFO    address of the synthesized PBL shared data handed to
  *                        SBL1 in r0 (default 0x08680000)
  *   QEMU_IPQ_BOOTCFG     value of the SoC boot-config word (0x5e02c, bits 9:0)
@@ -114,6 +116,7 @@
 #include "system/system.h"
 #include "system/device_tree.h"
 #include "system/runstate.h"
+#include "exec/tb-flush.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gic_common.h"
 #include "hw/qdev-properties.h"
@@ -376,6 +379,19 @@ static const MemoryRegionOps stub_ops = {
 
 /* Every stub register file, so a system reset can clear what software left */
 static GPtrArray *ipq_stub_list;
+
+/* QEMU_IPQ_STATE_DUMP=<path>: dump the whole model state at the handoff. */
+static void ipq_state_dump(const char *tag);
+static void state_note_tx(const uint8_t *buf, unsigned n);
+
+/*
+ * Modelled register files that keep software's writes (the ESS block, for
+ * now).  They are not IPQStub, so the stub sweep does not reach them, but a
+ * system reset has to clear them for the same reason: the next boot prints
+ * "Switch id detected ..." out of an id field the previous OS already
+ * rewrote.
+ */
+static GPtrArray *ipq_regfile_list;
 
 static IPQStub *add_stub_ex(MemoryRegion *parent, hwaddr base, hwaddr size,
                             const char *name, uint32_t read_mask)
@@ -2630,6 +2646,20 @@ static void qupl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
 #define IPQ_TLMM_IO_OFFSET   0x004u
 #define IPQ_TLMM_IO_OUT_BIT  1
 
+/*
+ * Reset value of the whole block: all ones.  Every pin reads back as "no
+ * function selected, no pull, output released", which is what a cold boot
+ * shows and what the boot ROM's own pin dump expects -- the booter prints
+ *
+ *     nand: cs54 cfg FFFFFFFF->200
+ *
+ * on a cold boot and must see the same value after a reboot: the previous OS
+ * leaves pin 54 muxed to its SPI function and pulled up (0xFFFFFE00 here), so
+ * a machine that forgets to reset the block hands the next boot a pin
+ * controller that is still programmed by Linux.
+ */
+#define IPQ_TLMM_RESET_VAL   0xffffffffu
+
 typedef struct IPQTLMM {
     MemoryRegion mr;
     uint32_t *regs;
@@ -2747,11 +2777,21 @@ static void add_tlmm(MemoryRegion *parent, hwaddr base, hwaddr size,
      * select deasserted until gpiolib drives it.
      */
     for (i = 0; i < t->nregs; i++) {
-        t->regs[i] = 0xffffffffu;
+        t->regs[i] = IPQ_TLMM_RESET_VAL;
     }
     memory_region_init_io(&t->mr, NULL, &tlmm_ops, t, name, size);
     memory_region_add_subregion(parent, base, &t->mr);
     ipq_tlmm = t;
+}
+
+/* A system reset puts every pin back to its reset value. */
+static void tlmm_dev_reset(IPQTLMM *t)
+{
+    uint32_t i;
+
+    for (i = 0; i < t->nregs; i++) {
+        t->regs[i] = IPQ_TLMM_RESET_VAL;
+    }
 }
 
 static const MemoryRegionOps qupl_ops = {
@@ -3670,6 +3710,12 @@ static IPQRegFile *add_regfile(MemoryRegion *parent, hwaddr base, hwaddr size,
     r->dbg = getenv("QEMU_IPQ_ESS_LOG") != NULL;
     memory_region_init_io(&r->mr, NULL, &regfile_ops, r, name, size);
     memory_region_add_subregion(parent, base, &r->mr);
+
+    /* Worth resetting to its power-on values on the next system reset. */
+    if (!ipq_regfile_list) {
+        ipq_regfile_list = g_ptr_array_new();
+    }
+    g_ptr_array_add(ipq_regfile_list, r);
     return r;
 }
 
@@ -5885,6 +5931,7 @@ static void uart_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
             for (k = 0; k < n; k++) {
                 die_dbg_ser(buf[k]);
             }
+            state_note_tx(buf, n);
             qemu_chr_fe_write_all(&u->chr, buf, n);
         }
         uart_update_irq(u);
@@ -6200,105 +6247,509 @@ static bool ipq4019_load_elf(MachineState *machine, MemoryRegion *sysmem)
     return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* Whole-machine state dump (QEMU_IPQ_STATE_DUMP=<path>)               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A warm boot's failure is invisible in the guest's own log: the booter
+ * prints the same lines, hands the same image to the same stub, and the stub
+ * is the same code.  What can still differ is any register the booter never
+ * rewrites -- and the only way to find those without guessing is to write
+ * the model's whole register state down at the handoff and diff a cold run
+ * against a warm one.
+ *
+ * Only nonzero registers are printed, so the diff is the leftover state: a
+ * block that appears with a value in the warm dump but not in the cold one
+ * is exactly what a system reset failed to clear.
+ */
+static void state_regs(FILE *f, const char *blk, const uint32_t *regs,
+                       unsigned n)
+{
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        if (regs[i]) {
+            fprintf(f, "%-14s [%05x] %08x\n", blk, i * 4, regs[i]);
+        }
+    }
+}
+
+/* Same, but only the entries that differ from the block's reset value. */
+static void state_regs_diff(FILE *f, const char *blk, const uint32_t *regs,
+                            unsigned n, uint32_t def)
+{
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        if (regs[i] != def) {
+            fprintf(f, "%-14s [%05x] %08x\n", blk, i * 4, regs[i]);
+        }
+    }
+}
+
+/* 16-bit register banks (a PHY's clause 22 register file). */
+static void state_regs16(FILE *f, const char *blk, const uint16_t *regs,
+                         unsigned n)
+{
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        if (regs[i]) {
+            fprintf(f, "%-14s [%04x] %04x\n", blk, i * 2, regs[i]);
+        }
+    }
+}
+
+static void ipq_state_dump(const char *tag)
+{
+    const char *path = getenv("QEMU_IPQ_STATE_DUMP");
+    FILE *f;
+    int i;
+
+    if (!path || !*path) {
+        return;
+    }
+    f = fopen(path, "a");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "== %s\n", tag);
+
+    if (qup_spi) {
+        IPQQupl *q = qup_spi;
+
+        state_regs(f, "qup.shadow", q->shadow, 0x1000 / 4);
+        fprintf(f, "qup.slave      phase=%d op=%02x addr=%06x al=%d dl=%d cs=%d "
+                "force=%d owner=%d die=%d tgt=%d nrd=%d rd=%d rxoff=%06x "
+                "rxlen=%d rxpos=%d wrap=%d sr1=%02x sr2=%02x wsr=%d "
+                "pgm=%06x pgl=%d wip=%d wr=%d db=%u last=%06x a4=%d\n",
+                q->phase, q->opcode, q->addr, q->addr_left, q->dummy_left,
+                q->cs, q->cs_force, q->cs_owner, q->cs_gpio_die, q->target,
+                q->nand_read, q->read_data, q->rx_off, q->rx_len, q->rx_pos,
+                q->rx_wrap, q->status, q->status2, q->write_sr, q->pgm_addr,
+                q->pgm_left, q->wip_pending, q->wr_kind, q->data_bytes,
+                q->last_addr, q->addr4);
+        fprintf(f, "qup.engine     state=%x opmask=%x txb=%u rxb=%u clk=%u "
+                "mid=%x mod=%x\n", q->state, q->op_mask, q->tx_bytes,
+                q->rx_bytes, q->clocks, q->max_in_done, q->max_out_done);
+    }
+    if (ipq_blsp1_bam) {
+        IPQBam *b = ipq_blsp1_bam;
+
+        state_regs(f, "bam.shadow", b->shadow, b->nregs);
+        fprintf(f, "bam.mask       %08x\n", b->irq_srcs_msk);
+        for (i = 0; i < BAM_PIPE_COUNT; i++) {
+            IPQBamPipe *p = &b->pipe[i];
+
+            if (p->ctrl || p->event || p->irq_stts || p->irq_en ||
+                p->limit || p->ring_base || p->ring_size || p->prod ||
+                p->cons || p->rx_desc_open) {
+                fprintf(f, "bam.pipe%-2d     ctrl=%x ev=%x sts=%x en=%x "
+                        "lim=%x base=%08x size=%x prod=%x cons=%x open=%d\n",
+                        i, p->ctrl, p->event, p->irq_stts, p->irq_en,
+                        p->limit, p->ring_base, p->ring_size, p->prod,
+                        p->cons, p->rx_desc_open);
+            }
+        }
+    }
+    if (ipq_console_uart) {
+        IPQUart *u = ipq_console_uart;
+
+        fprintf(f, "uart           mr1=%08x mr2=%08x imr=%08x cr=%x tfwr=%x "
+                "rfwr=%x dmrx=%x dmen=%x ncf=%x rxhead=%u rxcount=%u "
+                "rxqcount=%u rxtotal=%u dma=%d stale=%d\n",
+                u->mr1, u->mr2, u->imr, u->cr, u->tfwr, u->rfwr, u->dmrx,
+                u->dmen, u->ncf_tx, u->rx_head, u->rx_count, u->rxq_count,
+                u->rx_total, u->rx_dma_seen, u->rx_stale);
+    }
+    if (ipq_edma) {
+        IPQEdma *e = ipq_edma;
+
+        state_regs(f, "edma.regs", e->regs, e->nregs);
+        for (i = 0; i < IPQ_EDMA_QUEUES; i++) {
+            if (e->tx_pkt[i] || e->tx_byte[i] || e->tx_level[i]) {
+                fprintf(f, "edma.q%-2d        pkt=%08x byte=%08x lvl=%d\n",
+                        i, e->tx_pkt[i], e->tx_byte[i], e->tx_level[i]);
+            }
+        }
+    }
+    if (ipq_mdio) {
+        IPQMdio *m = ipq_mdio;
+
+        fprintf(f, "mdio           mode=%08x addr=%08x wdata=%08x "
+                "rdata=%08x cmd=%x\n", m->mode, m->addr, m->wdata, m->rdata,
+                m->cmd);
+        for (i = 0; i < m->nphy; i++) {
+            state_regs16(f, "mdio.phy", m->phy[i].reg, 32);
+        }
+    }
+    if (ipq_tlmm) {
+        state_regs_diff(f, "tlmm", ipq_tlmm->regs, ipq_tlmm->nregs,
+                        IPQ_TLMM_RESET_VAL);
+    }
+    if (ipq_regfile_list) {
+        for (i = 0; i < (int)ipq_regfile_list->len; i++) {
+            IPQRegFile *r = g_ptr_array_index(ipq_regfile_list, i);
+
+            state_regs(f, memory_region_name(&r->mr), r->regs, r->nregs);
+        }
+    }
+    if (ipq_stub_list) {
+        for (i = 0; i < (int)ipq_stub_list->len; i++) {
+            IPQStub *st = g_ptr_array_index(ipq_stub_list, i);
+
+            if (st->nregs) {
+                state_regs(f, st->name, st->shadow, st->nregs);
+            }
+        }
+    }
+    if (ipq_nand) {
+        IPQNand *n = ipq_nand;
+
+        fprintf(f, "nand           st=%02x cfg=%02x lock=%02x oip=%d ecc=%d "
+                "page=%u col=%u cache_valid=%d wr=%d feat=%02x\n",
+                n->status, n->cfg, n->lock, n->oip, n->ecc, n->page, n->col,
+                n->cache_valid, n->wr_kind, n->wr_feature);
+    }
+    if (ipq_wdt) {
+        state_regs(f, "wdt", ipq_wdt->regs, 0x1000 / 4);
+    }
+    if (ipq_pshold) {
+        fprintf(f, "pshold         val=%x\n", ipq_pshold->val);
+    }
+    if (current_cpu) {
+        CPUARMState *e = &ARM_CPU(current_cpu)->env;
+
+        fprintf(f, "cpu            cpsr=%08x sctlr=%08" PRIx64
+                " ttbr0=%08" PRIx64 " vbar=%08" PRIx64
+                " cntfrq=%08" PRIx64 " pmcr=%08" PRIx64 "\n",
+                e->uncached_cpsr, e->cp15.sctlr_el[1], e->cp15.ttbr0_el[1],
+                e->cp15.vbar_el[1], e->cp15.c14_cntfrq, e->cp15.c9_pmcr);
+        for (i = 0; i < 16; i++) {
+            fprintf(f, "cpu.r%-2d        %08x\n", i, e->regs[i]);
+        }
+    }
+    fprintf(f, "--\n");
+    fclose(f);
+}
+
+/* Watch the console bytes for the booter's handoff line. */
+static void state_note_tx(const uint8_t *buf, unsigned n)
+{
+    static int on = -1;
+    static char tail[32];
+    static unsigned tlen;
+
+    if (on < 0) {
+        const char *v = getenv("QEMU_IPQ_STATE_DUMP");
+
+        on = v && *v;
+    }
+    if (!on) {
+        return;
+    }
+    while (n--) {
+        uint8_t c = *buf++;
+
+        if (tlen == sizeof(tail) - 1) {
+            memmove(tail, tail + 1, sizeof(tail) - 2);
+            tlen--;
+        }
+        tail[tlen++] = c;
+        tail[tlen] = 0;
+        if (strstr(tail, "Jumping to kernel")) {
+            tlen = 0;
+            tail[0] = 0;
+            ipq_state_dump("handoff");
+        }
+    }
+}
+
+/*
+ * A system reset drops the die's controller state, not its array.
+ *
+ * The page cache, the latched row/column, the busy and write-enable bits and
+ * the half-finished write kind all belong to the controller: after power-on the
+ * part answers "not busy, cache invalid" and the boot ROM latches its own read
+ * from scratch.  Leaving Linux's last latched page and cache behind makes the
+ * next booter's READ FROM CACHE hand the stub whatever the previous OS last
+ * read, instead of the page it just asked for.  n->data (the array) and its
+ * backing file of course survive -- that is the point of a reboot.
+ */
+static void nand_dev_reset(IPQNand *n)
+{
+    n->status = 0;
+    n->cfg = 0;
+    n->lock = 0;
+    n->oip = 0;
+    n->ecc = 0;
+    n->page = 0;
+    n->col = 0;
+    nand_fill_erased(n->cache, NAND_STRIDE);
+    n->cache_valid = 0;
+    n->wr_kind = NAND_WR_NONE;
+    n->wr_feature = 0;
+}
+
 /*
  * Power-on reset of the modelled hardware.
  *
  * A system reset drops the SoC's state, and the boot chain depends on it: the
  * second SBL1 run re-probes the SPI controller and the BAM assuming they are
  * in their reset state, so leaving Linux's leftovers in the QUP's FIFOs makes
- * boot_flash_init fail with a die that is perfectly fine.  The one thing that
- * must survive is the flash array itself -- that is the point of a reboot.
+ * boot_flash_init fail with a die that is perfectly fine.  The pin controller
+ * and the NAND controller's page cache are the same story: a warm boot has to
+ * start from their reset values even though the flash array keeps what the
+ * previous OS wrote.  The one thing that must survive is the flash array
+ * itself -- that is the point of a reboot.
  */
-static void ipq4019_dev_reset(void *opaque)
+/*
+ * Every block that has state to drop owns a reset function, and the table
+ * below is the complete list of them.
+ *
+ * The point is not style.  Each of the leftovers found on this machine so far
+ * -- the pin controller still muxed by Linux, the NAND controller's latched
+ * page cache, the ESS register file, the level-high QUP/BAM/EDMA interrupt
+ * lines -- was a block that simply was not in the reset sequence.  A
+ * hand-written sequence cannot show that omission; a table can, and adding a
+ * device without adding its entry is visible in one place.
+ *
+ * What must *not* be here: the NOR die, the NAND array and their persist
+ * files.  Those are the machine's non-volatile storage, and surviving a reset
+ * is the entire point of a reboot.  Their controller state is reset (QUP for
+ * the NOR, nand_dev_reset() for the NAND) -- the arrays are not.
+ *
+ * QEMU_IPQ_NO_RESET_<NAME> skips one entry (same "0 means off" rule as every
+ * other knob); QEMU_IPQ_NO_DEV_RESET skips the whole table.
+ * QEMU_IPQ_RESET_LOG=1 prints which blocks ran.
+ */
+
+static void reset_counter(void)
+{
+    /*
+     * Start the QTIMER/GCNT/XO/TSC frames from zero again (SBL1's log stamps,
+     * udelay() baselines and the kernel's early delays all read them).
+     */
+    ipq_counter_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static void reset_qup(void)
+{
+    IPQQupl *q = qup_spi;
+    uint8_t *resp;
+    uint32_t resp_cap;
+    qemu_irq irq;
+
+    if (!q) {
+        return;
+    }
+    resp = q->resp;
+    resp_cap = q->resp_cap;
+    irq = q->irq;
+    memset((char *)q + offsetof(IPQQupl, phase), 0,
+           sizeof(*q) - offsetof(IPQQupl, phase));
+    q->resp = resp;
+    q->resp_cap = resp_cap;
+    q->irq = irq;
+    memset(q->shadow, 0, sizeof(q->shadow));
+    /*
+     * The interrupt is level-high and the GIC keeps whatever level the line
+     * had.  Zeroing the register file does not lower it, so after a booted
+     * Linux the next boot would start with SPI 95 already asserted -- an
+     * interrupt with no cause.  Power-on drops the line.
+     */
+    qemu_set_irq(q->irq, 0);
+}
+
+static void reset_bam(void)
+{
+    IPQBam *b = ipq_blsp1_bam;
+    int i;
+
+    if (!b) {
+        return;
+    }
+    memset(b->shadow, 0, b->nregs * sizeof(uint32_t));
+    memset(b->valid, 0, b->nregs);
+    /*
+     * BAM_IRQ_SRCS_MSK is its own field, not part of the shadow register file,
+     * so clearing the file left Linux's mask behind: power-on reads 0, and a
+     * warm boot read 0x80000033.  The mask gates bam_update_irq(), so a stale
+     * one re-asserts SPI 238 from sources the next boot believes are masked.
+     */
+    b->irq_srcs_msk = 0;
+    for (i = 0; i < BAM_PIPE_COUNT; i++) {
+        BAMClient client = b->pipe[i].client;
+
+        memset(&b->pipe[i], 0, sizeof(b->pipe[i]));
+        b->pipe[i].client = client;
+    }
+    bam_seed_id(b);
+    qemu_set_irq(b->irq, 0);
+}
+
+static void reset_uart(void)
+{
+    IPQUart *u = ipq_console_uart;
+
+    if (!u) {
+        return;
+    }
+    timer_del(u->stale_timer);
+    u->mr1 = u->mr2 = u->imr = u->cr = 0;
+    u->tfwr = u->rfwr = u->dmrx = u->dmen = u->ncf_tx = 0;
+    u->rx_head = u->rx_count = 0;
+    u->rxq_head = u->rxq_count = 0;
+    u->rx_total = 0;
+    u->rx_stale = false;
+    u->rx_dma_seen = false;
+    uart_update_irq(u);
+}
+
+static void reset_mdio(void)
 {
     int i;
+
+    if (!ipq_mdio) {
+        return;
+    }
+    ipq_mdio->mode = ipq_mdio->addr = ipq_mdio->wdata = 0;
+    ipq_mdio->rdata = ipq_mdio->cmd = 0;
+    for (i = 0; i < ipq_mdio->nphy; i++) {
+        phy_reset_regs(&ipq_mdio->phy[i]);
+    }
+}
+
+static void reset_edma(void)
+{
+    int i;
+
+    if (!ipq_edma) {
+        return;
+    }
+    memset(ipq_edma->regs, 0, ipq_edma->nregs * sizeof(uint32_t));
+    memset(ipq_edma->tx_pkt, 0, sizeof(ipq_edma->tx_pkt));
+    memset(ipq_edma->tx_byte, 0, sizeof(ipq_edma->tx_byte));
+    memset(ipq_edma->tx_level, 0, sizeof(ipq_edma->tx_level));
+    for (i = 0; i < IPQ_EDMA_QUEUES; i++) {
+        qemu_set_irq(ipq_edma->irq_tx[i], 0);
+        qemu_set_irq(ipq_edma->irq_rx[i], 0);
+    }
+}
+
+static void reset_stubs(void)
+{
+    int i;
+
+    for (i = 0; ipq_stub_list && i < (int)ipq_stub_list->len; i++) {
+        IPQStub *st = g_ptr_array_index(ipq_stub_list, i);
+
+        if (st->nregs) {
+            memset(st->shadow, 0, st->nregs * sizeof(uint32_t));
+            memset(st->valid, 0, st->nregs);
+        }
+        st->spin = 0;
+    }
+}
+
+static void reset_tlmm(void)
+{
+    if (ipq_tlmm) {
+        tlmm_dev_reset(ipq_tlmm);
+    }
+}
+
+static void reset_nand(void)
+{
+    if (ipq_nand) {
+        nand_dev_reset(ipq_nand);
+    }
+}
+
+static void reset_regfiles(void)
+{
+    int i;
+
+    if (!ipq_regfile_list) {
+        return;
+    }
+    for (i = 0; i < (int)ipq_regfile_list->len; i++) {
+        IPQRegFile *r = g_ptr_array_index(ipq_regfile_list, i);
+
+        memset(r->regs, 0, r->nregs * sizeof(uint32_t));
+    }
+}
+
+static void reset_pshold(void)
+{
+    if (ipq_pshold) {
+        ipq_pshold->val = 1;            /* rails back up */
+    }
+}
+
+static void reset_wdt(void)
+{
+    if (ipq_wdt) {
+        wdt_disarm(ipq_wdt);
+        memset(ipq_wdt->regs, 0, sizeof(ipq_wdt->regs));
+    }
+}
+
+typedef struct IPQResetEntry {
+    const char *name;
+    void (*fn)(void);
+} IPQResetEntry;
+
+static const IPQResetEntry ipq_reset_table[] = {
+    { "COUNTER",  reset_counter  },
+    { "TLMM",     reset_tlmm     },
+    { "QUP",      reset_qup      },
+    { "NAND",     reset_nand     },
+    { "BAM",      reset_bam      },
+    { "UART",     reset_uart     },
+    { "MDIO",     reset_mdio     },
+    { "EDMA",     reset_edma     },
+    { "ESS",      reset_regfiles },
+    { "STUBS",    reset_stubs    },
+    { "PSHOLD",   reset_pshold   },
+    { "WDT",      reset_wdt      },
+};
+
+static void ipq4019_dev_reset(void *opaque)
+{
+    unsigned i;
+
+    /* What the previous OS left behind, if a dump is configured. */
+    if (ipq_counter_epoch_ns) {
+        ipq_state_dump("reset");
+    }
 
     if (env_true("QEMU_IPQ_NO_DEV_RESET")) {
         return;
     }
 
-    /* Start the QTIMER/GCNT/XO/TSC frames from zero again (SBL1's log stamps,
-     * udelay() baselines and the kernel's early delays all read them). */
-    ipq_counter_epoch_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    for (i = 0; i < ARRAY_SIZE(ipq_reset_table); i++) {
+        char knob[64];
 
-    if (qup_spi && !env_true("QEMU_IPQ_NO_RESET_QUP")) {
-        IPQQupl *q = qup_spi;
-        uint8_t *resp = q->resp;
-        uint32_t resp_cap = q->resp_cap;
-        qemu_irq irq = q->irq;
-
-        memset((char *)q + offsetof(IPQQupl, phase), 0,
-               sizeof(*q) - offsetof(IPQQupl, phase));
-        q->resp = resp;
-        q->resp_cap = resp_cap;
-        q->irq = irq;
-        memset(q->shadow, 0, sizeof(q->shadow));
-    }
-
-    if (ipq_blsp1_bam && !env_true("QEMU_IPQ_NO_RESET_BAM")) {
-        IPQBam *b = ipq_blsp1_bam;
-
-        memset(b->shadow, 0, b->nregs * sizeof(uint32_t));
-        memset(b->valid, 0, b->nregs);
-        for (i = 0; i < BAM_PIPE_COUNT; i++) {
-            BAMClient client = b->pipe[i].client;
-
-            memset(&b->pipe[i], 0, sizeof(b->pipe[i]));
-            b->pipe[i].client = client;
+        snprintf(knob, sizeof(knob), "QEMU_IPQ_NO_RESET_%s",
+                 ipq_reset_table[i].name);
+        if (env_true(knob)) {
+            continue;
         }
-        bam_seed_id(b);
-    }
-
-    if (ipq_console_uart && !env_true("QEMU_IPQ_NO_RESET_UART")) {
-        IPQUart *u = ipq_console_uart;
-
-        timer_del(u->stale_timer);
-        u->mr1 = u->mr2 = u->imr = u->cr = 0;
-        u->tfwr = u->rfwr = u->dmrx = u->dmen = u->ncf_tx = 0;
-        u->rx_head = u->rx_count = 0;
-        u->rxq_head = u->rxq_count = 0;
-        u->rx_total = 0;
-        u->rx_stale = false;
-        u->rx_dma_seen = false;
-        uart_update_irq(u);
-    }
-
-    if (ipq_mdio && !env_true("QEMU_IPQ_NO_RESET_MDIO")) {
-        ipq_mdio->mode = ipq_mdio->addr = ipq_mdio->wdata = 0;
-        ipq_mdio->rdata = ipq_mdio->cmd = 0;
-        for (i = 0; i < ipq_mdio->nphy; i++) {
-            phy_reset_regs(&ipq_mdio->phy[i]);
+        if (env_true("QEMU_IPQ_RESET_LOG")) {
+            fprintf(stderr, "reset: %s\n", ipq_reset_table[i].name);
         }
+        ipq_reset_table[i].fn();
     }
 
-    if (ipq_edma && !env_true("QEMU_IPQ_NO_RESET_EDMA")) {
-        memset(ipq_edma->regs, 0,
-               ipq_edma->nregs * sizeof(uint32_t));
-        memset(ipq_edma->tx_pkt, 0, sizeof(ipq_edma->tx_pkt));
-        memset(ipq_edma->tx_byte, 0, sizeof(ipq_edma->tx_byte));
-        memset(ipq_edma->tx_level, 0, sizeof(ipq_edma->tx_level));
-    }
-
-    if (!env_true("QEMU_IPQ_NO_RESET_STUBS")) {
-        for (i = 0; ipq_stub_list && i < (int)ipq_stub_list->len; i++) {
-            IPQStub *st = g_ptr_array_index(ipq_stub_list, i);
-
-            if (st->nregs) {
-                memset(st->shadow, 0, st->nregs * sizeof(uint32_t));
-                memset(st->valid, 0, st->nregs);
-            }
-            st->spin = 0;
-        }
-    }
-
-    if (ipq_pshold) {
-        ipq_pshold->val = 1;            /* rails back up */
-    }
-
-    if (ipq_wdt) {
-        wdt_disarm(ipq_wdt);
-        memset(ipq_wdt->regs, 0, sizeof(ipq_wdt->regs));
-    }
+    /*
+     * What the machine starts the next boot with.  Comparing this snapshot
+     * across a reboot is how the reset is *shown* to be complete instead of
+     * assumed: a block that appears in the warm snapshot but not in the cold
+     * one is state the table above still misses.
+     */
+    ipq_state_dump("postreset");
 }
 
 static void ipq4019_reset(void *opaque)
@@ -6320,6 +6771,23 @@ static void ipq4019_reset(void *opaque)
      * entry point instead of a fresh boot log.
      */
     cpu_reset(CPU(cpu));
+
+    /*
+     * Reset the instruction cache, i.e. QEMU's translated blocks.
+     *
+     * This is not a speed tweak: a real CPU reset invalidates the I-cache, so
+     * nothing the previous OS translated may be executed after a reboot.  Here
+     * the translated blocks are that cache -- CPU objects sit on no bus and a
+     * system reset only flushes them when the code buffer overflows -- so
+     * without this the second boot re-enters the booter through blocks the
+     * booted Linux had already translated, while a cold boot has none.
+     *
+     * It is safe to queue from the reset handler: the flush runs at the next
+     * safe point, before any vCPU executes guest code again.
+     */
+    if (!env_true("QEMU_IPQ_NO_TB_FLUSH")) {
+        queue_tb_flush(CPU(cpu));
+    }
 
     /*
      * The IPQ40xx boot ROM leaves the PMU cycle counter running; RouterBOOT's
