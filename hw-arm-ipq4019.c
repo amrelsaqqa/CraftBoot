@@ -103,6 +103,7 @@
 #include <elf.h>
 #include "qapi/error.h"
 #include "qapi/visitor.h"
+#include "qapi/qapi-types-block-core.h"
 #include "qemu/units.h"
 #include "qemu/cutils.h"
 #include "qemu/log.h"
@@ -117,6 +118,9 @@
 #include "hw/arm/boot.h"
 #include "hw/arm/machines-qom.h"
 #include "system/address-spaces.h"
+#include "system/block-backend-global-state.h"
+#include "system/block-backend-io.h"
+#include "block/block-io.h"
 #include "system/reset.h"
 #include "system/system.h"
 #include "system/device_tree.h"
@@ -300,12 +304,14 @@ typedef struct IPQBoardConfig {
     uint32_t nor_size;          /* die bytes, power of two */
     const char *nor_id;         /* RDID as hex, e.g. "ef4019" */
     const char *nor_file;       /* the die itself (persist file) */
+    const char *nor_drive;      /* ... or a block backend holding it */
     const char *nor_image;      /* content for a die that is not programmed */
 
     bool nand;                  /* ... and a SPI NAND on chip select 1? */
     uint32_t nand_size;
     const char *nand_id;
     const char *nand_file;
+    const char *nand_drive;
     const char *nand_image;
 
     /* the TLMM pins the board wires to the dies' chip selects */
@@ -330,6 +336,8 @@ enum {
     IPQ_CFG_BOOT       = 1u << 10,
     IPQ_CFG_NOR_CS     = 1u << 11,
     IPQ_CFG_NAND_CS    = 1u << 12,
+    IPQ_CFG_NOR_DRIVE  = 1u << 13,
+    IPQ_CFG_NAND_DRIVE = 1u << 14,
 };
 
 typedef struct IPQBoardPreset {
@@ -443,11 +451,13 @@ static void ipq_board_config_resolve(MachineState *machine)
     if (ipq_cfg_set & IPQ_CFG_NOR_SIZE)   { ipq_cfg.nor_size   = want.nor_size; }
     if (ipq_cfg_set & IPQ_CFG_NOR_ID)     { ipq_cfg.nor_id     = want.nor_id; }
     if (ipq_cfg_set & IPQ_CFG_NOR_FILE)   { ipq_cfg.nor_file   = want.nor_file; }
+    if (ipq_cfg_set & IPQ_CFG_NOR_DRIVE)  { ipq_cfg.nor_drive  = want.nor_drive; }
     if (ipq_cfg_set & IPQ_CFG_NOR_IMAGE)  { ipq_cfg.nor_image  = want.nor_image; }
     if (ipq_cfg_set & IPQ_CFG_NAND)       { ipq_cfg.nand       = want.nand; }
     if (ipq_cfg_set & IPQ_CFG_NAND_SIZE)  { ipq_cfg.nand_size  = want.nand_size; }
     if (ipq_cfg_set & IPQ_CFG_NAND_ID)    { ipq_cfg.nand_id    = want.nand_id; }
     if (ipq_cfg_set & IPQ_CFG_NAND_FILE)  { ipq_cfg.nand_file  = want.nand_file; }
+    if (ipq_cfg_set & IPQ_CFG_NAND_DRIVE) { ipq_cfg.nand_drive = want.nand_drive; }
     if (ipq_cfg_set & IPQ_CFG_NAND_IMAGE) { ipq_cfg.nand_image = want.nand_image; }
     if (ipq_cfg_set & IPQ_CFG_BOOT)       { ipq_cfg.boot      = want.boot; }
     if (ipq_cfg_set & IPQ_CFG_NOR_CS)     { ipq_cfg.nor_cs_gpio  = want.nor_cs_gpio; }
@@ -581,7 +591,7 @@ static void ipq_board_config_resolve(MachineState *machine)
     if (ipq_cfg.nor) {
         fprintf(stderr, "%u MiB cs gpio %u%s, ",
                 (unsigned)(ipq_cfg.nor_size / MiB), ipq_cfg.nor_cs_gpio,
-                ipq_cfg.nor_file ? " (persist)" : "");
+                (ipq_cfg.nor_file || ipq_cfg.nor_drive) ? " (store)" : "");
     } else {
         fprintf(stderr, "none, ");
     }
@@ -589,7 +599,7 @@ static void ipq_board_config_resolve(MachineState *machine)
     if (ipq_cfg.nand) {
         fprintf(stderr, "%u MiB cs gpio %u%s, ",
                 (unsigned)(ipq_cfg.nand_size / MiB), ipq_cfg.nand_cs_gpio,
-                ipq_cfg.nand_file ? " (persist)" : "");
+                (ipq_cfg.nand_file || ipq_cfg.nand_drive) ? " (store)" : "");
     } else {
         fprintf(stderr, "none, ");
     }
@@ -1479,41 +1489,100 @@ static bool nor_range_protected(IPQQupl *q, uint32_t off, uint32_t len)
     return top ? off + len > die - prot : off < prot;
 }
 
+/* ------------------------------------------------------------------ */
+/* a die's backing store: a file, or a -drive backend                  */
+/* ------------------------------------------------------------------ */
+
 /*
- * QEMU_IPQ_FLASH_PERSIST=<file> turns the die into a real device that keeps
- * what the guest wrote after QEMU exits.
+ * A die is a device with storage behind it, and there are two ways to give it
+ * storage, because there are two worlds to fit into:
  *
- * The dump named on the command line stays a read-only factory image: it is
- * read into the die at power-on and never written back, so its checksum cannot
- * change.  The named file is the die itself.  On the first run it is created as
- * a copy of what the die holds after the dump was loaded; on every later run it
- * is loaded instead of the dump.  Each erase and each programmed byte is then
- * mirrored into it with pwrite(2), which is what makes a manual power cycle --
- * kill QEMU, start a new one -- retain the write.
+ *   -machine ipq4019,nor-file=board.bin          the machine opens the file
+ *   -drive if=none,id=nor,file=board.bin,format=raw
+ *   -machine ipq4019,nor-drive=nor               the machine uses that backend
  *
- * One file per dump, one die per file: a persist file that is smaller than the
- * configured die is refused rather than extended, because a die that suddenly
- * reads 0xff where it used to hold data is worse than a loud failure.
+ * The second is what a libvirt <disk> produces: libvirt owns the file, its
+ * format and its cache mode, and hands QEMU a block backend by name.  Both
+ * reach the die through this struct, so the QUP code never asks which one it
+ * has and the rest of the machine knows about neither.
+ *
+ * A store that cannot be written is still a valid die -- it is a part whose
+ * write protect is on.  The guest gets P_FAIL/E_FAIL from the operations it
+ * attempts, which is what silicon does, and the RAM image is left alone
+ * instead of quietly diverging from what a power cycle would show.
  */
-static int ipq_flash_persist_fd = -1;
-static bool ipq_flash_persist_loaded;   /* the die came from the persist file */
+typedef struct IPQDieStore {
+    int fd;                     /* nor-file= / nand-file=, -1 if absent */
+    BlockBackend *blk;          /* nor-drive= / nand-drive=, NULL if absent */
+    bool ro;                    /* the guest may not change this die */
+    const char *what;           /* "nor" / "nand", for messages */
+} IPQDieStore;
 
-static void nor_persist(const void *src, uint32_t off, uint32_t len)
+static bool ipq_die_store_open(IPQDieStore *s)
 {
-    uint32_t die = ipq_flash_die_size;
+    return s->fd >= 0 || s->blk;
+}
 
-    if (ipq_flash_persist_fd < 0 || off >= die) {
-        return;
+static bool ipq_die_store_writable(IPQDieStore *s)
+{
+    return ipq_die_store_open(s) && !s->ro;
+}
+
+static void ipq_die_store_fail(IPQDieStore *s, const char *op, uint64_t off)
+{
+    error_report("ipq4019: %s %s at 0x%" PRIx64 " failed", s->what, op, off);
+}
+
+/* The store's own length, or 0 when it does not have one to report. */
+static uint64_t ipq_die_store_len(IPQDieStore *s)
+{
+    if (s->blk) {
+        int64_t n = blk_getlength(s->blk);
+
+        return n < 0 ? 0 : (uint64_t)n;
     }
-    len = MIN(len, die - off);
+    return 0;
+}
+
+/* Read len bytes at off into dst.  The length was validated when it was bound. */
+static bool ipq_die_store_pread(IPQDieStore *s, void *dst, uint64_t len,
+                                uint64_t off)
+{
+    if (s->blk) {
+        return blk_pread(s->blk, off, len, dst, 0) == 0;
+    }
     while (len) {
-        ssize_t n = pwrite(ipq_flash_persist_fd, src, len, off);
+        ssize_t n = pread(s->fd, dst, len, off);
 
         if (n <= 0) {
-            error_report("ipq4019: flash persist write at 0x%06x failed: %s",
-                         off, n < 0 ? strerror(errno) : "short write");
-            close(ipq_flash_persist_fd);
-            ipq_flash_persist_fd = -1;
+            return false;
+        }
+        dst = (uint8_t *)dst + n;
+        off += n;
+        len -= n;
+    }
+    return true;
+}
+
+static void ipq_die_store_pwrite(IPQDieStore *s, const void *src, uint32_t len,
+                                 uint32_t off)
+{
+    if (!ipq_die_store_writable(s)) {
+        return;
+    }
+    if (s->blk) {
+        if (blk_pwrite(s->blk, off, len, src, 0) < 0) {
+            ipq_die_store_fail(s, "write", off);
+        }
+        return;
+    }
+    while (len) {
+        ssize_t n = pwrite(s->fd, src, len, off);
+
+        if (n <= 0) {
+            ipq_die_store_fail(s, "write", off);
+            close(s->fd);
+            s->fd = -1;
             return;
         }
         src = (const uint8_t *)src + n;
@@ -1522,97 +1591,248 @@ static void nor_persist(const void *src, uint32_t off, uint32_t len)
     }
 }
 
+/*
+ * An erase is the operation a later read depends on most, so give it a real
+ * durability point rather than relying on the page cache.  A block backend is
+ * asked to flush too: its cache mode is libvirt's choice, and if libvirt chose
+ * writeback then QEMU exiting is not a power cut until the flush says so.
+ */
+static void ipq_die_store_sync(IPQDieStore *s)
+{
+    if (s->fd >= 0 && !s->ro) {
+        fsync(s->fd);
+    } else if (s->blk && !s->ro) {
+        blk_flush(s->blk);
+    }
+}
+
+/*
+ * Bind a die to a store: a path the machine opens, or the name of a block
+ * backend somebody else opened.  Returns the store's length, or 0 when the
+ * store is empty and the caller should program it from the board's image.
+ *
+ * `exact` is for a part whose length *is* its geometry (a NAND die file
+ * carries the spare area, so any other length is a different part); without
+ * it the store may be larger than the die and the extra is simply never
+ * addressed, which is what a dump image covering less than the part looks
+ * like.
+ */
+static uint64_t ipq_die_store_bind(IPQDieStore *s, const char *path,
+                                   const char *node, uint64_t want, bool exact)
+{
+    struct stat st;
+    uint64_t len;
+
+    if (path && node) {
+        error_report("ipq4019: %s-file= and %s-drive= are two ways to say "
+                     "the same thing; give one", s->what, s->what);
+        exit(1);
+    }
+    if (path) {
+        int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+
+        if (fd < 0) {
+            error_report("ipq4019: %s-file=%s: %s", s->what, path,
+                         strerror(errno));
+            exit(1);
+        }
+        if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+            error_report("ipq4019: %s-file=%s is not a regular file",
+                         s->what, path);
+            exit(1);
+        }
+        s->fd = fd;
+        s->ro = false;
+        len = st.st_size;
+        if (!len) {
+            return 0;
+        }
+    } else {
+        Error *err = NULL;
+
+        s->blk = blk_by_name(node);
+        if (!s->blk) {
+            error_report("ipq4019: %s-drive=%s: no block backend with that "
+                         "id; add -drive if=none,id=%s,file=...", s->what,
+                         node, node);
+            exit(1);
+        }
+        /*
+         * A -drive backend starts with no permissions requested, because a
+         * device model normally claims it and asks for what it needs.  This
+         * machine has no block device to attach: the die is the consumer, so
+         * ask here.  That is also what upgrades an auto-read-only image,
+         * which is how a raw file is opened until somebody says it will be
+         * written.  Being refused is not fatal -- the die is then a
+         * write-protected part.
+         */
+        /*
+         * RESIZE is part of it because an empty backend has to be grown into a
+         * die: the block layer refuses a write past the end of an image unless
+         * the writer is allowed to change its length.
+         */
+        if (blk_set_perm(s->blk, BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE |
+                         BLK_PERM_RESIZE,
+                         BLK_PERM_ALL & ~(BLK_PERM_WRITE | BLK_PERM_RESIZE),
+                         &err)) {
+            s->ro = true;
+            fprintf(stderr, "ipq4019: %s drive %s is read-only (%s): the die "
+                    "will refuse program and erase\n", s->what, node,
+                    error_get_pretty(err));
+            error_free(err);
+        }
+        len = ipq_die_store_len(s);
+        if (!len) {
+            /*
+             * A raw file that did not exist yet is a zero-length backend, i.e.
+             * an unprogrammed part: the caller fills it and snapshots, exactly
+             * as it would for a newly created die file.  The block layer will
+             * not write past the end of a zero-length image, so give the
+             * backend the die's length first -- this is what a volume created
+             * by `qemu-img create` (or libvirt) already has.
+             */
+            if (!s->ro && blk_truncate(s->blk, want, true, PREALLOC_MODE_OFF,
+                                       0, &err)) {
+                fprintf(stderr, "ipq4019: %s drive %s cannot be sized to %"
+                        PRIu64 " bytes (%s)\n", s->what, node, want,
+                        error_get_pretty(err));
+                error_free(err);
+            }
+            return 0;
+        }
+    }
+
+    if (exact ? len != want : len < want) {
+        error_report("ipq4019: %s store holds %" PRIu64 " bytes, %s %" PRIu64
+                     "; remove it to start from %s", s->what, len,
+                     exact ? "but this die is exactly" : "less than the die's",
+                     want, exact ? "an erased part" : "the board's image");
+        exit(1);
+    }
+    return len;
+}
+
+/*
+ * A host-created volume is not a die.  `qemu-img create -f raw die.img 32M`
+ * -- which is what libvirt does before it hands QEMU a <disk> -- produces a
+ * sparse file that reads as zeros, while a NOR part that has never been
+ * programmed reads 0xff.  Treating those zeros as the board's flash would mean
+ * a machine that cannot boot from a freshly created volume, so an all-zero
+ * store is "nothing here yet", and only when the board also names an image to
+ * program it with.  A die the guest wrote is never all zeros across its whole
+ * length, and a store without an image is always taken as it is.
+ */
+static bool ipq_die_store_blank(const void *buf, uint64_t len)
+{
+    const uint8_t *p = buf;
+    uint64_t i;
+
+    for (i = 0; i < len; i++) {
+        if (p[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * QEMU_IPQ_FLASH_PERSIST=<file> / nor-file=<file> turns the die into a real
+ * device that keeps what the guest wrote after QEMU exits.
+ *
+ * The dump named on the command line stays a read-only factory image: it is
+ * read into the die at power-on and never written back, so its checksum cannot
+ * change.  The store is the die itself.  On the first run it is created as a
+ * copy of what the die holds after the dump was loaded; on every later run it
+ * is loaded instead of the dump.  Each erase and each programmed byte is then
+ * mirrored into it, which is what makes a manual power cycle -- kill QEMU,
+ * start a new one -- retain the write.
+ *
+ * One file per dump, one die per file: a store smaller than the configured die
+ * is refused rather than extended, because a die that suddenly reads 0xff where
+ * it used to hold data is worse than a loud failure.
+ */
+static IPQDieStore ipq_nor_store = { .fd = -1, .what = "nor" };
+
+static void nor_persist(const void *src, uint32_t off, uint32_t len)
+{
+    uint32_t die = ipq_flash_die_size;
+
+    if (off >= die) {
+        return;
+    }
+    ipq_die_store_pwrite(&ipq_nor_store, src, MIN(len, die - off), off);
+}
+
 #define NOR_PERSIST_NONE   (-1)
 #define NOR_PERSIST_EMPTY   0
 #define NOR_PERSIST_LOADED  1
 
 /*
- * Open the persistent die.  Returns LOADED when the file already holds a die
- * -- then it has been read into the array and the caller must not load the
- * dump, because the file *is* the board's flash.  EMPTY means the file was
- * just created, so the caller loads the dump and calls nor_persist_snapshot()
- * to make that the initial contents.  NONE means no persist file was asked for.
+ * Bind the NOR die to its store.  LOADED means the store already held a die --
+ * then it has been read into the array and the caller must not load the image
+ * on top of it, because the store *is* the board's flash.  EMPTY means the
+ * store was just created, so the caller loads the image and calls
+ * nor_persist_snapshot() to make that the initial contents.  NONE means no
+ * store was asked for and the die is RAM only.
  */
 static int nor_persist_preload(IPQMem *flash, uint32_t die, const char *img,
-                               const char *path)
+                               const char *path, const char *drive)
 {
     struct stat st, ist;
-    uint32_t done = 0;
-    int fd;
+    uint64_t len;
 
-    if (!path || !*path) {
+    if (!path && !drive) {
         return NOR_PERSIST_NONE;
     }
-    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) {
-        error_report("ipq4019: nor-file=%s: %s", path,
-                     strerror(errno));
-        exit(1);
-    }
-    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
-        error_report("ipq4019: nor-file=%s is not a writable "
-                     "regular file", path);
-        exit(1);
-    }
-    /*
-     * Naming the dump itself is allowed -- that is "the chip is the file" --
-     * but it stops being a factory image, so say so once and loudly.
-     */
-    if (img && !stat(img, &ist) && ist.st_dev == st.st_dev &&
+    if (path && img && !stat(img, &ist) &&
+        !stat(path, &st) && ist.st_dev == st.st_dev &&
         ist.st_ino == st.st_ino) {
-        warn_report("QEMU_IPQ_FLASH_PERSIST is the dump itself: guest writes "
-                    "will modify %s", img);
+        /*
+         * Naming the dump itself is allowed -- that is "the chip is the file"
+         * -- but it stops being a factory image, so say so once and loudly.
+         */
+        warn_report("nor-file is the dump itself: guest writes will modify "
+                    "%s", img);
     }
-    ipq_flash_persist_fd = fd;
-    if (st.st_size == 0) {
-        return NOR_PERSIST_EMPTY;
-    }
-    if ((uint64_t)st.st_size < die) {
-        error_report("ipq4019: QEMU_IPQ_FLASH_PERSIST=%s holds %" PRId64
-                     " bytes, less than the %u-byte die; remove it to start "
-                     "from the dump again", path, (int64_t)st.st_size,
-                     (unsigned)die);
-        exit(1);
-    }
-    while (done < die) {
-        ssize_t n = pread(fd, flash->data + done, die - done, done);
-
-        if (n <= 0) {
-            error_report("ipq4019: reading the persist file %s failed: %s",
-                         path, n < 0 ? strerror(errno) : "short read");
+    len = ipq_die_store_bind(&ipq_nor_store, path, drive, die, false);
+    if (!len) {
+        /*
+         * An empty store has to be programmable, because the only thing that
+         * can make it a die is the image the board named.
+         */
+        if (!ipq_die_store_writable(&ipq_nor_store)) {
+            error_report("ipq4019: nor store %s is empty and cannot be "
+                         "written, so there is no die to boot from",
+                         path ? path : drive);
             exit(1);
         }
-        done += n;
+        return NOR_PERSIST_EMPTY;
     }
-    fprintf(stderr, "ipq4019: flash persist %s loaded (%u MiB)\n", path,
-            (unsigned)(die / MiB));
-    ipq_flash_persist_loaded = true;
+    if (!ipq_die_store_pread(&ipq_nor_store, flash->data, die, 0)) {
+        error_report("ipq4019: reading the %s store failed",
+                     ipq_nor_store.what);
+        exit(1);
+    }
+    if (img && ipq_die_store_blank(flash->data, die)) {
+        fprintf(stderr, "ipq4019: nor store %s is blank (all 0x00): "
+                "programming it from %s\n", path ? path : drive, img);
+        return NOR_PERSIST_EMPTY;
+    }
+    fprintf(stderr, "ipq4019: nor store %s loaded (%u MiB)\n",
+            path ? path : drive, (unsigned)(die / MiB));
     return NOR_PERSIST_LOADED;
 }
 
-/* The file did not exist yet: make it a copy of what the dump produced. */
+/* The store did not exist yet: make it a copy of what the image produced. */
 static void nor_persist_snapshot(uint32_t die)
 {
-    const char *path = getenv("QEMU_IPQ_FLASH_PERSIST");
-    uint32_t done = 0;
-
-    if (ipq_flash_persist_fd < 0) {
+    if (!ipq_die_store_open(&ipq_nor_store)) {
         return;
     }
-    while (done < die) {
-        ssize_t n = pwrite(ipq_flash_persist_fd, ipq_board->nor->data + done,
-                           die - done, done);
-
-        if (n <= 0) {
-            error_report("ipq4019: writing the persist file %s failed: %s",
-                         path, n < 0 ? strerror(errno) : "short write");
-            exit(1);
-        }
-        done += n;
-    }
-    fsync(ipq_flash_persist_fd);
-    fprintf(stderr, "ipq4019: flash persist %s created (%u MiB, a copy of the "
-            "dump)\n", path, (unsigned)(die / MiB));
+    ipq_die_store_pwrite(&ipq_nor_store, ipq_board->nor->data, die, 0);
+    ipq_die_store_sync(&ipq_nor_store);
+    fprintf(stderr, "ipq4019: nor store %u MiB written (a copy of the image)\n",
+            (unsigned)(die / MiB));
 }
 
 static void nor_erase(IPQQupl *q, uint32_t off, uint32_t len)
@@ -1625,17 +1845,20 @@ static void nor_erase(IPQQupl *q, uint32_t off, uint32_t len)
         return;
     }
     len = MIN(len, (uint32_t)(ipq_board->nor->size - off));
-    if (nor_range_protected(q, off, len)) {
+    /*
+     * A store that cannot be written is a write-protected part, so the die
+     * refuses the operation the way it refuses a protected range: E_FAIL in
+     * SR2, contents unchanged.
+     */
+    if (nor_range_protected(q, off, len) ||
+        (ipq_die_store_open(&ipq_nor_store) &&
+         !ipq_die_store_writable(&ipq_nor_store))) {
         q->status2 |= NOR_SR2_EFAIL;
         return;
     }
     memset(ipq_board->nor->data + off, 0xff, len);
     nor_persist(ipq_board->nor->data + off, off, len);
-    if (ipq_flash_persist_fd >= 0) {
-        /* An erase is the operation a later read depends on most, so give it
-         * a real durability point rather than relying on the page cache. */
-        fsync(ipq_flash_persist_fd);
-    }
+    ipq_die_store_sync(&ipq_nor_store);
     if (env_true("QEMU_IPQ_SPI_LOG")) {
         qemu_log_mask(LOG_UNIMP, "die: erase 0x%06x +0x%x\n",
                       off, (unsigned)len);
@@ -1649,7 +1872,9 @@ static void nor_program_byte(IPQQupl *q, uint8_t b)
     if (!ipq_board->nor || !q->pgm_left || q->pgm_addr >= ipq_board->nor->size) {
         return;
     }
-    if (nor_range_protected(q, q->pgm_addr, 1)) {
+    if (nor_range_protected(q, q->pgm_addr, 1) ||
+        (ipq_die_store_open(&ipq_nor_store) &&
+         !ipq_die_store_writable(&ipq_nor_store))) {
         q->status2 |= NOR_SR2_PFAIL;
         return;
     }
@@ -1802,8 +2027,7 @@ struct IPQNand {
     int wr_kind;                /* NAND_WR_*: what the data phase does */
     uint8_t wr_feature;         /* feature register a SET_FEATURE targets */
 
-    int fd;                     /* QEMU_IPQ_NAND_PERSIST, -1 when RAM only */
-    bool loaded;                /* the die came from the persist file */
+    IPQDieStore store;          /* nand-file= / nand-drive=, closed when RAM only */
 };
 
 
@@ -1813,107 +2037,67 @@ static void nand_fill_erased(uint8_t *p, uint32_t len)
     memset(p, 0xff, len);
 }
 
-/* ---- the NAND die file ------------------------------------------------ */
+/* ---- the NAND die store ---------------------------------------------- */
 
 /*
- * QEMU_IPQ_NAND_PERSIST=<file> is the same contract as the NOR die: the file
- * *is* the part.  It is created as an erased part on the first run (there is
- * no NAND image in these dumps to copy -- the board ships blank) and loaded
- * instead of one afterwards, and every program and erase is mirrored into it
- * with pwrite(2).  An erase is fsync'ed, a page program is not: the page
- * cache survives QEMU exiting, and QEMU exiting is what a power cut is here.
+ * The same contract as the NOR die: the store *is* the part.  A NAND is created
+ * as an erased part on the first run (there is no NAND image in these dumps to
+ * copy -- the board ships blank) and loaded instead of one afterwards, and
+ * every program and erase is mirrored into it.  An erase is flushed and a page
+ * program is not: the page cache survives QEMU exiting, and QEMU exiting is
+ * what a power cut is here.
  */
 static void nand_persist(const void *src, uint32_t off, uint32_t len)
 {
     IPQNand *n = ipq_board->nand;
 
-    if (!n || n->fd < 0 || off >= n->bytes) {
+    if (!n || off >= n->bytes) {
         return;
     }
-    len = MIN(len, n->bytes - off);
-    while (len) {
-        ssize_t r = pwrite(n->fd, src, len, off);
-
-        if (r <= 0) {
-            error_report("ipq4019: nand persist write at 0x%08x failed: %s",
-                         off, r < 0 ? strerror(errno) : "short write");
-            close(n->fd);
-            n->fd = -1;
-            return;
-        }
-        src = (const uint8_t *)src + r;
-        off += r;
-        len -= r;
-    }
+    ipq_die_store_pwrite(&n->store, src, MIN(len, n->bytes - off), off);
 }
 
-/* Returns true when the file already held a die (so it must not be erased). */
-static bool nand_persist_open(IPQNand *n, const char *path)
+/* Returns true when the store already held a die (so it must not be erased). */
+static bool nand_persist_open(IPQNand *n, const char *path, const char *drive,
+                              const char *image)
 {
-    struct stat st;
-    uint32_t done = 0;
-    int fd;
+    uint64_t len;
 
-    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0) {
-        error_report("ipq4019: nand-file=%s: %s", path,
-                     strerror(errno));
-        exit(1);
-    }
-    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
-        error_report("ipq4019: nand-file=%s is not a writable "
-                     "regular file", path);
-        exit(1);
-    }
-    n->fd = fd;
-    if (st.st_size == 0) {
-        return false;
-    }
-    if ((uint64_t)st.st_size != n->bytes) {
-        /*
-         * Unlike the NOR, the size here is not a choice: a NAND die file
-         * carries the spare area, so its length is pages * (page + spare).
-         * A file of any other length is a different part, not a smaller one.
-         */
-        error_report("ipq4019: QEMU_IPQ_NAND_PERSIST=%s holds %" PRId64
-                     " bytes, but this die is %u bytes (%u pages of %u+%u); "
-                     "remove it to start from an erased part", path,
-                     (int64_t)st.st_size, n->bytes, n->pages,
-                     NAND_PAGE, NAND_OOB);
-        exit(1);
-    }
-    while (done < n->bytes) {
-        ssize_t r = pread(fd, n->data + done, n->bytes - done, done);
-
-        if (r <= 0) {
-            error_report("ipq4019: reading the NAND persist file %s failed: %s",
-                         path, r < 0 ? strerror(errno) : "short read");
+    /*
+     * Unlike the NOR, the length here is not a choice: a NAND die carries the
+     * spare area, so its length is pages * (page + spare).  A store of any
+     * other length is a different part, not a smaller one.
+     */
+    len = ipq_die_store_bind(&n->store, path, drive, n->bytes, true);
+    if (!len) {
+        if (!ipq_die_store_writable(&n->store)) {
+            error_report("ipq4019: nand store %s is empty and cannot be "
+                         "written, so there is no die to boot from",
+                         path ? path : drive);
             exit(1);
         }
-        done += r;
+        return false;
     }
-    n->loaded = true;
+    if (!ipq_die_store_pread(&n->store, n->data, n->bytes, 0)) {
+        error_report("ipq4019: reading the nand store %s failed",
+                     path ? path : drive);
+        exit(1);
+    }
+    if (image && ipq_die_store_blank(n->data, n->bytes)) {
+        fprintf(stderr, "ipq4019: nand store %s is blank (all 0x00): "
+                "programming it from %s\n", path ? path : drive, image);
+        return false;
+    }
     return true;
 }
 
-static void nand_persist_snapshot(IPQNand *n, const char *path)
+static void nand_persist_snapshot(IPQNand *n)
 {
-    uint32_t done = 0;
-
-    if (n->fd < 0) {
+    if (!ipq_die_store_open(&n->store)) {
         return;
     }
-    while (done < n->bytes) {
-        ssize_t r = pwrite(n->fd, n->data + done, n->bytes - done, done);
-
-        if (r <= 0) {
-            error_report("ipq4019: writing the NAND persist file %s failed: %s",
-                         path, r < 0 ? strerror(errno) : "short write");
-            exit(1);
-        }
-        done += r;
-    }
-    fsync(n->fd);
+    ipq_die_store_pwrite(&n->store, n->data, n->bytes, 0);
+    ipq_die_store_sync(&n->store);
 }
 
 /* ---- the NAND command set -------------------------------------------- */
@@ -2007,7 +2191,9 @@ static void nand_program_execute(uint32_t page)
 
     n->status &= ~NAND_ST_WEL;
     n->oip = 1;
-    if (!(n->status & NAND_ST_EFAIL) && page >= n->pages) {
+    if ((n->status & NAND_ST_EFAIL) || page >= n->pages ||
+        (ipq_die_store_open(&n->store) &&
+         !ipq_die_store_writable(&n->store))) {
         n->status = (n->status & ~NAND_ST_PFAIL) | NAND_ST_PFAIL;
         return;
     }
@@ -2042,15 +2228,15 @@ static void nand_block_erase(uint32_t row)
 
     n->status &= ~NAND_ST_WEL;
     n->oip = 1;
-    if (!(n->status & NAND_ST_EFAIL) && off + NAND_BLKBYTES > n->bytes) {
+    if ((n->status & NAND_ST_EFAIL) || off + NAND_BLKBYTES > n->bytes ||
+        (ipq_die_store_open(&n->store) &&
+         !ipq_die_store_writable(&n->store))) {
         n->status |= NAND_ST_EFAIL;
         return;
     }
     memset(n->data + off, 0xff, NAND_BLKBYTES);
     nand_persist(n->data + off, off, NAND_BLKBYTES);
-    if (n->fd >= 0) {
-        fsync(n->fd);
-    }
+    ipq_die_store_sync(&n->store);
     if (env_true("QEMU_IPQ_NAND_LOG")) {
         qemu_log_mask(LOG_UNIMP, "nand: erase block %u (row %u)\n", blk, row);
     }
@@ -2281,7 +2467,7 @@ static void ipq_board_add_nor(MemoryRegion *sysmem)
 
     img = ipq_cfg.nor_image;
     pers = nor_persist_preload(flash, ipq_flash_die_size, img,
-                               ipq_cfg.nor_file);
+                               ipq_cfg.nor_file, ipq_cfg.nor_drive);
     if (pers != NOR_PERSIST_LOADED) {
         if (img) {
             g_file_get_contents(img, &buf, &len, NULL);
@@ -2297,8 +2483,9 @@ static void ipq_board_add_nor(MemoryRegion *sysmem)
         fprintf(stderr, " %02x", ipq_flash_jedec[j]);
     }
     if (pers == NOR_PERSIST_LOADED) {
-        fprintf(stderr, ", window %u MiB <- the persist file\n",
-                (unsigned)(IPQ_FLASH_SIZE / MiB));
+        fprintf(stderr, ", window %u MiB <- %s\n",
+                (unsigned)(IPQ_FLASH_SIZE / MiB),
+                ipq_cfg.nor_file ? ipq_cfg.nor_file : ipq_cfg.nor_drive);
     } else {
         fprintf(stderr, ", window %u MiB <- %s (%zu bytes)\n",
                 (unsigned)(IPQ_FLASH_SIZE / MiB), img ? img : "(none)", len);
@@ -2317,6 +2504,11 @@ static void ipq_board_add_nor(MemoryRegion *sysmem)
 static void ipq_board_add_nand(void)
 {
     uint32_t per_block = NAND_STRIDE * NAND_PPBLK;
+    const char *what = ipq_cfg.nand_file && *ipq_cfg.nand_file
+                     ? ipq_cfg.nand_file
+                     : ipq_cfg.nand_drive && *ipq_cfg.nand_drive
+                     ? ipq_cfg.nand_drive : NULL;
+    bool fresh = false;
     IPQNand *n;
     int id_len;
 
@@ -2343,27 +2535,31 @@ static void ipq_board_add_nand(void)
     nand_fill_erased(n->data, n->bytes);
     nand_fill_erased(n->cache, NAND_STRIDE);
     n->status = 0;
-    n->fd = -1;
+    n->store.fd = -1;
+    n->store.what = "nand";
     ipq_board->nand = n;
 
     /*
-     * A die file is the part: if it already holds a die, that is the NAND,
-     * and a dump is not needed.  Otherwise the file is created (erased) and,
-     * when the board names one, filled from the image.
+     * A store is the part: if it already holds a die, that is the NAND, and an
+     * image is not needed.  Otherwise the store is created (erased) and, when
+     * the board names one, filled from the image.
      */
-    if (ipq_cfg.nand_file && *ipq_cfg.nand_file) {
-        if (!nand_persist_open(n, ipq_cfg.nand_file)) {
-            nand_persist_snapshot(n, ipq_cfg.nand_file);
-            fprintf(stderr, "ipq4019: nand persist %s created (%u MiB, %u "
-                    "pages of %u+%u, erased)\n", ipq_cfg.nand_file,
-                    (unsigned)(n->bytes / MiB), n->pages, NAND_PAGE, NAND_OOB);
-        } else {
-            fprintf(stderr, "ipq4019: nand persist %s loaded (%u MiB, %u "
-                    "pages of %u+%u)\n", ipq_cfg.nand_file,
-                    (unsigned)(n->bytes / MiB), n->pages, NAND_PAGE, NAND_OOB);
-        }
+    if (what) {
+        fresh = !nand_persist_open(n, ipq_cfg.nand_file, ipq_cfg.nand_drive,
+                                   ipq_cfg.nand_image);
+        fprintf(stderr, "ipq4019: nand store %s %s (%u MiB, %u pages of %u+%u)\n",
+                what, fresh ? "created, erased" : "loaded",
+                (unsigned)(n->bytes / MiB), n->pages, NAND_PAGE, NAND_OOB);
     }
-    if (ipq_cfg.nand_image && *ipq_cfg.nand_image && n->fd < 0) {
+
+    /*
+     * The image is content for a die that is not one yet: the board's own
+     * image when the machine starts from a blank part, or -kernel when the
+     * boot chain comes from the NAND.  A store that already holds a die is
+     * the part, so nothing is programmed over it.
+     */
+    if (ipq_cfg.nand_image && *ipq_cfg.nand_image &&
+        (!ipq_die_store_open(&n->store) || fresh)) {
         gchar *buf = NULL;
         gsize len = 0;
 
@@ -2382,11 +2578,13 @@ static void ipq_board_add_nand(void)
             g_free(buf);
         }
     }
+    if (fresh) {
+        nand_persist_snapshot(n);
+    }
     fprintf(stderr, "ipq4019: nand die %u MiB, RDID %02x %02x, %u pages of %u+%u, "
             "%u blocks%s\n", (unsigned)(n->bytes / MiB), n->id[0], n->id[1],
             n->pages, NAND_PAGE, NAND_OOB, n->pages / NAND_PPBLK,
-            (ipq_cfg.nand_file && *ipq_cfg.nand_file) ? " <- the persist file"
-                                                       : " (RAM only)");
+            ipq_die_store_open(&n->store) ? " <- the store" : " (RAM only)");
 }
 
 static void qup_spi_opcode(IPQQupl *q, uint8_t op)
@@ -8468,10 +8666,12 @@ static void ipq4019_machine_add_props(MachineClass *mc)
         { "nor-size",   offsetof(IPQBoardConfig, nor_size),   IPQ_CFG_NOR_SIZE, IPQ_PROP_SIZE },
         { "nor-id",     offsetof(IPQBoardConfig, nor_id),     IPQ_CFG_NOR_ID, IPQ_PROP_STR },
         { "nor-file",   offsetof(IPQBoardConfig, nor_file),   IPQ_CFG_NOR_FILE, IPQ_PROP_STR },
+        { "nor-drive",  offsetof(IPQBoardConfig, nor_drive),  IPQ_CFG_NOR_DRIVE, IPQ_PROP_STR },
         { "nand",       offsetof(IPQBoardConfig, nand),       IPQ_CFG_NAND, IPQ_PROP_BOOL },
         { "nand-size",  offsetof(IPQBoardConfig, nand_size),  IPQ_CFG_NAND_SIZE, IPQ_PROP_SIZE },
         { "nand-id",    offsetof(IPQBoardConfig, nand_id),    IPQ_CFG_NAND_ID, IPQ_PROP_STR },
         { "nand-file",  offsetof(IPQBoardConfig, nand_file),  IPQ_CFG_NAND_FILE, IPQ_PROP_STR },
+        { "nand-drive", offsetof(IPQBoardConfig, nand_drive), IPQ_CFG_NAND_DRIVE, IPQ_PROP_STR },
         { "nor-cs-gpio",  offsetof(IPQBoardConfig, nor_cs_gpio),
           IPQ_CFG_NOR_CS, IPQ_PROP_UINT32 },
         { "nand-cs-gpio", offsetof(IPQBoardConfig, nand_cs_gpio),
@@ -8482,10 +8682,12 @@ static void ipq4019_machine_add_props(MachineClass *mc)
         "NOR die size in bytes (power of two, 1M..64M)",
         "NOR RDID as hex, e.g. ef4019",
         "file that is the NOR part (survives a power cut)",
+        "block backend id that is the NOR part, e.g. from -drive if=none",
         "attach the SPI NAND die on chip select 1 (on/off)",
         "NAND die size in bytes, a whole number of erase blocks",
         "NAND RDID as hex, e.g. c212",
         "file that is the NAND part (survives a power cut)",
+        "block backend id that is the NAND part, e.g. from -drive if=none",
         "TLMM pin driving the NOR chip select",
         "TLMM pin driving the NAND chip select",
     };
