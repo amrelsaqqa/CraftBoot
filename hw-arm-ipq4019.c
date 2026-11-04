@@ -64,16 +64,16 @@
  *                        of the dump on the first run, loaded instead of the
  *                        dump afterwards, and written through on every erase
  *                        and program.  The dump itself is never modified.
- *   QEMU_IPQ_NAND=1      put a SPI NAND behind chip select 1 (the part the
- *                        vendor DTS names: MX35LF1G24AD, 136 MiB incl. spare);
- *                        opt-in because it costs 136 MiB of host RAM
+ *   QEMU_IPQ_NAND=1      put a SPI NAND behind chip select 1 (the part on the
+ *                        board: MX35LF1GE4AB, 132 MiB incl. spare); opt-in
+ *                        because it costs that much host RAM
  *   QEMU_IPQ_NAND_PERSIST=<file> keep that die in this file: created erased on
  *                        the first run, loaded afterwards, written through on
  *                        every program and fsync'ed on every erase.  Its length
  *                        must be exactly pages * (page + spare).
  *   QEMU_IPQ_NAND_SIZE   die size in bytes, a whole number of erase blocks
- *                        (default 1024 blocks = 136 MiB including spare)
- *   QEMU_IPQ_NAND_ID     RDID as hex, manufacturer + device (default "c214")
+ *                        (default 1024 blocks = 132 MiB including spare)
+ *   QEMU_IPQ_NAND_ID     RDID as hex, manufacturer + device (default "c212")
  *   QEMU_IPQ_NAND_LOG=1  log NAND commands, page reads and erases
  *   QEMU_IPQ_CS_GPIO     TLMM pin driving NOR chip select (default 54)
  *   QEMU_IPQ_NAND_CS_GPIO  TLMM pin driving NAND chip select (default 59)
@@ -826,6 +826,7 @@ typedef struct IPQQupl {
     uint8_t rx_buf[8];      /* short replies: JEDEC id, status */
     int rx_len;
     int rx_pos;
+    int rx_wrap;            /* the reply repeats instead of ending (RDID) */
     uint8_t status;         /* SR1: bit0 busy, bit1 WEL, 2-4 BP, 5 TB, 6 SEC */
     uint8_t status2;        /* SR2: bit5 E_FAIL, bit6 P_FAIL (W25Q style) */
     int write_sr;           /* status bytes still expected (0 = not WRSR) */
@@ -1298,9 +1299,8 @@ static void nor_write_start(IPQQupl *q)
  * the vendor DTS marks both pins GPIO_ACTIVE_HIGH while every mainline board
  * writes GPIO_ACTIVE_LOW for CS0 -- and an edge brackets a transfer either way.
  *
- * Geometry is the part the DTS names by compatible string, the MX35LF1G24AD:
- * 1 Gbit, 2048-byte pages with 128 bytes of spare, 64 pages in a 128 KiB erase
- * block, 1024 blocks.  The spare area is part of the die and part of the die
+ * Geometry is the part on the board, the MX35LF1GE4AB: 1 Gbit, 2048-byte pages
+ * with 64 bytes of spare, 64 pages in a 128 KiB erase block, 1024 blocks.  The spare area is part of the die and part of the die
  * file, because that is where the bad-block markers live and where the FTL
  * keeps its erase counters and volume headers.  On-die ECC is modelled as
  * "nothing to correct, nothing to report": the status register's ECC bits say
@@ -1310,7 +1310,14 @@ static void nor_write_start(IPQQupl *q)
 #define NAND_CS_NAND  1
 
 #define NAND_PAGE       2048u
-#define NAND_OOB        128u
+/*
+ * 2048+64, not 2048+128: the part on this board is a MX35LF1GE4AB, whose own
+ * read-id answer was measured as `id=C212C212` -- manufacturer c2, device 12,
+ * then the same two bytes again because the die repeats its id while it keeps
+ * being clocked.  64 is also what the spare-area tags and the 128 MiB capacity
+ * in that survey imply.
+ */
+#define NAND_OOB        64u
 #define NAND_STRIDE     (NAND_PAGE + NAND_OOB)   /* one page incl. spare */
 #define NAND_PPBLK      64u                      /* pages per erase block */
 #define NAND_BLKBYTES   (NAND_STRIDE * NAND_PPBLK)   /* 128 KiB + spare */
@@ -1647,11 +1654,24 @@ static void nand_opcode(IPQQupl *q, uint8_t op)
 
     switch (op) {
     case NAND_OP_RDID:
-        /* Macronix answers one dummy byte, then manufacturer and device. */
+        /*
+         * One turnaround clock before the id: the die drives the manufacturer
+         * only on the second clock after 9fh.
+         *
+         * The 5.6 kernel knows it even though it asks for no dummy clocks
+         * (SPINAND_READID_OP(0, ...)): macronix_spinand_detect() skips the
+         * first byte -- "Macronix SPI NAND read ID needs a dummy byte, so the
+         * first byte in raw_id is garbage" -- matches id[1] against 0xc2 and
+         * takes the device byte from id[2].  Get this clock wrong and a die
+         * that answers immediately reads back as `unknown raw ID c2120000`;
+         * get the part wrong and it reads back as `00c21400`.
+         */
         q->dummy_left = 1;
         q->rx_buf[0] = n->id[0];
         q->rx_buf[1] = n->id[1];
         q->rx_len = n->id_len;
+        q->rx_wrap = 1;             /* C212C212 on the board, for as long as
+                                       the master keeps clocking */
         break;
     case NAND_OP_GET_FEATURE:
     case NAND_OP_SET_FEATURE:
@@ -1787,6 +1807,9 @@ static uint8_t nand_miso(IPQQupl *q)
     if (q->rx_pos < q->rx_len) {
         return q->rx_buf[q->rx_pos++];
     }
+    if (q->rx_wrap && q->rx_len > 0) {
+        return q->rx_buf[q->rx_pos++ % q->rx_len];
+    }
     return 0x00;
 }
 
@@ -1796,7 +1819,7 @@ static uint8_t nand_miso(IPQQupl *q)
  * QEMU_IPQ_NAND=1 puts the part on the board; QEMU_IPQ_NAND_PERSIST=... both
  * instantiates it and gives it a die file.  Geometry is fixed to the part the
  * vendor DTS names, because the whole point of the file is that it is a raw
- * dump of *that* chip: 1024 blocks of 64 pages, 2048+128 bytes each.
+ * dump of *that* chip: 1024 blocks of 64 pages, 2048+64 bytes each.
  */
 static void nand_init(void)
 {
@@ -1822,7 +1845,7 @@ static void nand_init(void)
     }
     n->pages = n->bytes / NAND_STRIDE;
     n->id[0] = 0xc2;                    /* Macronix */
-    n->id[1] = 0x14;                    /* MX35LF1G24AD */
+    n->id[1] = 0x12;                    /* MX35LF1GE4AB, 128 MiB 2048+64 */
     n->id_len = 2;
     if (idstr && *idstr) {
         const char *p = idstr;
@@ -1848,7 +1871,7 @@ static void nand_init(void)
         }
         if (got != 2) {
             error_report("ipq4019: QEMU_IPQ_NAND_ID='%s' is not a two-byte "
-                         "id like c214", idstr);
+                         "id like c212", idstr);
             exit(1);
         }
     }
@@ -1949,9 +1972,15 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
         q->addr4 = 0;
         break;
     case 0x9f:                          /* RDID */
-        /* Whatever die the board has: QEMU_IPQ_FLASH_JEDEC/_SIZE. */
+        /*
+         * Whatever die the board has: QEMU_IPQ_FLASH_JEDEC/_SIZE.  The part
+         * repeats its id once it has shifted all of it out (the board's NOR
+         * reads back as C22019C2 over four bytes), so a driver that asks for
+         * more than three gets the id again rather than zeros.
+         */
         memcpy(q->rx_buf, ipq_flash_jedec, ipq_flash_jedec_len);
         q->rx_len = ipq_flash_jedec_len;
+        q->rx_wrap = 1;
         break;
     case 0x4b:                          /* Read Unique ID: 8 bytes */
         q->rx_len = 8;
@@ -2104,11 +2133,9 @@ static uint8_t qup_miso(IPQQupl *q)
     if (q->rx_pos < q->rx_len) {
         return q->rx_buf[q->rx_pos++];
     }
-    /*
-     * Past the end of a short reply (RDID, RDSR, ...) the die keeps shifting
-     * out zeros.  The driver reads a fixed 4-byte device id, so this byte is
-     * part of the id word it looks up.
-     */
+    if (q->rx_wrap && q->rx_len > 0) {
+        return q->rx_buf[q->rx_pos++ % q->rx_len];
+    }
     return 0x00;
 }
 
@@ -2353,6 +2380,7 @@ static void qup_bus_reset(IPQQupl *q)
     q->rx_off = 0;
     q->rx_len = 0;
     q->rx_pos = 0;
+    q->rx_wrap = 0;
     qup_fifo_flush(q);
     nand_xact_reset();
 }
@@ -6561,7 +6589,7 @@ static void ipq4019_init(MachineState *machine)
     /* The second die on the bus: a blank SPI NAND behind chip select 1.  It is
      * opt-in (QEMU_IPQ_NAND=1 or a NAND die file) because the boards whose
      * dumps are here have only the NOR, and a part nobody probes still costs
-     * 136 MiB of RAM. */
+     * 132 MiB of RAM. */
     nand_init();
     /*
      * MikroTik's APPSBL ELF header is written with a file-offset-compensated
