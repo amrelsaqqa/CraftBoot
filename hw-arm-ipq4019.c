@@ -308,6 +308,10 @@ typedef struct IPQBoardConfig {
     const char *nand_file;
     const char *nand_image;
 
+    /* the TLMM pins the board wires to the dies' chip selects */
+    uint32_t nor_cs_gpio;
+    uint32_t nand_cs_gpio;
+
     IPQBootDev boot;            /* which die the boot chain comes from */
 } IPQBoardConfig;
 
@@ -324,6 +328,8 @@ enum {
     IPQ_CFG_NAND_FILE  = 1u << 8,
     IPQ_CFG_NAND_IMAGE = 1u << 9,
     IPQ_CFG_BOOT       = 1u << 10,
+    IPQ_CFG_NOR_CS     = 1u << 11,
+    IPQ_CFG_NAND_CS    = 1u << 12,
 };
 
 typedef struct IPQBoardPreset {
@@ -343,7 +349,9 @@ static const IPQBoardPreset ipq_board_presets[] = {
         .nor = true,
         .nor_size = IPQ_FLASH_DEFAULT,
         .nor_id = "ef4019",
+        .nor_cs_gpio = 54,
         .nand = false,
+        .nand_cs_gpio = 59,
         .boot = IPQ_BOOT_SPI_NOR,
     } },
     { "none", {
@@ -442,6 +450,8 @@ static void ipq_board_config_resolve(MachineState *machine)
     if (ipq_cfg_set & IPQ_CFG_NAND_FILE)  { ipq_cfg.nand_file  = want.nand_file; }
     if (ipq_cfg_set & IPQ_CFG_NAND_IMAGE) { ipq_cfg.nand_image = want.nand_image; }
     if (ipq_cfg_set & IPQ_CFG_BOOT)       { ipq_cfg.boot      = want.boot; }
+    if (ipq_cfg_set & IPQ_CFG_NOR_CS)     { ipq_cfg.nor_cs_gpio  = want.nor_cs_gpio; }
+    if (ipq_cfg_set & IPQ_CFG_NAND_CS)    { ipq_cfg.nand_cs_gpio = want.nand_cs_gpio; }
 
     /*
      * 3. the deprecated environment shim.  It overwrites, because that is what
@@ -486,6 +496,14 @@ static void ipq_board_config_resolve(MachineState *machine)
         ipq_cfg.nand_id = env;
         env_set |= IPQ_CFG_NAND_ID;
     }
+    if ((env = getenv("QEMU_IPQ_CS_GPIO")) && *env) {
+        ipq_cfg.nor_cs_gpio = strtoul(env, NULL, 0);
+        env_set |= IPQ_CFG_NOR_CS;
+    }
+    if ((env = getenv("QEMU_IPQ_NAND_CS_GPIO")) && *env) {
+        ipq_cfg.nand_cs_gpio = strtoul(env, NULL, 0);
+        env_set |= IPQ_CFG_NAND_CS;
+    }
     ipq_cfg_set |= env_set;
 
     /* 4. defaults and sanity, so the rest of the machine can trust the struct */
@@ -495,6 +513,9 @@ static void ipq_board_config_resolve(MachineState *machine)
         }
         if (!ipq_cfg.nor_id) {
             ipq_cfg.nor_id = "ef4019";
+        }
+        if (!ipq_cfg.nor_cs_gpio) {
+            ipq_cfg.nor_cs_gpio = 54;
         }
         if (ipq_cfg.nor_size < IPQ_FLASH_MIN ||
             ipq_cfg.nor_size > IPQ_FLASH_SIZE ||
@@ -511,6 +532,9 @@ static void ipq_board_config_resolve(MachineState *machine)
         }
         if (!ipq_cfg.nand_id) {
             ipq_cfg.nand_id = "c212";       /* MX35LF1GE4AB */
+        }
+        if (!ipq_cfg.nand_cs_gpio) {
+            ipq_cfg.nand_cs_gpio = 59;
         }
     }
     /* its geometry is checked where the part is built (ipq_board_add_nand) */
@@ -555,14 +579,16 @@ static void ipq_board_config_resolve(MachineState *machine)
     fprintf(stderr, "ipq4019: board %s: nor ", ipq_cfg_board ? ipq_cfg_board
             : "default");
     if (ipq_cfg.nor) {
-        fprintf(stderr, "%u MiB%s, ", (unsigned)(ipq_cfg.nor_size / MiB),
+        fprintf(stderr, "%u MiB cs gpio %u%s, ",
+                (unsigned)(ipq_cfg.nor_size / MiB), ipq_cfg.nor_cs_gpio,
                 ipq_cfg.nor_file ? " (persist)" : "");
     } else {
         fprintf(stderr, "none, ");
     }
     fprintf(stderr, "nand ");
     if (ipq_cfg.nand) {
-        fprintf(stderr, "%u MiB%s, ", (unsigned)(ipq_cfg.nand_size / MiB),
+        fprintf(stderr, "%u MiB cs gpio %u%s, ",
+                (unsigned)(ipq_cfg.nand_size / MiB), ipq_cfg.nand_cs_gpio,
                 ipq_cfg.nand_file ? " (persist)" : "");
     } else {
         fprintf(stderr, "none, ");
@@ -3096,14 +3122,81 @@ static void qupl_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
  */
 #define IPQ_TLMM_RESET_VAL   0xffffffffu
 
+/*
+ * The pins.
+ *
+ * A board part either drives a pin or watches one, and both are per-pin lines
+ * here -- the way a qdev GPIO controller exposes them -- so a board device
+ * never has to know about TLMM register layout.  The line's level is the bit
+ * the guest drives (GPIO_IO bit 1, high = 1), and a handler is told about
+ * *every* write to its pin's IO register, not only about changes: gpiolib
+ * takes and releases a chip select around each message, and asserting the same
+ * die twice in a row is two transaction boundaries.
+ */
+#define IPQ_TLMM_NPINS 128
+
+typedef void (*IPQPinHandler)(void *opaque, int level);
+
 struct IPQTLMM {
     MemoryRegion mr;
     uint32_t *regs;
     uint32_t nregs;
+
+    uint8_t out_level[IPQ_TLMM_NPINS];          /* what the guest drives */
+    IPQPinHandler handler[IPQ_TLMM_NPINS];
+    void *handler_opaque[IPQ_TLMM_NPINS];
+
+    /*
+     * Pins the board drives into the SoC (buttons, PHY interrupts): their
+     * level is what a read of the pin reports, instead of the latch the guest
+     * last wrote.
+     */
+    uint8_t in_level[IPQ_TLMM_NPINS];
+    bool in_used[IPQ_TLMM_NPINS];
 };
 
-static unsigned ipq_tlmm_nor_cs_pin = 54;
-static unsigned ipq_tlmm_nand_cs_pin = 59;
+static bool ipq_tlmm_pin_mapped(IPQTLMM *t, unsigned pin)
+{
+    return pin < IPQ_TLMM_NPINS &&
+           pin * 0x1000 + IPQ_TLMM_IO_OFFSET + 4 <= t->nregs * 4;
+}
+
+/* the level the guest is driving onto a pin, from the IO register's latch */
+static int ipq_tlmm_latch(IPQTLMM *t, unsigned pin)
+{
+    uint32_t v = t->regs[(pin * 0x1000 + IPQ_TLMM_IO_OFFSET) >> 2];
+
+    return (v >> IPQ_TLMM_IO_OUT_BIT) & 1;
+}
+
+/*
+ * A write to a pin's IO register.  Called on every write, not only on a
+ * change, and after the shadow update so the handler sees the new level.
+ */
+static void ipq_tlmm_pin_written(IPQTLMM *t, unsigned pin)
+{
+    int level;
+
+    if (!ipq_tlmm_pin_mapped(t, pin) || !t->handler[pin]) {
+        return;
+    }
+    level = ipq_tlmm_latch(t, pin);
+    t->out_level[pin] = level;
+    t->handler[pin](t->handler_opaque[pin], level);
+}
+
+/* Attach a board part to a pin's output: what the guest drives, it sees. */
+static void ipq_tlmm_connect(IPQTLMM *t, unsigned pin, IPQPinHandler fn,
+                             void *opaque)
+{
+    if (pin >= IPQ_TLMM_NPINS) {
+        error_report("ipq4019: pin %u is outside the TLMM frame", pin);
+        exit(1);
+    }
+    t->handler[pin] = fn;
+    t->handler_opaque[pin] = opaque;
+    t->out_level[pin] = ipq_tlmm_pin_mapped(t, pin) ? ipq_tlmm_latch(t, pin) : 1;
+}
 
 /*
  * A chip select was driven.  What decides is the *level*, not the edge and
@@ -3120,35 +3213,32 @@ static unsigned ipq_tlmm_nand_cs_pin = 59;
  *     ones, so a release legitimately lands as 0xffffffff and an assertion as
  *     0xfffffffd.
  *
- * A select is acted on every time it is written, not only when the level
- * changes: gpiolib takes the pin for each message, and a deassertion followed
- * by an assertion of the same die is two boundaries.
+ * This is the same rule the machine used when it read the register itself; the
+ * difference is that it is now a line on the SoC's pin controller instead of a
+ * special case keyed on two hardcoded pin numbers.
  */
-static void ipq_tlmm_cs_changed(unsigned which)
+static void ipq_cs_line(void *opaque, int level)
 {
-    IPQTLMM *t = ipq->tlmm;
-    unsigned pin = which == NAND_CS_NAND ? ipq_tlmm_nand_cs_pin
-                                         : ipq_tlmm_nor_cs_pin;
-    uint32_t v;
-    int asserted;
+    unsigned which = (unsigned)(uintptr_t)opaque;
+    IPQQupl *q = ipq->qup_spi;
+    bool asserted = level == 0;
 
-    if (!t || !ipq->qup_spi || pin * 0x400 + 1 >= t->nregs) {
+    if (!q) {
         return;
     }
-    v = t->regs[(pin * 0x1000 + IPQ_TLMM_IO_OFFSET) >> 2];
-    asserted = ((v >> IPQ_TLMM_IO_OUT_BIT) & 1) == 0;
     if (die_dbg_on()) {
-        die_dbg_log("die: pin%u io=0x%08x %s %s\n", pin, v,
+        die_dbg_log("die: cs%u %s %s\n",
+                    which == NAND_CS_NAND ? ipq_cfg.nand_cs_gpio
+                                          : ipq_cfg.nor_cs_gpio,
                     asserted ? "assert" : "release",
                     which == NAND_CS_NAND ? "nand" : "nor");
     }
     if (asserted) {
-        qup_spi_select(ipq->qup_spi, which);
-        ipq->qup_spi->cs_owner = CS_OWNER_GPIO;
-        ipq->qup_spi->cs_gpio_die = which;
-    } else if (ipq->qup_spi->cs_owner == CS_OWNER_GPIO &&
-               ipq->qup_spi->cs_gpio_die == which) {
-        qup_deselect(ipq->qup_spi);
+        qup_spi_select(q, which);
+        q->cs_owner = CS_OWNER_GPIO;
+        q->cs_gpio_die = which;
+    } else if (q->cs_owner == CS_OWNER_GPIO && q->cs_gpio_die == which) {
+        qup_deselect(q);
     }
 }
 
@@ -3156,8 +3246,19 @@ static uint64_t tlmm_read(void *opaque, hwaddr off, unsigned size)
 {
     IPQTLMM *t = opaque;
     uint32_t idx = off >> 2;
+    unsigned pin = off >> 12;
     uint32_t v = idx < t->nregs ? t->regs[idx] : 0xffffffffu;
 
+    /*
+     * A pin the board drives reads back the board's level, not the latch the
+     * guest last wrote there: that is what makes a button visible to the
+     * driver instead of a stale copy of its own output.
+     */
+    if ((off & 0xfff) == IPQ_TLMM_IO_OFFSET && pin < IPQ_TLMM_NPINS &&
+        t->in_used[pin]) {
+        v = (v & ~(1u << IPQ_TLMM_IO_OUT_BIT)) |
+            ((uint32_t)t->in_level[pin] << IPQ_TLMM_IO_OUT_BIT);
+    }
     if (env_true("QEMU_IPQ_TRACE")) {
         qemu_log_mask(LOG_UNIMP, "tlmm: read  off 0x%06" HWADDR_PRIx
                       " -> 0x%08x\n", off, v);
@@ -3178,14 +3279,8 @@ static void tlmm_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
     if (idx < t->nregs) {
         t->regs[idx] = val;
     }
-    if ((off & 0xfff) != IPQ_TLMM_IO_OFFSET) {
-        return;
-    }
-    if (pin == ipq_tlmm_nor_cs_pin) {
-        ipq_tlmm_cs_changed(NAND_CS_NOR);
-    }
-    if (pin == ipq_tlmm_nand_cs_pin) {
-        ipq_tlmm_cs_changed(NAND_CS_NAND);
+    if ((off & 0xfff) == IPQ_TLMM_IO_OFFSET) {
+        ipq_tlmm_pin_written(t, pin);
     }
 }
 
@@ -7675,9 +7770,20 @@ static void ipq4019_init(MachineState *machine)
     memory_region_init_io(qtimer, NULL, &gcnt_ops, &qtimer_hz, "qtimer", 8);
     memory_region_add_subregion(sysmem, 0x4a2000, qtimer);
     add_stub(sysmem, 0x4a3000, 0x8000, "timer-misc");
-    ipq_tlmm_nor_cs_pin = env_u32("QEMU_IPQ_CS_GPIO", 54);
-    ipq_tlmm_nand_cs_pin = env_u32("QEMU_IPQ_NAND_CS_GPIO", 59);
     add_tlmm(sysmem, IPQ_TLMM_BASE, IPQ_TLMM_SIZE, "tlmm");
+    /*
+     * The board says which pins drive the dies' chip selects, so that is where
+     * the dies are connected: the pin controller is the SoC's, the wiring
+     * between it and the parts is the board's.
+     */
+    if (ipq_cfg.nor) {
+        ipq_tlmm_connect(ipq->tlmm, ipq_cfg.nor_cs_gpio, ipq_cs_line,
+                         (void *)(uintptr_t)NAND_CS_NOR);
+    }
+    if (ipq_cfg.nand) {
+        ipq_tlmm_connect(ipq->tlmm, ipq_cfg.nand_cs_gpio, ipq_cs_line,
+                         (void *)(uintptr_t)NAND_CS_NAND);
+    }
     /*
      * Clock blocks: bit 0 behaves as a self-clearing trigger on written
      * registers (software sets it, then polls until it reads 0).  Unwritten
@@ -8242,10 +8348,18 @@ static void ipq4019_init(MachineState *machine)
  * meaning the same thing, and lets the same property set describe a board that
  * has no preset at all.
  */
+typedef enum IPQPropKind {
+    IPQ_PROP_BOOL,
+    IPQ_PROP_UINT32,
+    IPQ_PROP_SIZE,              /* string, parsed with the usual 16M suffixes */
+    IPQ_PROP_STR,
+} IPQPropKind;
+
 typedef struct IPQBoardProp {
     const char *name;
     size_t off;                 /* field in ipq_cfg_pending */
     uint32_t bit;               /* which IPQ_CFG_* it sets */
+    IPQPropKind kind;
 } IPQBoardProp;
 
 static void ipq_prop_bool(Object *obj, Visitor *v, const char *name,
@@ -8255,6 +8369,18 @@ static void ipq_prop_bool(Object *obj, Visitor *v, const char *name,
     bool *field = (bool *)((char *)&ipq_cfg_pending + p->off);
 
     if (!visit_type_bool(v, name, field, errp)) {
+        return;
+    }
+    ipq_cfg_set |= p->bit;
+}
+
+static void ipq_prop_uint32(Object *obj, Visitor *v, const char *name,
+                            void *opaque, Error **errp)
+{
+    const IPQBoardProp *p = opaque;
+    uint32_t *field = (uint32_t *)((char *)&ipq_cfg_pending + p->off);
+
+    if (!visit_type_uint32(v, name, field, errp)) {
         return;
     }
     ipq_cfg_set |= p->bit;
@@ -8338,14 +8464,18 @@ static void ipq_prop_board_set(Object *obj, const char *value, Error **errp)
 static void ipq4019_machine_add_props(MachineClass *mc)
 {
     static const IPQBoardProp props[] = {
-        { "nor",        offsetof(IPQBoardConfig, nor),        IPQ_CFG_NOR },
-        { "nor-size",   offsetof(IPQBoardConfig, nor_size),   IPQ_CFG_NOR_SIZE },
-        { "nor-id",     offsetof(IPQBoardConfig, nor_id),     IPQ_CFG_NOR_ID },
-        { "nor-file",   offsetof(IPQBoardConfig, nor_file),   IPQ_CFG_NOR_FILE },
-        { "nand",       offsetof(IPQBoardConfig, nand),       IPQ_CFG_NAND },
-        { "nand-size",  offsetof(IPQBoardConfig, nand_size),  IPQ_CFG_NAND_SIZE },
-        { "nand-id",    offsetof(IPQBoardConfig, nand_id),    IPQ_CFG_NAND_ID },
-        { "nand-file",  offsetof(IPQBoardConfig, nand_file),  IPQ_CFG_NAND_FILE },
+        { "nor",        offsetof(IPQBoardConfig, nor),        IPQ_CFG_NOR, IPQ_PROP_BOOL },
+        { "nor-size",   offsetof(IPQBoardConfig, nor_size),   IPQ_CFG_NOR_SIZE, IPQ_PROP_SIZE },
+        { "nor-id",     offsetof(IPQBoardConfig, nor_id),     IPQ_CFG_NOR_ID, IPQ_PROP_STR },
+        { "nor-file",   offsetof(IPQBoardConfig, nor_file),   IPQ_CFG_NOR_FILE, IPQ_PROP_STR },
+        { "nand",       offsetof(IPQBoardConfig, nand),       IPQ_CFG_NAND, IPQ_PROP_BOOL },
+        { "nand-size",  offsetof(IPQBoardConfig, nand_size),  IPQ_CFG_NAND_SIZE, IPQ_PROP_SIZE },
+        { "nand-id",    offsetof(IPQBoardConfig, nand_id),    IPQ_CFG_NAND_ID, IPQ_PROP_STR },
+        { "nand-file",  offsetof(IPQBoardConfig, nand_file),  IPQ_CFG_NAND_FILE, IPQ_PROP_STR },
+        { "nor-cs-gpio",  offsetof(IPQBoardConfig, nor_cs_gpio),
+          IPQ_CFG_NOR_CS, IPQ_PROP_UINT32 },
+        { "nand-cs-gpio", offsetof(IPQBoardConfig, nand_cs_gpio),
+          IPQ_CFG_NAND_CS, IPQ_PROP_UINT32 },
     };
     static const char *const desc[ARRAY_SIZE(props)] = {
         "attach the SPI NOR die on chip select 0 (on/off)",
@@ -8356,6 +8486,8 @@ static void ipq4019_machine_add_props(MachineClass *mc)
         "NAND die size in bytes, a whole number of erase blocks",
         "NAND RDID as hex, e.g. c212",
         "file that is the NAND part (survives a power cut)",
+        "TLMM pin driving the NOR chip select",
+        "TLMM pin driving the NAND chip select",
     };
     ObjectClass *oc = OBJECT_CLASS(mc);
     size_t i;
@@ -8374,11 +8506,26 @@ static void ipq4019_machine_add_props(MachineClass *mc)
         "which die the boot chain comes from: none, spi-nor, spi-nand");
 
     for (i = 0; i < ARRAY_SIZE(props); i++) {
-        void (*set)(Object *, Visitor *, const char *, void *, Error **) =
-            strstr(props[i].name, "size") ? ipq_prop_size :
-            strstr(props[i].name, "id") || strstr(props[i].name, "file") ?
-            ipq_prop_str : ipq_prop_bool;
-        const char *type = set == ipq_prop_bool ? "bool" : "string";
+        void (*set)(Object *, Visitor *, const char *, void *, Error **);
+        const char *type;
+
+        switch (props[i].kind) {
+        case IPQ_PROP_BOOL:
+            set = ipq_prop_bool;
+            type = "bool";
+            break;
+        case IPQ_PROP_UINT32:
+            set = ipq_prop_uint32;
+            type = "uint32";
+            break;
+        case IPQ_PROP_SIZE:
+        case IPQ_PROP_STR:
+            set = props[i].kind == IPQ_PROP_SIZE ? ipq_prop_size : ipq_prop_str;
+            type = "string";
+            break;
+        default:
+            g_assert_not_reached();
+        }
 
         object_class_property_add(oc, props[i].name, type, NULL, set,
                                   NULL, (void *)&props[i]);
