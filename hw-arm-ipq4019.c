@@ -1696,7 +1696,18 @@ static void nand_opcode(IPQQupl *q, uint8_t op)
         q->addr_left = 3;               /* 24-bit page / block address */
         break;
     case NAND_OP_READ_CACHE:
+        /*
+         * 03h is the plain READ FROM CACHE, and like its x1/x2/x4 siblings it
+         * puts one dummy byte between the column address and the first data
+         * byte (macronix.c: SPINAND_PAGE_READ_FROM_CACHE_OP(false, 0, 1, ...)).
+         * The dummy is a turnaround, not a data clock: the die must not spend
+         * a byte of the cache on it.  Without this the dummy consumed cache
+         * column 0 and every later byte arrived one early -- invisible to the
+         * 5.6 kernel, which reads through 0Bh, but it shifted every byte the
+         * RouterBOOT cave read through 03h.
+         */
         q->addr_left = 2;               /* 16-bit column */
+        q->dummy_left = 1;
         break;
     case NAND_OP_READ_CACHE_F:
     case NAND_OP_READ_CACHE_2:
