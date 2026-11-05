@@ -371,6 +371,15 @@ typedef struct IPQBoardConfig {
     uint32_t eth_phy_id;
 
     IPQBootDev boot;            /* which die the boot chain comes from */
+
+    /*
+     * This board has no power-off register: RouterOS reaches
+     * machine_power_off(), finds nothing to write, and parks the CPU in
+     * machine_halt().  A parked CPU is therefore the power-off -- see
+     * ipq_poweroff_poll() -- and this turns that reading off for anyone who
+     * would rather keep the machine running.
+     */
+    bool poweroff;
 } IPQBoardConfig;
 
 /* which fields an explicit -machine property (or the env shim) provided */
@@ -395,6 +404,7 @@ enum {
     IPQ_CFG_ETH_PORTS  = 1u << 17,
     IPQ_CFG_ETH_BRIDGE = 1u << 18,
     IPQ_CFG_ETH_PHY_ID = 1u << 19,
+    IPQ_CFG_POWEROFF   = 1u << 20,
 };
 
 typedef struct IPQBoardPreset {
@@ -564,6 +574,7 @@ static void ipq_board_config_resolve(MachineState *machine)
     if (ipq_cfg_set & IPQ_CFG_ETH_PORTS)  { ipq_cfg.eth_ports   = want.eth_ports; }
     if (ipq_cfg_set & IPQ_CFG_ETH_BRIDGE) { ipq_cfg.eth_bridge_port = want.eth_bridge_port; }
     if (ipq_cfg_set & IPQ_CFG_ETH_PHY_ID) { ipq_cfg.eth_phy_id  = want.eth_phy_id; }
+    if (ipq_cfg_set & IPQ_CFG_POWEROFF)   { ipq_cfg.poweroff    = want.poweroff; }
 
     /*
      * 3. the deprecated environment shim.  It overwrites, because that is what
@@ -663,6 +674,10 @@ static void ipq_board_config_resolve(MachineState *machine)
     }
     if (!ipq_cfg.eth_phy_id) {
         ipq_cfg.eth_phy_id = IPQ_ETH_DEFAULT_PHY_ID;
+    }
+    if (!(ipq_cfg_set & IPQ_CFG_POWEROFF)) {
+        /* a machine whose guest cannot power it off is a machine that hangs */
+        ipq_cfg.poweroff = true;
     }
     if (!ipq_cfg.eth_bridge_port) {
         /* port 0 is the CPU port: there is no cable to hand a host frame to */
@@ -1014,6 +1029,94 @@ static const MemoryRegionOps pshold_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 4 },
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
+
+/*
+ * Powering the board off.
+ *
+ * This SoC has no register that cuts power.  The board's rails are held by
+ * PS_HOLD, and software that wants to *restart* drops it (that is what
+ * /sbin/reboot does; the pshold model above turns it into a machine reset).
+ * A guest that wants to *stop* has nowhere to write: MikroTik's device tree
+ * gives the kernel only `qcom,pshold`, which is a restart handler, so
+ * /system shutdown prints
+ *
+ *     reboot: Power down
+ *
+ * from kernel_power_off() and then arch/arm's default machine_power_off()
+ * falls into machine_halt(): mask IRQs, `while (1) cpu_do_idle();`.  On the
+ * real board that is also the end of the story -- the part sits there until
+ * something removes power.
+ *
+ * What that loop looks like from the outside is not "a halted CPU".  WFI is
+ * only allowed to halt when nothing is pending (arm_cpu_has_work()), and the
+ * interrupted line is still asserted because the CPU masked it, so WFI
+ * returns at once and the loop spins: PC pinned on the WFI, IRQs masked,
+ * CPU_INTERRUPT_HARD permanently set -- a full core burnt, which is exactly
+ * the 100% CPU a hung shutdown shows.  A live guest never sits in that state:
+ * idle halts with nothing pending, and any interrupt it masks while doing
+ * work is taken as soon as it unmasks.
+ *
+ * So that state, held for IPQ_POWEROFF_TICKS, *is* the power-off: the machine
+ * ends the way the plug coming out would.  poweroff=off keeps it running.
+ */
+#define IPQ_POWEROFF_MS     100
+#define IPQ_POWEROFF_TICKS  15          /* 1.5 s of an IRQ-masked WFI spin */
+
+static QEMUTimer *ipq_poweroff_timer;
+static int ipq_poweroff_ticks;
+
+static void ipq_poweroff_poll(void *opaque)
+{
+    CPUState *cs = qemu_get_cpu(0);
+    ARMCPU *cpu;
+    bool parked;
+
+    if (!cs) {
+        return;
+    }
+    cpu = ARM_CPU(cs);
+    /*
+     * IRQs masked, an interrupt that cannot be delivered, and a CPU that is
+     * not halted: WFI returns immediately and machine_halt() spins on it.
+     */
+    parked = (cpu->env.daif & PSTATE_I) != 0 &&
+             !cs->halted &&
+             (cs->interrupt_request & CPU_INTERRUPT_HARD) != 0;
+
+    if (env_true("QEMU_IPQ_HANG_LOG")) {
+        fprintf(stderr, "ipq4019: poll pc=%08x daif=%02x halted=%d irq=%x "
+                "ticks=%d\n", (uint32_t)cpu->env.regs[15],
+                (uint32_t)cpu->env.daif,
+                cs->halted, cs->interrupt_request, ipq_poweroff_ticks);
+    }
+
+    /* A paused machine (-S, a monitor stop) is not a powered-down one. */
+    if (!runstate_is_running()) {
+        ipq_poweroff_ticks = 0;
+    } else if (ipq_cfg.poweroff && parked) {
+        if (++ipq_poweroff_ticks >= IPQ_POWEROFF_TICKS) {
+            fprintf(stderr,
+                    "ipq4019: poweroff: the guest parked the CPU at 0x%08x "
+                    "with IRQs masked and an interrupt pending, so the board "
+                    "is off (poweroff=off in -machine keeps it running)\n",
+                    (uint32_t)cpu->env.regs[15]);
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+            return;
+        }
+    } else {
+        ipq_poweroff_ticks = 0;
+    }
+    timer_mod(ipq_poweroff_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + IPQ_POWEROFF_MS);
+}
+
+static void ipq_poweroff_start(void)
+{
+    ipq_poweroff_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ipq_poweroff_poll,
+                                      NULL);
+    timer_mod(ipq_poweroff_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + IPQ_POWEROFF_MS);
+}
 
 /*
  * KPSS watchdog at 0x0b017000: how RouterBOOT restarts the board.
@@ -8626,6 +8729,9 @@ static void ipq4019_init(MachineState *machine)
     for (i = 0; i < machine->smp.cpus; i++) {
         cpu_create(machine->cpu_type);
     }
+    if (ipq_cfg.poweroff || env_true("QEMU_IPQ_HANG_LOG")) {
+        ipq_poweroff_start();
+    }
 
     if (env_true("QEMU_IPQ_DIAG")) {
         ipq_diag_last_virtual = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -9516,6 +9622,7 @@ static void ipq4019_machine_add_props(MachineClass *mc)
           IPQ_CFG_ETH_BRIDGE, IPQ_PROP_UINT32 },
         { "eth-phy-id", offsetof(IPQBoardConfig, eth_phy_id),
           IPQ_CFG_ETH_PHY_ID, IPQ_PROP_UINT32 },
+        { "poweroff",   offsetof(IPQBoardConfig, poweroff),   IPQ_CFG_POWEROFF, IPQ_PROP_BOOL },
     };
     static const char *const desc[ARRAY_SIZE(props)] = {
         "attach the SPI NOR die on chip select 0 (on/off)",
@@ -9535,6 +9642,7 @@ static void ipq4019_machine_add_props(MachineClass *mc)
         "switch PHYs as addr[:speed[:id]];... ('!' = link down)",
         "switch port wired to the host -netdev (1..6, default lan1=5)",
         "PHY identifier for ports that do not name their own",
+        "a CPU parked with IRQs masked powers the board off (on/off)",
     };
     ObjectClass *oc = OBJECT_CLASS(mc);
     size_t i;
