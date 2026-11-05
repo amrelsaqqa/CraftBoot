@@ -2557,6 +2557,15 @@ static uint8_t nand_miso(IPQQupl *q)
  * dump of *that* chip: 1024 blocks of 64 pages, 2048+64 bytes each.
  */
 /*
+ * Whether each die was loaded from its store instead of programmed from an
+ * image on this run.  The boot chain always comes out of the die, so these two
+ * are what tells a run that booted what it was given from one that booted the
+ * die it already had.
+ */
+static bool ipq_nor_store_loaded;
+static bool ipq_nand_store_loaded;
+
+/*
  * The SPI NOR on chip select 0, as the board configuration describes it.
  *
  * Three things are the board's, not the SoC's: whether the part exists at all,
@@ -2594,6 +2603,7 @@ static void ipq_board_add_nor(MemoryRegion *sysmem)
     img = ipq_cfg.nor_image;
     pers = nor_persist_preload(flash, ipq_flash_die_size, img,
                                ipq_cfg.nor_file, ipq_cfg.nor_drive);
+    ipq_nor_store_loaded = (pers == NOR_PERSIST_LOADED);
     if (pers != NOR_PERSIST_LOADED) {
         if (img) {
             g_file_get_contents(img, &buf, &len, NULL);
@@ -2673,6 +2683,7 @@ static void ipq_board_add_nand(void)
     if (what) {
         fresh = !nand_persist_open(n, ipq_cfg.nand_file, ipq_cfg.nand_drive,
                                    ipq_cfg.nand_image);
+        ipq_nand_store_loaded = !fresh;
         fprintf(stderr, "ipq4019: nand store %s %s (%u MiB, %u pages of %u+%u)\n",
                 what, fresh ? "created, erased" : "loaded",
                 (unsigned)(n->bytes / MiB), n->pages, NAND_PAGE, NAND_OOB);
@@ -8574,6 +8585,26 @@ static void ipq4019_diag(void *opaque)
     timer_mod_ns(ipq->diag_timer, h + 2 * NANOSECONDS_PER_SECOND);
 }
 
+/*
+ * Which die boots, and what the command line offered to program it with.  The
+ * boot chain always comes from the die, so "the image" here is a programmer:
+ * it is either what filled the die on this run or the thing that was ignored
+ * because the die already held one.
+ */
+static void ipq_boot_dev_info(const char **dev, const char **img,
+                              const char **store, bool *loaded)
+{
+    *dev = ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? "NOR" :
+           ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? "NAND" : NULL;
+    *img = ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? ipq_cfg.nor_image :
+           ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? ipq_cfg.nand_image : NULL;
+    *store = ipq_cfg.boot == IPQ_BOOT_SPI_NOR
+           ? (ipq_cfg.nor_file ? ipq_cfg.nor_file : ipq_cfg.nor_drive)
+           : (ipq_cfg.nand_file ? ipq_cfg.nand_file : ipq_cfg.nand_drive);
+    *loaded = ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? ipq_nor_store_loaded
+            : ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? ipq_nand_store_loaded : false;
+}
+
 static void ipq4019_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -9146,6 +9177,25 @@ static void ipq4019_init(MachineState *machine)
         g_free(bc);
     }
 
+    /*
+     * -kernel is content for a die that is not a board yet, never the thing
+     * that boots: ipq_boot_image() reads the boot chain out of the configured
+     * die.  When that die came from a store it already held one, so the image
+     * was not programmed and the wrong board can be booted while the command
+     * line says otherwise.  Say which of the two happened.
+     */
+    {
+        const char *dev, *img, *store;
+        bool loaded;
+
+        ipq_boot_dev_info(&dev, &img, &store, &loaded);
+        if (dev && loaded && img) {
+            warn_report("the %s die (%s) already holds a boot chain, so %s "
+                        "was not programmed into it; delete that file to "
+                        "program from the image", dev, store, img);
+        }
+    }
+
     if (ipq4019_load_elf(machine, sysmem)) {
         /* SBL1 loaded: hand it the PBL boot-info pointer in r0 */
         uint8_t *bi = g_malloc0(0x200);
@@ -9280,6 +9330,27 @@ static void ipq4019_init(MachineState *machine)
         fprintf(stderr, "ipq4019: boot-info handed to SBL1 in r0 = 0x%08x\n",
                ipq4019_bootinfo);
     } else {
+        /*
+         * No SBL ELF in the boot device.  A die that was loaded from a store
+         * and a -kernel that could not be used are both mistakes worth naming:
+         * the alternative is a machine that runs an empty boot ROM and looks
+         * like a hang.
+         */
+        const char *dev, *img, *store;
+        bool loaded;
+
+        ipq_boot_dev_info(&dev, &img, &store, &loaded);
+        if (dev && store && (machine->kernel_filename || loaded)) {
+            error_report("ipq4019: the %s die (%s) holds no SBL ELF, so there "
+                         "is nothing to boot there; delete that file to program "
+                         "it from an image", dev, store);
+            if (machine->kernel_filename) {
+                error_report("ipq4019: -kernel %s is a programming source, not "
+                             "a boot source: it is only copied into an empty "
+                             "die", machine->kernel_filename);
+            }
+            exit(1);
+        }
         arm_load_kernel(ARM_CPU(first_cpu), machine, &ipq4019_binfo);
     }
 
