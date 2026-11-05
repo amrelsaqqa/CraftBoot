@@ -328,6 +328,14 @@ static IPQBoardState *ipq_board;/* the parts wired to it */
 #define IPQ_FLASH_TYPE_NAND   2
 #define IPQ_FLASH_TYPE_SPI    6
 
+/*
+ * The reference design's switch: a QCA8075 exposes its five copper PHYs at
+ * MDIO addresses 0..4 and its PSGMII control block at 5 (U-Boot's PSGMII_ID).
+ * A board with a different switch, or fewer ports, names its own list.
+ */
+#define IPQ_ETH_DEFAULT_PORTS  "0,1,2,3,4,5"
+#define IPQ_ETH_DEFAULT_PHY_ID 0x004dd0b1u      /* QCA8075 */
+
 typedef enum IPQBootDev {
     IPQ_BOOT_NONE = 0,
     IPQ_BOOT_SPI_NOR,           /* SPI NOR behind the QUP, flash type 6 */
@@ -357,6 +365,11 @@ typedef struct IPQBoardConfig {
     const char *leds;
     const char *keys;
 
+    /* the switch: which PHYs sit on the MDIO bus, and which port is the host's */
+    const char *eth_ports;
+    uint32_t eth_bridge_port;
+    uint32_t eth_phy_id;
+
     IPQBootDev boot;            /* which die the boot chain comes from */
 } IPQBoardConfig;
 
@@ -379,6 +392,9 @@ enum {
     IPQ_CFG_NAND_DRIVE = 1u << 14,
     IPQ_CFG_LEDS       = 1u << 15,
     IPQ_CFG_KEYS       = 1u << 16,
+    IPQ_CFG_ETH_PORTS  = 1u << 17,
+    IPQ_CFG_ETH_BRIDGE = 1u << 18,
+    IPQ_CFG_ETH_PHY_ID = 1u << 19,
 };
 
 typedef struct IPQBoardPreset {
@@ -505,6 +521,9 @@ static void ipq_board_config_resolve(MachineState *machine)
     if (ipq_cfg_set & IPQ_CFG_NAND_CS)    { ipq_cfg.nand_cs_gpio = want.nand_cs_gpio; }
     if (ipq_cfg_set & IPQ_CFG_LEDS)       { ipq_cfg.leds        = want.leds; }
     if (ipq_cfg_set & IPQ_CFG_KEYS)       { ipq_cfg.keys        = want.keys; }
+    if (ipq_cfg_set & IPQ_CFG_ETH_PORTS)  { ipq_cfg.eth_ports   = want.eth_ports; }
+    if (ipq_cfg_set & IPQ_CFG_ETH_BRIDGE) { ipq_cfg.eth_bridge_port = want.eth_bridge_port; }
+    if (ipq_cfg_set & IPQ_CFG_ETH_PHY_ID) { ipq_cfg.eth_phy_id  = want.eth_phy_id; }
 
     /*
      * 3. the deprecated environment shim.  It overwrites, because that is what
@@ -557,6 +576,18 @@ static void ipq_board_config_resolve(MachineState *machine)
         ipq_cfg.nand_cs_gpio = strtoul(env, NULL, 0);
         env_set |= IPQ_CFG_NAND_CS;
     }
+    if ((env = getenv("QEMU_IPQ_ETH_PORTS")) && *env) {
+        ipq_cfg.eth_ports = env;
+        env_set |= IPQ_CFG_ETH_PORTS;
+    }
+    if ((env = getenv("QEMU_IPQ_ETH_BRIDGE_PORT")) && *env) {
+        ipq_cfg.eth_bridge_port = strtoul(env, NULL, 0);
+        env_set |= IPQ_CFG_ETH_BRIDGE;
+    }
+    if ((env = getenv("QEMU_IPQ_ETH_PHY_ID")) && *env) {
+        ipq_cfg.eth_phy_id = strtoul(env, NULL, 0);
+        env_set |= IPQ_CFG_ETH_PHY_ID;
+    }
     ipq_cfg_set |= env_set;
 
     /* 4. defaults and sanity, so the rest of the machine can trust the struct */
@@ -589,6 +620,18 @@ static void ipq_board_config_resolve(MachineState *machine)
         if (!ipq_cfg.nand_cs_gpio) {
             ipq_cfg.nand_cs_gpio = 59;
         }
+    }
+    if (!ipq_cfg.eth_phy_id) {
+        ipq_cfg.eth_phy_id = IPQ_ETH_DEFAULT_PHY_ID;
+    }
+    if (!ipq_cfg.eth_bridge_port) {
+        /* port 0 is the CPU port: there is no cable to hand a host frame to */
+        ipq_cfg.eth_bridge_port = 5;
+    }
+    if (ipq_cfg.eth_bridge_port > 6) {
+        error_report("ipq4019: eth-bridge-port=%u must be 1..6",
+                     ipq_cfg.eth_bridge_port);
+        exit(1);
     }
     /* its geometry is checked where the part is built (ipq_board_add_nand) */
 
@@ -5889,23 +5932,18 @@ static NetClientInfo edma_net_info = {
 
 /*
  * Attach the engine to a QEMU network backend.  QEMU_IPQ_NETDEV names the
- * -netdev (default "net0") and QEMU_IPQ_ETH_BRIDGE_PORT the switch port wired
- * to it (default 5, the front-panel port the DTS calls lan1).  Without a
- * matching -netdev the machine still boots and simply drops every frame, the
- * way it did before there was a packet path at all.
+ * -netdev (default "net0") and eth-bridge-port the switch port wired to it
+ * (default 5, the front-panel port the DTS calls lan1).  Without a matching
+ * -netdev the machine still boots and simply drops every frame, the way it did
+ * before there was a packet path at all.
  */
 static void edma_connect_netdev(IPQEdma *e)
 {
     const char *id = getenv("QEMU_IPQ_NETDEV");
-    const char *bridge = getenv("QEMU_IPQ_ETH_BRIDGE_PORT");
     NetClientState *peer;
     NICState *nic;
 
-    e->bridge_port = bridge ? atoi(bridge) : 5;
-    if (e->bridge_port < 0 || e->bridge_port > 6) {
-        warn_report("ipq4019: bad QEMU_IPQ_ETH_BRIDGE_PORT '%s'", bridge);
-        e->bridge_port = 5;
-    }
+    e->bridge_port = ipq_cfg.eth_bridge_port;
     e->txbuf = g_malloc(EDMA_MAX_FRAME);
     e->segbuf = g_malloc(EDMA_MAX_FRAME);
 
@@ -6093,14 +6131,6 @@ static void edma_wire_irqs(DeviceState *gicdev)
 #define IPQ_MDIO_BASE        0x00090000u
 #define IPQ_MDIO_SIZE        0x00001000u
 #define IPQ_MDIO_MAX_PHYS    8
-/*
- * A QCA8075 exposes its five copper PHYs at MDIO addresses 0..4 and its
- * PSGMII control block at address 5 (U-Boot's PSGMII_ID), so that is the
- * default population of the bus.  Boards with a different switch or fewer
- * ports override this.
- */
-#define IPQ_ETH_DEFAULT_PORTS "0,1,2,3,4,5"
-#define IPQ_ETH_DEFAULT_PHY_ID 0x004dd0b1u     /* QCA8075 */
 
 #define MDIO_MODE_REG   0x40
 #define MDIO_ADDR_REG   0x44
@@ -6513,20 +6543,19 @@ static void mdio_add_phy(IPQMdio *m, int addr, int speed, uint32_t id, int link)
 }
 
 /*
- * Parse "addr[:speed[:id]]" entries separated by commas.  A leading '!' on the
- * port means "link down"; that is how a board with an empty SFP cage or a
- * switch port with nothing plugged in looks.
+ * Parse "addr[:speed[:id]]" entries separated by ';' (or ',' for the old
+ * environment spelling).  A leading '!' on the port means "link down"; that is
+ * how a board with an empty SFP cage or a switch port with nothing plugged in
+ * looks.  An entry that does not name an ID gets the board's PHY identifier.
  */
-static void mdio_parse_ports(IPQMdio *m, const char *spec)
+static void mdio_parse_ports(IPQMdio *m, const char *spec, uint32_t def_id)
 {
-    uint32_t def_id = env_u32("QEMU_IPQ_ETH_PHY_ID", IPQ_ETH_DEFAULT_PHY_ID);
-
     while (spec && *spec) {
         char *end;
         long addr, speed = 1000, link = 1;
         uint32_t id = def_id;
 
-        while (*spec == ',' || *spec == ' ') {
+        while (*spec == ',' || *spec == ';' || *spec == ' ') {
             spec++;
         }
         if (!*spec) {
@@ -6538,13 +6567,26 @@ static void mdio_parse_ports(IPQMdio *m, const char *spec)
         }
         addr = strtol(spec, &end, 0);
         if (end == spec || addr < 0 || addr > 31) {
-            warn_report("ipq4019: bad QEMU_IPQ_ETH_PORTS entry at '%s'", spec);
+            warn_report("ipq4019: bad Ethernet port entry at '%s'", spec);
             break;
         }
         spec = end;
+        /* '!' next to the address -- "!5", "5!", "5:!100" -- is "no cable" */
+        while (*spec == '!') {
+            link = 0;
+            spec++;
+        }
+        if (*spec == ':' && spec[1] == '!') {
+            link = 0;
+            spec++;
+        }
         if (*spec == ':') {
             speed = strtol(spec + 1, &end, 0);
             spec = end;
+        }
+        if (*spec == '!') {
+            link = 0;
+            spec++;
         }
         if (*spec == ':') {
             id = strtoul(spec + 1, &end, 0);
@@ -6739,34 +6781,44 @@ static const char *ipq_machine_dtb(MachineState *machine)
 static IPQMdio *add_mdio(MemoryRegion *parent, const char *dtb_path)
 {
     IPQMdio *m = g_new0(IPQMdio, 1);
-    const char *spec = getenv("QEMU_IPQ_ETH_PORTS");
     int i;
 
     /*
-     * Three sources, in order of precedence: an explicit port list, the board
-     * device tree, the built-in QCA8075 population.
+     * Three sources, in order of precedence: the machine's port list, the
+     * board device tree, the built-in QCA8075 population.  The port list is
+     * board data in the same sense as the dies: a board with two PHYs is not a
+     * reference design with four missing, it is a different board.
      */
-    if (spec) {
-        mdio_parse_ports(m, spec);
+    if (ipq_cfg_set & IPQ_CFG_ETH_PORTS) {
+        /* An empty list is a board with no switch on the bus, not "unspecified":
+         * someone who wrote eth-ports= has said what is there. */
+        if (ipq_cfg.eth_ports && *ipq_cfg.eth_ports) {
+            mdio_parse_ports(m, ipq_cfg.eth_ports, ipq_cfg.eth_phy_id);
+        }
     } else if (dtb_path) {
         mdio_add_from_dtb(m, dtb_path);
         if (!m->nphy) {
-            mdio_parse_ports(m, IPQ_ETH_DEFAULT_PORTS);
+            mdio_parse_ports(m, IPQ_ETH_DEFAULT_PORTS, ipq_cfg.eth_phy_id);
         }
     } else {
-        mdio_parse_ports(m, IPQ_ETH_DEFAULT_PORTS);
+        mdio_parse_ports(m, IPQ_ETH_DEFAULT_PORTS, ipq_cfg.eth_phy_id);
     }
 
     ipq->mdio = m;
     memory_region_init_io(&m->mr, NULL, &mdio_ops, m, "mdio", IPQ_MDIO_SIZE);
     memory_region_add_subregion(parent, IPQ_MDIO_BASE, &m->mr);
 
-    fprintf(stderr, "ipq4019: mdio@%08x, %d port(s):", IPQ_MDIO_BASE, m->nphy);
-    for (i = 0; i < m->nphy; i++) {
-        fprintf(stderr, " %d@%d%s", m->phy[i].addr, m->phy[i].speed,
-               m->phy[i].link ? "" : "(down)");
+    if (!m->nphy) {
+        fprintf(stderr, "ipq4019: mdio@%08x, no port\n", IPQ_MDIO_BASE);
+    } else {
+        fprintf(stderr, "ipq4019: mdio@%08x, %d port(s):", IPQ_MDIO_BASE,
+                m->nphy);
+        for (i = 0; i < m->nphy; i++) {
+            fprintf(stderr, " %d@%d%s", m->phy[i].addr, m->phy[i].speed,
+                    m->phy[i].link ? "" : "(down)");
+        }
+        fprintf(stderr, "\n");
     }
-    fprintf(stderr, "\n");
     return m;
 }
 
@@ -9345,6 +9397,11 @@ static void ipq4019_machine_add_props(MachineClass *mc)
           IPQ_CFG_NAND_CS, IPQ_PROP_UINT32 },
         { "leds",       offsetof(IPQBoardConfig, leds),       IPQ_CFG_LEDS, IPQ_PROP_STR },
         { "keys",       offsetof(IPQBoardConfig, keys),       IPQ_CFG_KEYS, IPQ_PROP_STR },
+        { "eth-ports",  offsetof(IPQBoardConfig, eth_ports),  IPQ_CFG_ETH_PORTS, IPQ_PROP_STR },
+        { "eth-bridge-port", offsetof(IPQBoardConfig, eth_bridge_port),
+          IPQ_CFG_ETH_BRIDGE, IPQ_PROP_UINT32 },
+        { "eth-phy-id", offsetof(IPQBoardConfig, eth_phy_id),
+          IPQ_CFG_ETH_PHY_ID, IPQ_PROP_UINT32 },
     };
     static const char *const desc[ARRAY_SIZE(props)] = {
         "attach the SPI NOR die on chip select 0 (on/off)",
@@ -9361,6 +9418,9 @@ static void ipq4019_machine_add_props(MachineClass *mc)
         "TLMM pin driving the NAND chip select",
         "LEDs as name:pin[:al];... (shown in QEMU's window; ';' separates)",
         "keys as name:pin[:al]:qcode;... (window or QMP send-key)",
+        "switch PHYs as addr[:speed[:id]];... ('!' = link down)",
+        "switch port wired to the host -netdev (1..6, default lan1=5)",
+        "PHY identifier for ports that do not name their own",
     };
     ObjectClass *oc = OBJECT_CLASS(mc);
     size_t i;
