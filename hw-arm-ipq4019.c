@@ -406,8 +406,18 @@ typedef struct IPQBoardPreset {
  * The presets.  `default` is the board this machine has always built: a
  * 32 MiB W25Q256 NOR behind chip select 0, no NAND, booting from the NOR.
  * `none` is the bare SoC -- every part has to be named on the command line.
- * Named boards (kt708, hap-ac2, ...) belong here too, but only once their
- * wiring is read from their own DTS rather than guessed.
+ *
+ * `mikrotik-952` is a real board, and every fact in it comes from that board's
+ * own device tree (the 952G_5HacD2HnD tree inside the MikroTik dump, see
+ * tools/dts2xml.py and tests/dts2xml-test.sh): a 32 MiB NOR and a 1 Gbit SPI
+ * NAND on chip selects 0 and 1, five MDIO PHYs at addresses 0..4 (the QCA8075's
+ * block at 5 is not in the tree, so it is not on the bus), and three lamp lines
+ * -- user-led on pin 3, power-led on 0, the USB power line on 2, active low.
+ *
+ * What a preset deliberately cannot carry is a button's *behaviour*: the tree
+ * says a switch is on pin 63 and another on pin 5, but not that the first one
+ * should be Escape in QEMU.  That is a decision about the run, so it stays a
+ * `keys=` property; the preset only knows the pins.
  */
 static const IPQBoardPreset ipq_board_presets[] = {
     { "default", {
@@ -424,6 +434,19 @@ static const IPQBoardPreset ipq_board_presets[] = {
         .nand = false,
         .boot = IPQ_BOOT_NONE,
     } },
+    { "mikrotik-952", {
+        .nor = true,
+        .nor_size = 33554432,
+        .nor_id = "ef4019",
+        .nor_cs_gpio = 54,
+        .nand = true,
+        .nand_size = NAND_BYTES_DEF,
+        .nand_id = "c212",
+        .nand_cs_gpio = 59,
+        .leds = "user-led:3;power-led:0;usb-power-off:2:al",
+        .eth_ports = "0;1;2;3;4",
+        .boot = IPQ_BOOT_SPI_NOR,
+    } },
 };
 
 /* what the machine was asked for, before presets and env are merged in */
@@ -433,6 +456,23 @@ static const char *ipq_cfg_board;
 /* the resolved answer, built once when the machine starts */
 static IPQBoardConfig ipq_cfg;
 static bool ipq_cfg_ready;
+
+/* The preset names, in the order they are defined, for error messages. */
+static const char *ipq_board_preset_names(void)
+{
+    static char names[128];
+    size_t i;
+
+    if (!names[0]) {
+        for (i = 0; i < ARRAY_SIZE(ipq_board_presets); i++) {
+            if (i) {
+                g_strlcat(names, ", ", sizeof(names));
+            }
+            g_strlcat(names, ipq_board_presets[i].name, sizeof(names));
+        }
+    }
+    return names;
+}
 
 static const IPQBoardPreset *ipq_board_preset(const char *name)
 {
@@ -497,8 +537,8 @@ static void ipq_board_config_resolve(MachineState *machine)
     /* 1. the preset (board=<name>, default when nothing was said) */
     p = ipq_board_preset(ipq_cfg_board ? ipq_cfg_board : "default");
     if (!p) {
-        error_report("ipq4019: no such board '%s'; known boards: default, none",
-                     ipq_cfg_board);
+        error_report("ipq4019: no such board '%s'; known boards: %s",
+                     ipq_cfg_board, ipq_board_preset_names());
         exit(1);
     }
     ipq_cfg = p->cfg;
@@ -6789,10 +6829,13 @@ static IPQMdio *add_mdio(MemoryRegion *parent, const char *dtb_path)
      * board data in the same sense as the dies: a board with two PHYs is not a
      * reference design with four missing, it is a different board.
      */
-    if (ipq_cfg_set & IPQ_CFG_ETH_PORTS) {
+    if (ipq_cfg.eth_ports) {
         /* An empty list is a board with no switch on the bus, not "unspecified":
-         * someone who wrote eth-ports= has said what is there. */
-        if (ipq_cfg.eth_ports && *ipq_cfg.eth_ports) {
+         * someone who wrote eth-ports= has said what is there.  The resolved
+         * configuration is non-NULL only when the board named its PHYs --
+         * with the property, or through its preset -- so this also covers a
+         * board preset whose population differs from the reference design. */
+        if (*ipq_cfg.eth_ports) {
             mdio_parse_ports(m, ipq_cfg.eth_ports, ipq_cfg.eth_phy_id);
         }
     } else if (dtb_path) {
@@ -9428,7 +9471,8 @@ static void ipq4019_machine_add_props(MachineClass *mc)
     object_class_property_add_str(oc, "board", ipq_prop_board_get,
                                   ipq_prop_board_set);
     object_class_property_set_description(oc, "board",
-        "board preset: default, none (or a command-line property set)");
+        "board preset: default, none, mikrotik-952 (or a command-line "
+        "property set)");
     /*
      * "boot" already exists on MachineState (the structured -machine boot=
      * configuration), so the strap is named for what it is.
