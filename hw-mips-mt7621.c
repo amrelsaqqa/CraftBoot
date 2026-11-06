@@ -30,6 +30,7 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/system.h"
+#include "qemu/log.h"
 #include "system/reset.h"
 #include "target/mips/cpu-qom.h"
 #include "target/mips/internal.h"
@@ -41,12 +42,40 @@ OBJECT_DECLARE_SIMPLE_TYPE(MT7621State, MT7621_MACHINE)
 #define MT7621_RAM_BASE         0x00000000
 #define MT7621_PERIPH_BASE      0x1e000000
 #define MT7621_PERIPH_SIZE      0x00200000
+
 #define MT7621_SYSCTL_OFF       0x00000000
 #define MT7621_UART0_OFF        0x00000c00
 #define MT7621_NFI_OFF          0x00003000
 #define MT7621_DRAMC_OFF        0x00005000
+/* Every KSEG0/KSEG1 physical address the CPU can generate, for aliasing. */
+#define MT7621_KSEG1_WINDOW     0x20000000
 #define MT7621_SRAM_BASE        0x1e100000
 #define MT7621_SRAM_SIZE        0x00010000
+
+/*
+ * MIPS Coherence Manager (CM) / Cluster Power Controller (CPC).
+ * CPC sits at 0x1fbf0000, the global control registers (GCR) at 0x1fbf8000.
+ */
+#define MT7621_CM_BASE          0x1fbf0000
+#define MT7621_CM_SIZE          0x00010000
+#define MT7621_GCR_OFF          0x00008000
+
+/* GCR register offsets */
+#define GCR_CONFIG              0x0000
+#define GCR_BASE                0x0008
+#define GCR_REV                 0x0030
+#define GCR_GIC_BASE            0x0080
+#define GCR_CPC_BASE            0x0088
+#define GCR_GIC_STATUS          0x00d0
+#define GCR_CPC_STATUS          0x00f0
+#define GCR_CL_OTHER            0x2018
+#define GCR_CL_ID               0x2028
+#define GCR_CO_RESET_RELEASE    0x4000
+
+/* CPC register offsets (relative to the CPC base) */
+#define CPC_CL_OTHER            0x0010
+#define CPC_CL_BASE             0x2010
+#define CPC_CO_CMD              0x4000
 
 #define MT7621_UART_CLOCK       50000000
 #define MT7621_UART_BAUD_BASE   (MT7621_UART_CLOCK / 16)
@@ -75,10 +104,14 @@ struct MT7621State {
     MemoryRegion dramc;
     MemoryRegion nfi;
     MemoryRegion sram;
+    MemoryRegion cm;
+    MemoryRegion ram_alias[8];
+    int ram_alias_count;
 
     uint32_t sysctl_regs[SYSCTL_WORDS];
     uint32_t dramc_regs[DRAMC_WORDS];
     uint32_t nfi_regs[NFI_WORDS];
+    uint32_t cm_regs[MT7621_CM_SIZE / 4];
 
     /* boot image */
     uint32_t load_addr;
@@ -86,11 +119,18 @@ struct MT7621State {
     bool uimage;
 };
 
+static bool mt7621_trace;
+
 static uint64_t mt7621_reg_read(void *opaque, hwaddr addr, unsigned size)
 {
     uint32_t *regs = opaque;
+    uint32_t val = regs[(addr & 0xfff) >> 2];
 
-    return regs[(addr & 0xfff) >> 2];
+    if (mt7621_trace) {
+        qemu_log_mask(LOG_UNIMP, "mt7621: reg read  %08" HWADDR_PRIx
+                      " -> %08x\n", addr, val);
+    }
+    return val;
 }
 
 static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
@@ -98,12 +138,60 @@ static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
 {
     uint32_t *regs = opaque;
 
+    if (mt7621_trace) {
+        qemu_log_mask(LOG_UNIMP, "mt7621: reg write %08" HWADDR_PRIx
+                      " <- %08" PRIx64 "\n", addr, val);
+    }
     regs[(addr & 0xfff) >> 2] = val;
 }
 
 static const MemoryRegionOps mt7621_reg_ops = {
     .read = mt7621_reg_read,
     .write = mt7621_reg_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/* The CM/CPC block is 64 KiB, so it needs a wider index than mt7621_reg_ops. */
+static uint64_t mt7621_cm_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint32_t *regs = opaque;
+    uint32_t val;
+
+    /*
+     * Breed releases every core through GCR_CL_OTHER and then polls
+     * GCR_CO_COHERENCE until the core reports in.  We only model CPU0
+     * (QEMU has no MT VPEs), so always report the domain as coherent.
+     */
+    if ((addr & (MT7621_CM_SIZE - 1)) == MT7621_GCR_OFF + 0x4008) {
+        val = 1;
+    } else {
+        val = regs[(addr & (MT7621_CM_SIZE - 1)) >> 2];
+    }
+
+    if (mt7621_trace) {
+        qemu_log_mask(LOG_UNIMP, "mt7621: cm read  %08" HWADDR_PRIx
+                      " -> %08x\n", addr, val);
+    }
+    return val;
+}
+
+static void mt7621_cm_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned size)
+{
+    uint32_t *regs = opaque;
+
+    if (mt7621_trace) {
+        qemu_log_mask(LOG_UNIMP, "mt7621: cm write %08" HWADDR_PRIx
+                      " <- %08" PRIx64 "\n", addr, val);
+    }
+    regs[(addr & (MT7621_CM_SIZE - 1)) >> 2] = val;
+}
+
+static const MemoryRegionOps mt7621_cm_ops = {
+    .read = mt7621_cm_read,
+    .write = mt7621_cm_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = { .min_access_size = 4, .max_access_size = 4 },
     .impl = { .min_access_size = 4, .max_access_size = 4 },
@@ -141,7 +229,16 @@ static void mt7621_load_image(MT7621State *s, const char *filename)
             error_report("mt7621: %s: not a uImage", filename);
             exit(1);
         }
-        size  = (uint32_t)ldl_be_p(hdr + 12);
+        uint32_t img_size = (uint32_t)ldl_be_p(hdr + 12);
+        /*
+         * MT7621 BootROM NAND header: the uImage name field (32 bytes) is
+         * overlaid by nand_header_t, so ih_bootloader_offset lives at +52.
+         * When non-zero the BootROM first runs the stage-1 DDR init image
+         * and then loads the bootloader from that file offset.
+         */
+        uint32_t bl_off = ldl_be_p(hdr + 52);
+
+        size  = img_size;
         load  = (uint32_t)ldl_be_p(hdr + 16);
         entry = (uint32_t)ldl_be_p(hdr + 20);
         off   = 64;
@@ -150,6 +247,25 @@ static void mt7621_load_image(MT7621State *s, const char *filename)
         }
         if (s->entry) {
             entry = s->entry;
+        }
+        if (bl_off && !getenv("MT7621_STAGE1")) {
+            if (bl_off >= 64 + (uint64_t)img_size) {
+                error_report("mt7621: bootloader offset 0x%x out of range",
+                             bl_off);
+                exit(1);
+            }
+            /*
+             * BootROM step 2: the bootloader is loaded to ih_load (a KSEG1
+             * address, called out in the MT7621 NAND image header) and
+             * entered there.  Stage-1 has already trained DDR by now.
+             */
+            load  = (uint32_t)ldl_be_p(hdr + 16);
+            entry = (uint32_t)ldl_be_p(hdr + 20);
+            off   = bl_off;
+            size  = 64 + (uint64_t)img_size - bl_off;
+            printf("mt7621: BootROM boot step 2: bootloader 0x%" PRIx64
+                   " bytes from file 0x%x -> 0x%" PRIx64 "\n",
+                   size, bl_off, load);
         }
         if ((load & 0x1fffffff) + size > s->ram.size) {
             error_report("mt7621: image 0x%" PRIx64 "+0x%" PRIx64
@@ -217,6 +333,9 @@ static void mt7621_machine_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
     qemu_irq uart_irq;
     uint64_t ram_size = machine->ram_size;
+    int i;
+
+    mt7621_trace = getenv("MT7621_TRACE") != NULL;
 
     if (ram_size > 512 * MiB) {
         error_report("mt7621: at most 512 MiB of RAM is supported");
@@ -237,6 +356,26 @@ static void mt7621_machine_init(MachineState *machine)
                            &error_fatal);
     memory_region_add_subregion(sysmem, MT7621_RAM_BASE, &s->ram);
 
+    /*
+     * The MT7621 DRAM controller only decodes the address bits that the
+     * populated chips need, so accesses above the installed size wrap around
+     * and alias onto low memory.  Breed detects the DDR size exactly this
+     * way (write a pattern at 0, write 0 at 1<<n, read back 0), so the
+     * aliases have to exist for it to measure less than 512 MiB.
+     */
+    if (ram_size & (ram_size - 1)) {
+        error_report("mt7621: RAM size must be a power of two");
+        exit(1);
+    }
+    s->ram_alias_count = MIN(MT7621_KSEG1_WINDOW / ram_size - 1,
+                             ARRAY_SIZE(s->ram_alias));
+    for (i = 0; i < s->ram_alias_count; i++) {
+        memory_region_init_alias(&s->ram_alias[i], NULL, "mt7621.ddr-alias",
+                                 &s->ram, 0, ram_size);
+        memory_region_add_subregion(sysmem, (i + 1) * ram_size,
+                                    &s->ram_alias[i]);
+    }
+
     /* palmbus */
     memory_region_init(&s->periph, NULL, "mt7621.periph",
                        MT7621_PERIPH_SIZE);
@@ -246,6 +385,11 @@ static void mt7621_machine_init(MachineState *machine)
     s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000180; /* 25 MHz xtal, DDR3 */
     s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x00000000; /* CPU PLL 500 MHz */
     s->sysctl_regs[SYS_CUR_CLK_STS / 4]  = 0x00000101; /* /1 * 1 */
+    /*
+     * 0x3fc is polled for bit 10 before Breed's DDR3 init: it reports the
+     * DDR/PLL calibration as finished. Our DDR is always ready.
+     */
+    s->sysctl_regs[0x3fc / 4]            = 0x00000400;
     memory_region_init_io(&s->sysctl, NULL, &mt7621_reg_ops, s->sysctl_regs,
                           "mt7621.sysctl", 0x1000);
     memory_region_add_subregion(&s->periph, MT7621_SYSCTL_OFF, &s->sysctl);
@@ -254,6 +398,7 @@ static void mt7621_machine_init(MachineState *machine)
     s->dramc_regs[0x604 / 4] = 0x00000000;
     s->dramc_regs[0x618 / 4] = 0x00000190;
     s->dramc_regs[0x648 / 4] = 0x03800000;
+    s->dramc_regs[0x3fc / 4] = 0x00000400;
     memory_region_init_io(&s->dramc, NULL, &mt7621_reg_ops, s->dramc_regs,
                           "mt7621.dramc", 0x1000);
     memory_region_add_subregion(&s->periph, MT7621_DRAMC_OFF, &s->dramc);
@@ -267,6 +412,18 @@ static void mt7621_machine_init(MachineState *machine)
     memory_region_init_ram(&s->sram, NULL, "mt7621.sram",
                            MT7621_SRAM_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, MT7621_SRAM_BASE, &s->sram);
+
+    /* Coherence manager + cluster power controller */
+    memset(s->cm_regs, 0, sizeof(s->cm_regs));
+    s->cm_regs[(MT7621_GCR_OFF + GCR_CONFIG) / 4] = 0x00000004; /* 4 cores */
+    s->cm_regs[(MT7621_GCR_OFF + GCR_BASE) / 4]   = 0x1fbf8000;
+    s->cm_regs[(MT7621_GCR_OFF + GCR_REV) / 4]    = 0x00000002;
+    /* No GIC in the MT7621 CM; a CPC is present. */
+    s->cm_regs[(MT7621_GCR_OFF + GCR_GIC_STATUS) / 4] = 0x00000000;
+    s->cm_regs[(MT7621_GCR_OFF + GCR_CPC_STATUS) / 4] = 0x00000001;
+    memory_region_init_io(&s->cm, NULL, &mt7621_cm_ops, s->cm_regs,
+                          "mt7621.cm", MT7621_CM_SIZE);
+    memory_region_add_subregion(sysmem, MT7621_CM_BASE, &s->cm);
 
     uart_irq = qemu_allocate_irq(mt7621_irq_noop, s, 0);
     serial_mm_init(&s->periph, MT7621_UART0_OFF, 2, uart_irq,
@@ -303,7 +460,7 @@ static void mt7621_machine_class_init(ObjectClass *oc, const void *data)
 
     mc->desc = "MediaTek MT7621 (MIPS 1004Kc)";
     mc->init = mt7621_machine_init;
-    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("34Kf");
+    mc->default_cpu_type = MIPS_CPU_TYPE_NAME("1004Kc");
     mc->default_ram_size = 256 * MiB;
     mc->default_ram_id = "mt7621.ram";
     mc->max_cpus = 1;
