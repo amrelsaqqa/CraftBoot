@@ -30,6 +30,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "net/net.h"
+#include "qemu/main-loop.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/system.h"
@@ -422,32 +423,62 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     uint32_t base = s->eth_regs[ETH_PRX_BASE_PTR0 / 4];
     uint32_t cnt = s->eth_regs[ETH_PRX_MAX_CNT0 / 4];
     uint32_t idx = s->rx_drx_idx;
-    uint32_t desc, rxd1, rxd2;
+    uint32_t desc, rxd1, rxd2, cap;
+    bool took_bql = !bql_locked();
+    static int dbg;
 
-    if (!base || !cnt || len > 0x3fff) {
+    if (!base || !cnt) {
         return;
     }
     if (idx >= cnt) {
         idx = 0;
     }
 
+    if (took_bql) {
+        bql_lock();
+    }
+
     desc = base + idx * 16;
     rxd1 = address_space_ldl_le(&address_space_memory, desc,
                                 MEMTXATTRS_UNSPECIFIED, NULL);
+    rxd2 = address_space_ldl_le(&address_space_memory, desc + 4,
+                                MEMTXATTRS_UNSPECIFIED, NULL);
+    /* Words 16:29 of a clean descriptor hold the buffer capacity. */
+    cap = (rxd2 >> 16) & 0x3fff;
+    if (!cap) {
+        cap = 1536;
+    }
     if (!rxd1) {
-        return;
+        goto out;
+    }
+    if (len > cap) {
+        len = cap;             /* never write past the driver's buffer */
     }
 
     address_space_write(&address_space_memory, rxd1, MEMTXATTRS_UNSPECIFIED,
                         buf, len);
-    rxd2 = RX_DMA_DONE | RX_DMA_PLEN0(len);
-    address_space_stl_le(&address_space_memory, desc + 4, rxd2,
+    address_space_stl_le(&address_space_memory, desc + 4,
+                         RX_DMA_DONE | RX_DMA_PLEN0(len),
                          MEMTXATTRS_UNSPECIFIED, NULL);
 
     s->rx_drx_idx = (idx + 1) % cnt;
     s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = s->rx_drx_idx;
     s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_RX_DONE;
+
+    if (getenv("MT7621_ETHLOG") && dbg < 8) {
+        fprintf(stderr, "eth: rx[%d] desc=%08x buf=%08x len=%zu cap=%u st=%08x mask=%08x\n",
+                dbg, desc, rxd1, len, cap,
+                s->eth_regs[ETH_PDMA_INT_STATUS / 4],
+                s->eth_regs[ETH_PDMA_INT_MASK / 4]);
+        dbg++;
+    }
+
     mt7621_eth_update_irq(s);
+
+out:
+    if (took_bql) {
+        bql_unlock();
+    }
 }
 
 static bool mt7621_eth_can_receive(NetClientState *nc)
@@ -506,8 +537,10 @@ static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
                                MEMTXATTRS_UNSPECIFIED, frame, len);
             qemu_send_packet(qemu_get_queue(s->nic), frame, len);
         }
-        address_space_stl_le(&address_space_memory, p + 4,
-                             txd2 | TX_DMA_DONE, MEMTXATTRS_UNSPECIFIED, NULL);
+        /*
+         * txd2 is the link to the next descriptor in QDMA mode -- do not
+         * touch it.  Completion is published through QTX_DRX_PTR below.
+         */
         p = txd2;
     }
 
