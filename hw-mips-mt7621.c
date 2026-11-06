@@ -38,6 +38,7 @@
 #include "qemu/timer.h"
 #include "system/reset.h"
 #include "system/runstate.h"
+#include "system/block-backend.h"
 #include "target/mips/cpu-qom.h"
 #include "target/mips/internal.h"
 
@@ -189,6 +190,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(MT7621State, MT7621_MACHINE)
 #define MT7621_CHIP_MODE        1       /* SYSCFG0[3:0]: parallel NAND */
 #define SYS_CLKCFG0             0x2c
 #define SYS_RSTCTL              0x34
+#define SYS_RSTSTAT             0x38
+#define WDT_RST_CAUSE           (1u << 1)
+
+/*
+ * Ralink timer/watchdog block in the system controller's second 256 byte
+ * page (1e000100).  Linux's mt7621_wdt drives timer 1: TMR1LOAD holds the
+ * reload value in prescaler ticks, TMR1CTL bit 7 enables counting and bits
+ * 16..31 are the prescaler in microseconds.  Writing TMRSTAT bit 9 reloads
+ * (that is the "ping"); letting it run out resets the SoC.
+ */
+#define MT7621_WDT_OFF          0x100
+#define MT7621_WDT_SIZE         0x100
+#define WDT_TMRSTAT             0x00
+#define WDT_TMR1CTL             0x20
+#define WDT_TMR1LOAD            0x24
+#define WDT_TMRSTAT_RESTART     (1u << 9)
+#define WDT_TMR1CTL_ENABLE      (1u << 7)
 #define SYS_CUR_CLK_STS         0x44
 #define SYS_GPIO_MODE           0x60
 
@@ -207,6 +225,7 @@ struct MT7621State {
     MemoryRegion periph;
     MemoryRegion sysctl;
     MemoryRegion rstctl;
+    MemoryRegion wdt;
     MemoryRegion systick;
     MemoryRegion dramc;
     MemoryRegion nfi;
@@ -224,6 +243,13 @@ struct MT7621State {
     uint32_t rx_drx_idx;
     int64_t phy_link_ns;        /* when the tapped PHY reports link up */
     uint16_t phy_regs[32][32];  /* MDIO register file per address */
+
+    /* optional writable NAND image (-drive if=none,id=nand) */
+    BlockBackend *nand_blk;
+    int nand_fd;
+    bool nand_wr_error;
+    QEMUTimer *wdt_timer;
+    bool wdt_rst_cause;
     unsigned eth_port;          /* DSA user port exposed to the backend */
     uint32_t qtx_dtx;           /* forward DMA pointer (next to send) */
     uint32_t qtx_base;          /* start of the TX descriptor ring */
@@ -1197,6 +1223,128 @@ static void mt7621_nfi_page_read(MT7621State *s)
     }
 }
 
+/*
+ * Optional write-through to a block backend, so a session's NAND changes
+ * survive QEMU restarts without touching the pristine dump.  Usage:
+ *   -drive file=nand.img,if=none,id=nand,format=raw
+ * The image is seeded from the -kernel dump the first time it is used.
+ */
+static int mt7621_pwrite_all(int fd, const void *buf, size_t len, off_t off)
+{
+    const uint8_t *p = buf;
+
+    while (len) {
+        ssize_t n = pwrite(fd, p, len, off);
+
+        if (n <= 0) {
+            return -1;
+        }
+        p += n;
+        off += n;
+        len -= n;
+    }
+    return 0;
+}
+
+static void mt7621_nand_persist(MT7621State *s, uint64_t off,
+                                const void *data, uint64_t len)
+{
+    bool failed;
+
+    if (off + len > s->nand_size) {
+        return;
+    }
+    if (s->nand_fd >= 0) {
+        failed = mt7621_pwrite_all(s->nand_fd, data, len, off) < 0;
+    } else if (s->nand_blk) {
+        failed = blk_pwrite(s->nand_blk, off, len, data, 0) < 0;
+    } else {
+        return;
+    }
+    if (failed && !s->nand_wr_error) {
+        warn_report("mt7621: cannot write the NAND image, changes are "
+                    "kept in RAM only");
+        s->nand_wr_error = true;
+    }
+}
+
+static void mt7621_wdt_arm(MT7621State *s)
+{
+    uint32_t ctl = s->sysctl_regs[(MT7621_WDT_OFF + WDT_TMR1CTL) / 4];
+    uint32_t load = s->sysctl_regs[(MT7621_WDT_OFF + WDT_TMR1LOAD) / 4];
+    uint32_t prescale = (ctl >> 16) & 0xffff;
+    int64_t ns;
+
+    if (!(ctl & WDT_TMR1CTL_ENABLE) || load == 0) {
+        timer_del(s->wdt_timer);
+        return;
+    }
+    if (prescale == 0) {
+        prescale = 1;
+    }
+    ns = (int64_t)load * prescale * 1000;      /* ticks of prescale usec */
+    /* test hook: force a short bark to exercise the reset path */
+    if (getenv("MT7621_WDT_TEST_MS")) {
+        ns = strtoull(getenv("MT7621_WDT_TEST_MS"), NULL, 0) * 1000000LL;
+    }
+    timer_mod(s->wdt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+}
+
+static void mt7621_wdt_expire(void *opaque)
+{
+    MT7621State *s = opaque;
+
+    warn_report("mt7621: watchdog expired, resetting the machine");
+    s->wdt_rst_cause = true;
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+static uint64_t mt7621_wdt_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MT7621State *s = opaque;
+    uint32_t val = s->sysctl_regs[(MT7621_WDT_OFF +
+                                   (addr & (MT7621_WDT_SIZE - 1))) / 4];
+
+    if (mt7621_trace) {
+        qemu_log_mask(LOG_UNIMP, "mt7621: wdt read  %03x -> %08x\n",
+                      (unsigned)(addr & (MT7621_WDT_SIZE - 1)), val);
+    }
+    return val;
+}
+
+static void mt7621_wdt_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    MT7621State *s = opaque;
+    hwaddr off = addr & (MT7621_WDT_SIZE - 1);
+
+    if (mt7621_trace) {
+        qemu_log_mask(LOG_UNIMP, "mt7621: wdt write %03x <- %08x\n",
+                      (unsigned)off, (uint32_t)val);
+    }
+    s->sysctl_regs[(MT7621_WDT_OFF + off) / 4] = val;
+
+    switch (off) {
+    case WDT_TMRSTAT:
+        if (val & WDT_TMRSTAT_RESTART) {
+            mt7621_wdt_arm(s);
+        }
+        break;
+    case WDT_TMR1CTL:
+    case WDT_TMR1LOAD:
+        mt7621_wdt_arm(s);
+        break;
+    }
+}
+
+static const MemoryRegionOps mt7621_wdt_ops = {
+    .read = mt7621_wdt_read,
+    .write = mt7621_wdt_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
 {
     /*
@@ -1259,6 +1407,7 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
             }
             if (off + n <= s->nand_size) {
                 memcpy(s->nand + off, s->nfi_wbuf, n);
+                mt7621_nand_persist(s, off, s->nfi_wbuf, n);
             }
         }
         s->nfi_writing = false;
@@ -1276,6 +1425,8 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
 
             if (blk_start + blk_size <= s->nand_size) {
                 memset(s->nand + blk_start, 0xff, blk_size);
+                mt7621_nand_persist(s, blk_start, s->nand + blk_start,
+                                    blk_size);
             }
         }
         {
@@ -1766,6 +1917,101 @@ static const MemoryRegionOps mt7621_cm_ops = {
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+/*
+ * Attach an optional writable NAND image passed as
+ *   -drive file=nand.img,if=none,id=nand,format=raw
+ * A fresh/empty image is seeded from the dump; an existing one is used as
+ * is, so writes survive QEMU restarts while the dump stays pristine.
+ */
+static void mt7621_nand_attach(MT7621State *s)
+{
+    const char *path = getenv("MT7621_NAND_IMAGE");
+    BlockBackend *blk;
+    int64_t len;
+    int fd;
+    off_t sz;
+
+    s->nand_fd = -1;
+
+    /*
+     * Preferred: a plain image file we create and seed ourselves, so the
+     * user does not have to know the flash size:
+     *   MT7621_NAND_IMAGE=~/nand-state.img qemu-system-mipsel ...
+     */
+    if (path) {
+        if (!s->nand) {
+            warn_report("mt7621: MT7621_NAND_IMAGE needs a readable boot dump");
+            return;
+        }
+        fd = open(path, O_RDWR | O_CREAT, 0644);
+        if (fd < 0) {
+            warn_report("mt7621: cannot open NAND image %s: %s, changes will "
+                        "be kept in RAM only", path, strerror(errno));
+            return;
+        }
+        sz = lseek(fd, 0, SEEK_END);
+        if (sz < 0) {
+            warn_report("mt7621: cannot size %s", path);
+            close(fd);
+            return;
+        }
+        if ((uint64_t)sz < s->nand_size) {
+            if (mt7621_pwrite_all(fd, s->nand, s->nand_size, 0) < 0) {
+                warn_report("mt7621: cannot seed %s", path);
+                close(fd);
+                return;
+            }
+            printf("mt7621: NAND image %s seeded from the boot dump "
+                   "(%" PRIu64 " bytes)\n", path, s->nand_size);
+        } else {
+            if (pread(fd, s->nand, s->nand_size, 0) != (ssize_t)s->nand_size) {
+                warn_report("mt7621: cannot read %s", path);
+                close(fd);
+                return;
+            }
+            printf("mt7621: using persistent NAND image %s\n", path);
+        }
+        s->nand_fd = fd;
+        return;
+    }
+
+    /* Alternative, QEMU style (the file has to exist):
+     *   -drive file=nand.img,if=none,id=nand,format=raw
+     */
+    blk = blk_by_name("nand");
+    if (!blk) {
+        return;
+    }
+    if (!s->nand) {
+        warn_report("mt7621: -drive id=nand needs a readable boot dump");
+        return;
+    }
+
+    len = blk_getlength(blk);
+    if (len < 0) {
+        warn_report("mt7621: cannot size the NAND image, ignoring it");
+        return;
+    }
+    if (len < s->nand_size) {
+        if (blk_pwrite(blk, 0, s->nand_size, s->nand, 0) < 0) {
+            warn_report("mt7621: cannot seed the NAND image, changes will "
+                        "be kept in RAM only");
+            return;
+        }
+        printf("mt7621: NAND image seeded from the boot dump (%" PRIu64
+               " bytes)\n", s->nand_size);
+    } else {
+        if (blk_pread(blk, 0, s->nand_size, s->nand, 0) < 0) {
+            warn_report("mt7621: cannot read the NAND image, changes will "
+                        "be kept in RAM only");
+            return;
+        }
+        printf("mt7621: using the persistent NAND image (%" PRIu64
+               " bytes)\n", s->nand_size);
+    }
+    s->nand_blk = blk;
+}
+
 static void mt7621_load_image(MT7621State *s, const char *filename)
 {
     uint8_t hdr[64];
@@ -1937,6 +2183,15 @@ static void mt7621_sysctl_defaults(MT7621State *s)
      * DDR/PLL calibration as finished. Our DDR is always ready.
      */
     s->sysctl_regs[0x3fc / 4]            = 0x00000400;
+    /*
+     * SYSC_RSTSTAT reports the reset cause.  Keep the bit we recorded when
+     * the watchdog barked (Breed overwrites this register itself once it
+     * runs, but a real SoC latches the cause across a watchdog reset).
+     */
+    if (s->wdt_rst_cause) {
+        s->sysctl_regs[SYS_RSTSTAT / 4] = WDT_RST_CAUSE;
+        s->wdt_rst_cause = false;
+    }
 }
 
 static void mt7621_cm_defaults(MT7621State *s)
@@ -2027,6 +2282,10 @@ static void mt7621_reset(void *opaque)
 {
     MT7621State *s = opaque;
     CPUMIPSState *env = &s->cpu->env;
+
+    if (s->wdt_timer) {
+        timer_del(s->wdt_timer);
+    }
 
     /* Everything the guest programmed is gone after a real reset. */
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
@@ -2212,6 +2471,10 @@ static void mt7621_machine_init(MachineState *machine)
     memory_region_init_io(&s->rstctl, NULL, &mt7621_rstctl_ops, s,
                           "mt7621.rstctl", 4);
     memory_region_add_subregion(&s->sysctl, SYS_RSTCTL, &s->rstctl);
+    s->wdt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mt7621_wdt_expire, s);
+    memory_region_init_io(&s->wdt, NULL, &mt7621_wdt_ops, s,
+                          "mt7621.wdt", MT7621_WDT_SIZE);
+    memory_region_add_subregion(&s->sysctl, MT7621_WDT_OFF, &s->wdt);
     memory_region_add_subregion(&s->periph, MT7621_SYSCTL_OFF, &s->sysctl);
 
     /* systick: compare interrupt routed through the GIC */
@@ -2269,6 +2532,7 @@ static void mt7621_machine_init(MachineState *machine)
     if (machine->kernel_filename) {
         s->image_file = g_strdup(machine->kernel_filename);
         mt7621_nand_load(s, machine->kernel_filename);
+        mt7621_nand_attach(s);
         mt7621_load_image(s, machine->kernel_filename);
     } else {
         error_report("mt7621: no boot image (-kernel) supplied");
