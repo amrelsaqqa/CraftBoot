@@ -193,6 +193,7 @@ struct MT7621State {
     MemoryRegion sram;            /* unused, kept for layout stability */
     uint32_t eth_regs[MT7621_ETH_SIZE / 4];
     NICState *nic;
+    NICConf nic_conf;
     qemu_irq eth_irq;
     uint32_t rx_drx_idx;
     uint32_t qtx_dtx;
@@ -366,6 +367,12 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
                 (unsigned)off, val, size);
     }
 
+    if (off == ETH_QTX_DTX_PTR || off == ETH_QTX_DRX_PTR) {
+        /* ring base / last completed descriptor: track where to start */
+        s->qtx_dtx = val;
+        s->eth_regs[off >> 2] = val;
+        return;
+    }
     if (off == ETH_QTX_CTX_PTR) {
         s->eth_regs[off >> 2] = val;
         mt7621_eth_tx(s, val);
@@ -1402,14 +1409,13 @@ static void mt7621_machine_init(MachineState *machine)
     {
         NetClientState *peer = qemu_find_netdev("net0");
 
-        if (peer && getenv("MT7621_NET")) {
-            NICConf conf;
-
-            memset(&conf, 0, sizeof(conf));
-            qemu_macaddr_default_if_unset(&conf.macaddr);
-            conf.peers.ncs[0] = peer;
-            s->nic = qemu_new_nic(&mt7621_net_info, &conf, "mt7621-eth",
-                                  "mt7621-eth", NULL, s);
+        if (peer) {
+            /* The NIC keeps a pointer to this, so it must outlive init. */
+            memset(&s->nic_conf, 0, sizeof(s->nic_conf));
+            qemu_macaddr_default_if_unset(&s->nic_conf.macaddr);
+            s->nic_conf.peers.ncs[0] = peer;
+            s->nic = qemu_new_nic(&mt7621_net_info, &s->nic_conf,
+                                  "mt7621-eth", "mt7621-eth", NULL, s);
             qemu_set_info_str(qemu_get_queue(s->nic), "mt7621-eth");
         }
     }
