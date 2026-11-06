@@ -335,6 +335,13 @@ static IPQBoardState *ipq_board;/* the parts wired to it */
  */
 #define IPQ_ETH_DEFAULT_PORTS  "0,1,2,3,4,5"
 #define IPQ_ETH_DEFAULT_PHY_ID 0x004dd0b1u      /* QCA8075 */
+/*
+ * The PSGMII control block is part of the switch, not a copper PHY: it answers
+ * on MDIO address 5 (U-Boot calls it PSGMII_ID) whatever the board's front
+ * panel looks like.  A board's eth-ports names the PHYs it has; the machine
+ * adds this block on top of them whenever the bus is in use.
+ */
+#define IPQ_PSGMII_ADDR        5
 
 typedef enum IPQBootDev {
     IPQ_BOOT_NONE = 0,
@@ -420,9 +427,12 @@ typedef struct IPQBoardPreset {
  * `mikrotik-952` is a real board, and every fact in it comes from that board's
  * own device tree (the 952G_5HacD2HnD tree inside the MikroTik dump, see
  * tools/dts2xml.py and tests/dts2xml-test.sh): a 32 MiB NOR and a 1 Gbit SPI
- * NAND on chip selects 0 and 1, five MDIO PHYs at addresses 0..4 (the QCA8075's
- * block at 5 is not in the tree, so it is not on the bus), and three lamp lines
- * -- user-led on pin 3, power-led on 0, the USB power line on 2, active low.
+ * NAND on chip selects 0 and 1, five copper MDIO PHYs at addresses 0..4, and
+ * three lamp lines -- user-led on pin 3, power-led on 0, the USB power line on
+ * 2, active low.  The switch's PSGMII control block at address 5 is not in
+ * that tree (RouterOS never addresses it) but it belongs to the switch, so
+ * the machine puts it on the bus for every board that has one; see
+ * IPQ_PSGMII_ADDR.
  *
  * What a preset deliberately cannot carry is a button's *behaviour*: the tree
  * says a switch is on pin 63 and another on pin 5, but not that the first one
@@ -6968,6 +6978,18 @@ static IPQMdio *add_mdio(MemoryRegion *parent, const char *dtb_path)
         }
     } else {
         mdio_parse_ports(m, IPQ_ETH_DEFAULT_PORTS, ipq_cfg.eth_phy_id);
+    }
+
+    /*
+     * The switch's PSGMII control block is not a front-panel PHY but it is on
+     * the same bus, at address 5.  It has to answer even when the board named
+     * only its copper PHYs: RouterOS's device tree leaves it out because its
+     * driver never addresses it, while OpenWrt's tree hangs `psgmii-phy@5`
+     * off the mdio node and qca8k refuses to bind when that read fails
+     * ("unable to get PSGMII eth PHY") -- no DSA ports, no bridge, nothing.
+     */
+    if (m->nphy && !mdio_lookup(m, IPQ_PSGMII_ADDR)) {
+        mdio_add_phy(m, IPQ_PSGMII_ADDR, 1000, ipq_cfg.eth_phy_id, 1);
     }
 
     ipq->mdio = m;
