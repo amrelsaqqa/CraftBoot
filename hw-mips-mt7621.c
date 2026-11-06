@@ -367,6 +367,11 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
             return (w >> 16) & 0xffff;
         }
         s->sw_r = r;
+        /* HWTRAP (0x7800) must never read back zero: the probe polls it. */
+        if ((((unsigned)s->sw_page << 6) | ((unsigned)r << 2)) == 0x7800 &&
+            *mt7621_sw_word(s, s->sw_page, r) == 0) {
+            *mt7621_sw_word(s, s->sw_page, r) = 1;
+        }
         if (getenv("MT7621_ETHLOG")) {
             fprintf(stderr, "eth: sw rd page=%03x r=%x -> %08x\n",
                     s->sw_page, r, *mt7621_sw_word(s, s->sw_page, r));
@@ -438,6 +443,15 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
                     uint32_t *w = mt7621_sw_word(s, s->sw_page, s->sw_r);
 
                     *w = (*w & 0xffff) | (data << 16);
+                    /*
+                     * MT7530_ATC (0x90): the driver starts an address-table
+                     * operation and polls ATC_BUSY (bit 31) until it clears.
+                     * Complete it immediately.
+                     */
+                    if ((((unsigned)s->sw_page << 6) |
+                         ((unsigned)s->sw_r << 2)) == 0x90) {
+                        *w &= ~0x80000000u;
+                    }
                 } else {
                     uint32_t *w;
 
