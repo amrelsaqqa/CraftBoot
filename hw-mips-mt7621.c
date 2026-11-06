@@ -160,10 +160,36 @@ struct MT7621State {
 
 static bool mt7621_trace;
 
+/*
+ * The GPIO block lives inside the system controller.  Bits set in the
+ * direction register drive the pin, every other bit is an input.  The board
+ * wires its buttons active-low with pull-ups, so an *idle* input reads 1;
+ * echoing the output latch back for input bits makes an unconnected pin look
+ * permanently pressed (Breed then aborts autoboot with "button press").
+ */
+#define SYS_GPIO_CTRL           0x600
+#define SYS_GPIO_DATA           0x620
+#define SYS_GPIO_DSET           0x634
+#define SYS_GPIO_DCLR           0x638
+#define SYS_GPIO_MASK           0x00ffffffu
+
+static uint32_t mt7621_gpio_inputs(uint32_t *regs)
+{
+    uint32_t dir = regs[SYS_GPIO_CTRL / 4] & SYS_GPIO_MASK;
+    uint32_t out = regs[SYS_GPIO_DATA / 4] & dir;
+
+    /* Input bits read their pulled-up idle level. */
+    return out | (~dir & SYS_GPIO_MASK);
+}
+
 static uint64_t mt7621_reg_read(void *opaque, hwaddr addr, unsigned size)
 {
     uint32_t *regs = opaque;
     uint32_t val = regs[(addr & 0xfff) >> 2];
+
+    if ((addr & 0xfff) == SYS_GPIO_DATA) {
+        val = mt7621_gpio_inputs(regs);
+    }
 
     if (mt7621_trace) {
         qemu_log_mask(LOG_UNIMP, "mt7621: reg read  %08" HWADDR_PRIx
@@ -181,6 +207,27 @@ static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
         qemu_log_mask(LOG_UNIMP, "mt7621: reg write %08" HWADDR_PRIx
                       " <- %08" PRIx64 "\n", addr, val);
     }
+
+    switch (addr & 0xfff) {
+    case SYS_GPIO_DATA:
+    {
+        /* Only pins configured as outputs latch a value. */
+        uint32_t dir = regs[SYS_GPIO_CTRL / 4] & SYS_GPIO_MASK;
+
+        regs[SYS_GPIO_DATA / 4] =
+            (regs[SYS_GPIO_DATA / 4] & ~dir) | ((uint32_t)val & dir);
+        return;
+    }
+    case SYS_GPIO_DSET:
+        regs[SYS_GPIO_DATA / 4] |= (uint32_t)val;
+        return;
+    case SYS_GPIO_DCLR:
+        regs[SYS_GPIO_DATA / 4] &= ~(uint32_t)val;
+        return;
+    default:
+        break;
+    }
+
     regs[(addr & 0xfff) >> 2] = val;
 }
 
@@ -655,7 +702,12 @@ static void mt7621_machine_init(MachineState *machine)
                        MT7621_PERIPH_SIZE);
 
     memset(s->sysctl_regs, 0, sizeof(s->sysctl_regs));
-    s->sysctl_regs[SYS_CHIP_REV_ID / 4]  = 0x00000000;
+    /*
+     * SYS_CHIP_REV_ID, decoded the way U-Boot and Breed do it:
+     * bit 17 = CPU_ID (second core present), bit 16 = PKG_ID, bits 11:8
+     * = version, bits 3:0 = eco.  A real MT7621A has both bits set.
+     */
+    s->sysctl_regs[SYS_CHIP_REV_ID / 4]  = 0x00030000 | (1 << 8) | 0;
     s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000180; /* 25 MHz xtal, DDR3 */
     s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x00000000; /* CPU PLL 500 MHz */
     s->sysctl_regs[SYS_CUR_CLK_STS / 4]  = 0x00000101; /* /1 * 1 */
