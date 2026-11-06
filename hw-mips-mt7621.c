@@ -180,6 +180,15 @@ struct MT7621State {
     uint32_t nfi_row;
     uint32_t nfi_served;
     uint32_t nfi_last_cmd;
+    /* Address bytes the kernel driver sends one at a time via COLADDR. */
+    uint8_t nfi_addr[8];
+    uint32_t nfi_addr_len;
+    uint32_t nfi_addr_pending;
+
+    /* page program buffer */
+    uint8_t nfi_wbuf[MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE];
+    uint32_t nfi_wbuf_len;
+    bool nfi_writing;
     uint32_t cm_regs[MT7621_CM_SIZE / 4];
 
     /* systick state: count = base + elapsed, anchored at base_ns */
@@ -310,12 +319,45 @@ static void mt7621_nfi_fifo_put(MT7621State *s, const void *data, size_t len)
     s->nfi_fifo_pos = 0;
 }
 
+/*
+ * The Linux driver sends each address byte on its own (COLADDR followed by
+ * ADDRNOB = 1); two column bytes and three row bytes make up a page
+ * address.  Breed instead programs the count once, so fall back to the
+ * COLADDR/ROWADDR fields when no byte stream was collected.
+ */
+static uint64_t mt7621_nfi_addr_col(MT7621State *s)
+{
+    if (s->nfi_addr_len >= 2) {
+        s->nfi_col = s->nfi_addr[0] | (s->nfi_addr[1] << 8);
+    }
+    return s->nfi_col;
+}
+
+static uint64_t mt7621_nfi_addr_row(MT7621State *s)
+{
+    if (s->nfi_addr_len >= 3) {
+        uint64_t row = s->nfi_addr[2];
+
+        if (s->nfi_addr_len > 3) {
+            row |= (uint64_t)s->nfi_addr[3] << 8;
+        }
+        if (s->nfi_addr_len > 4) {
+            row |= (uint64_t)s->nfi_addr[4] << 16;
+        }
+        s->nfi_row = row;
+    }
+    return s->nfi_row;
+}
+
 static void mt7621_nfi_page_read(MT7621State *s)
 {
     uint8_t buf[MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE];
     uint64_t off;
 
     memset(buf, 0xff, sizeof(buf));
+
+    mt7621_nfi_addr_col(s);
+    mt7621_nfi_addr_row(s);
 
     off = (uint64_t)s->nfi_row * MT7621_NAND_PAGE_SIZE;
     if (s->nand && off < s->nand_size) {
@@ -327,16 +369,7 @@ static void mt7621_nfi_page_read(MT7621State *s)
         memcpy(buf, s->nand + off, n);
     }
 
-    if (mt7621_trace) {
-        fprintf(stderr, "mt7621: nand page read row=%u, previous transfer "
-                "served %u bytes\n", s->nfi_row, s->nfi_served);
-    }
     s->nfi_served = 0;
-    if (getenv("MT7621_NFILOG")) {
-        fprintf(stderr, "page row=%x off=%llx data=%02x%02x%02x%02x\n",
-                s->nfi_row, (unsigned long long)off,
-                buf[0], buf[1], buf[2], buf[3]);
-    }
     mt7621_nfi_fifo_put(s, buf, sizeof(buf));
 
     /* Honour the column address: 2048..2111 selects the spare area. */
@@ -366,6 +399,22 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
     }
     s->nfi_served = 0;
     s->nfi_last_cmd = cmd;
+    /*
+     * Only commands that begin a new operation restart the address byte
+     * stream; program/erase confirm (0x10/0xd0) and read start (0x30)
+     * must still see the address they were given.
+     */
+    switch (cmd) {
+    case 0x00:
+    case 0x60:
+    case 0x80:
+    case 0x90:
+    case 0xff:
+        s->nfi_addr_len = 0;
+        break;
+    default:
+        break;
+    }
 
     switch (cmd) {
     case 0x90:                          /* read id */
@@ -376,6 +425,44 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
         break;
     case 0x70:                          /* read status */
         mt7621_nfi_fifo_put(s, &status, 1);
+        break;
+    case 0x80:                          /* page program */
+        s->nfi_wbuf_len = 0;
+        s->nfi_writing = true;
+        break;
+    case 0x10:                          /* program confirm */
+        if (s->nfi_writing && s->nand) {
+            uint64_t off = mt7621_nfi_addr_row(s) * MT7621_NAND_PAGE_SIZE;
+            uint32_t n = s->nfi_wbuf_len;
+
+            if (n > MT7621_NAND_PAGE_SIZE) {
+                n = MT7621_NAND_PAGE_SIZE;
+            }
+            if (off + n <= s->nand_size) {
+                memcpy(s->nand + off, s->nfi_wbuf, n);
+            }
+        }
+        s->nfi_writing = false;
+        {
+            uint8_t st = 0xe0;
+            mt7621_nfi_fifo_put(s, &st, 1);
+        }
+        break;
+    case 0xd0:                          /* erase confirm */
+        if (s->nand) {
+            uint64_t row = mt7621_nfi_addr_row(s);
+            uint64_t blk_start = (row / MT7621_NAND_PAGES_BLK) *
+                                 MT7621_NAND_PAGES_BLK * MT7621_NAND_PAGE_SIZE;
+            uint64_t blk_size = (uint64_t)MT7621_NAND_PAGES_BLK * MT7621_NAND_PAGE_SIZE;
+
+            if (blk_start + blk_size <= s->nand_size) {
+                memset(s->nand + blk_start, 0xff, blk_size);
+            }
+        }
+        {
+            uint8_t st = 0xe0;
+            mt7621_nfi_fifo_put(s, &st, 1);
+        }
         break;
     case 0x00:                          /* read setup / reset */
     case 0xff:
@@ -449,15 +536,26 @@ static uint64_t mt7621_nfi_read(void *opaque, hwaddr addr, unsigned size)
         break;
     }
     case NFI_PIO_DIRDY:
-        val = (s->nfi_fifo_pos < s->nfi_fifo_len) ? 1 : 0;
+        if (s->nfi_writing) {
+            val = 1;            /* always ready to accept write data */
+        } else {
+            val = (s->nfi_fifo_pos < s->nfi_fifo_len) ? 1 : 0;
+        }
+        if (getenv("MT7621_NFILOG") && !val) {
+            fprintf(stderr, "pio not ready: last cmd %02x col %x row %x addrlen %u\n",
+                    s->nfi_last_cmd, s->nfi_col, s->nfi_row, s->nfi_addr_len);
+        }
         break;
     case NFI_INTR_STA:
         /* Report everything the firmware enabled as already pending. */
         val = s->nfi_regs[NFI_INTR_EN >> 2];
         break;
     case NFI_STA:
-    case NFI_ADDRCNTR:
         val = 0;
+        break;
+    case NFI_ADDRCNTR:
+        /* sector counter used to detect program completion */
+        val = s->nfi_writing ? 0x00000010 : 0x00000010;
         break;
     case 0xa0 ... 0xbf:
         /*
@@ -507,6 +605,16 @@ static void mt7621_nfi_write(void *opaque, hwaddr addr, uint64_t val,
     }
 
     switch (off) {
+    case NFI_DATAW:
+        if (s->nfi_writing) {
+            unsigned i;
+
+            for (i = 0; i < size && s->nfi_wbuf_len < sizeof(s->nfi_wbuf); i++) {
+                s->nfi_wbuf[s->nfi_wbuf_len++] =
+                    ((uint32_t)val >> (8 * i)) & 0xff;
+            }
+        }
+        return;
     case NFI_CMD:
         s->nfi_regs[off >> 2] = (uint32_t)val;
         mt7621_nfi_cmd(s, (uint32_t)val);
@@ -520,10 +628,24 @@ static void mt7621_nfi_write(void *opaque, hwaddr addr, uint64_t val,
             s->nfi_row = 0;
         }
         return;
-    case NFI_COLADDR:
-        if (getenv("MT7621_NFILOG")) {
-            fprintf(stderr, "coladdr <- %x\n", (unsigned)val);
+    case NFI_ADDRNOB:
+        /*
+         * Two conventions: Breed programs a cycle count once (e.g. 0x22 =
+         * two column + two row cycles) with the values in COLADDR/ROWADDR,
+         * while the Linux driver sends every address byte separately as
+         * COLADDR followed by ADDRNOB = 1.  Accumulate the byte stream.
+         */
+        s->nfi_regs[off >> 2] = (uint32_t)val;
+        if (val == 1) {
+            if (s->nfi_addr_len < ARRAY_SIZE(s->nfi_addr)) {
+                s->nfi_addr[s->nfi_addr_len++] = s->nfi_addr_pending & 0xff;
+            }
+        } else {
+            s->nfi_addr_len = 0;
         }
+        return;
+    case NFI_COLADDR:
+        s->nfi_addr_pending = (uint32_t)val;
         s->nfi_col = (uint32_t)val;
         s->nfi_regs[off >> 2] = (uint32_t)val;
         return;
