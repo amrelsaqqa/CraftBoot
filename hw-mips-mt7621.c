@@ -140,6 +140,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(MT7621State, MT7621_MACHINE)
  */
 #define TX_DMA_OWNER_CPU        (1u << 31)
 #define TX_DMA_FPORT_SHIFT      25
+#define TX_DMA_TSO              (1u << 28)
+#define TX_DMA_LS0              (1u << 30)   /* last buffer of this frame */
+#define TX_DMA_CHKSUM           (0x7u << 29)
 /* QDMA TX ring: 2048 descriptors of 16 bytes. */
 #define TX_RING_BYTES           0x8000
 
@@ -704,16 +707,269 @@ static NetClientInfo mt7621_net_info = {
  * from the last completed descriptor, hand each buffer to the net backend
  * and publish the new done pointer.
  */
+/*
+ * The driver leaves TCP/UDP checksums to the MAC (NETIF_F_HW_CSUM): the
+ * stack fills the checksum field with the pseudo-header sum and sets
+ * TX_DMA_CHKSUM in txd4.  Finish the job here, otherwise every TCP segment
+ * leaves with a bogus checksum and the peer silently drops it.
+ */
+static void mt7621_eth_tx_csum(uint8_t *frame, size_t len)
+{
+    size_t l3 = 14, l4 = 0, l4_len = 0, csum_off;
+    unsigned eth, proto, ihl, tot;
+
+    if (len < 34) {
+        return;
+    }
+    eth = (frame[12] << 8) | frame[13];
+    if (eth == 0x8100 || eth == 0x88a8) {
+        if (len < 38) {
+            return;
+        }
+        eth = (frame[16] << 8) | frame[17];
+        l3 = 18;
+    }
+
+    if (eth == 0x0800) {                    /* IPv4 */
+        if (len < l3 + 20 || (frame[l3] >> 4) != 4) {
+            return;
+        }
+        ihl = (frame[l3] & 0xf) * 4;
+        if (ihl < 20 || len < l3 + ihl) {
+            return;
+        }
+        if (((frame[l3 + 6] << 8) | frame[l3 + 7]) & 0x1fff) {
+            return;                         /* fragment: checksum is final */
+        }
+        tot = (frame[l3 + 2] << 8) | frame[l3 + 3];
+        if (tot < ihl) {
+            return;
+        }
+        proto = frame[l3 + 9];
+        l4 = l3 + ihl;
+        l4_len = tot - ihl;
+    } else if (eth == 0x86dd) {             /* IPv6 */
+        if (len < l3 + 40 || (frame[l3] >> 4) != 6) {
+            return;
+        }
+        proto = frame[l3 + 6];
+        l4 = l3 + 40;
+        l4_len = (frame[l3 + 4] << 8) | frame[l3 + 5];
+    } else {
+        return;
+    }
+
+    switch (proto) {
+    case 6:                                 /* TCP */
+    case 17:                                /* UDP */
+        csum_off = (proto == 6) ? 16 : 6;
+        break;
+    case 1:                                 /* ICMP */
+    case 58:                                /* ICMPv6 */
+        csum_off = 2;
+        break;
+    default:
+        return;                             /* header with extensions, etc. */
+    }
+
+    if (len < l4 + csum_off + 2) {
+        return;
+    }
+    if (l4_len > len - l4) {
+        l4_len = len - l4;                  /* truncated: sum what we have */
+    }
+
+    {
+        uint32_t sum = 0;
+        size_t i;
+        uint16_t c;
+
+        for (i = 0; i + 1 < l4_len; i += 2) {
+            sum += (frame[l4 + i] << 8) | frame[l4 + i + 1];
+        }
+        if (l4_len & 1) {
+            sum += frame[l4 + l4_len - 1] << 8;
+        }
+        while (sum >> 16) {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        c = ~sum;
+        if (!c) {
+            c = 0xffff;
+        }
+        frame[l4 + csum_off] = c >> 8;
+        frame[l4 + csum_off + 1] = c & 0xff;
+    }
+}
+
+/*
+ * TSO: the driver hands us one oversized TCP segment and puts the MSS in the
+ * checksum field (mtk_start_xmit does tcp_hdr(skb)->check = gso_size).  Split
+ * it into MTU-sized frames, fixing up the IP length/id, the sequence number
+ * and both checksums.
+ */
+static void mt7621_eth_tx_tso(MT7621State *s, const uint8_t *frame, size_t len)
+{
+    uint8_t out[1600];
+    size_t l3 = 14;
+    unsigned eth, proto, ihl, doff, hdr, payload_len, mss, off, room;
+
+    if (len < 54) {
+        return;
+    }
+    eth = (frame[12] << 8) | frame[13];
+    if (eth == 0x8100 || eth == 0x88a8) {
+        if (len < 58) {
+            return;
+        }
+        eth = (frame[16] << 8) | frame[17];
+        l3 = 18;
+    }
+    if (eth != 0x0800 && eth != 0x86dd) {
+        return;
+    }
+    if (eth == 0x0800) {
+        ihl = (frame[l3] & 0xf) * 4;
+        proto = frame[l3 + 9];
+        payload_len = ((frame[l3 + 2] << 8) | frame[l3 + 3]) - ihl;
+    } else {
+        ihl = 40;
+        proto = frame[l3 + 6];
+        payload_len = (frame[l3 + 4] << 8) | frame[l3 + 5];
+    }
+    if (proto != 6 || ihl < 20 || len < l3 + ihl + 20) {
+        return;
+    }
+    doff = ((frame[l3 + ihl + 12] >> 4) & 0xf) * 4;
+    if (doff < 20 || l3 + ihl + doff > len) {
+        return;
+    }
+    if (payload_len > len - l3 - ihl - doff) {
+        payload_len = len - l3 - ihl - doff;
+    }
+
+    mss = (frame[l3 + ihl + 16] << 8) | frame[l3 + ihl + 17];
+    room = (eth == 0x0800) ? (1514 - l3 - ihl - doff)
+                           : (1514 - l3 - ihl - doff);
+    if (mss == 0 || mss > room) {
+        mss = room;
+    }
+    if ((int)room <= 0) {
+        return;
+    }
+    hdr = l3 + ihl + doff;
+
+    for (off = 0; off < payload_len; off += mss) {
+        unsigned chunk = payload_len - off;
+        bool last;
+        uint32_t sum = 0;
+        size_t i;
+        uint16_t c;
+
+        if (chunk > mss) {
+            chunk = mss;
+        }
+        last = (off + chunk >= payload_len);
+
+        memcpy(out, frame, hdr);
+        memcpy(out + hdr, frame + hdr + off, chunk);
+
+        /* IPv4 header: total length, id and checksum */
+        if (eth == 0x0800) {
+            out[l3 + 2] = (ihl + doff + chunk) >> 8;
+            out[l3 + 3] = (ihl + doff + chunk) & 0xff;
+            sum = 0;
+            for (i = 0; i < ihl; i += 2) {
+                sum += (out[l3 + i] << 8) | out[l3 + i + 1];
+            }
+            while (sum >> 16) {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            c = ~sum;
+            out[l3 + 10] = c >> 8;
+            out[l3 + 11] = c & 0xff;
+        }
+        /* TCP sequence number advances with the payload */
+        {
+            uint32_t seq = ((uint32_t)out[l3 + ihl + 4] << 24) |
+                           (out[l3 + ihl + 5] << 16) |
+                           (out[l3 + ihl + 6] << 8) | out[l3 + ihl + 7];
+
+            seq += off;
+            out[l3 + ihl + 4] = seq >> 24;
+            out[l3 + ihl + 5] = seq >> 16;
+            out[l3 + ihl + 6] = seq >> 8;
+            out[l3 + ihl + 7] = seq;
+        }
+        /* PSH only on the final segment */
+        out[l3 + ihl + 12] = (out[l3 + ihl + 12] & 0xf0) | (doff / 4);
+        if (last) {
+            out[l3 + ihl + 13] |= 0x08;
+        } else {
+            out[l3 + ihl + 13] &= ~0x08;
+        }
+        /* TCP checksum over pseudo header + segment */
+        out[l3 + ihl + 16] = 0;
+        out[l3 + ihl + 17] = 0;
+        sum = 0;
+        if (eth == 0x0800) {
+            sum += (out[l3 + 12] << 8) | out[l3 + 13];
+            sum += (out[l3 + 14] << 8) | out[l3 + 15];
+            sum += (out[l3 + 16] << 8) | out[l3 + 17];
+            sum += (out[l3 + 18] << 8) | out[l3 + 19];
+        } else {
+            for (i = 8; i < 40; i += 2) {
+                sum += (out[l3 + i] << 8) | out[l3 + i + 1];
+            }
+        }
+        sum += 6;
+        sum += doff + chunk;
+        for (i = 0; i < doff + chunk; i += 2) {
+            unsigned hi = out[l3 + ihl + i];
+            unsigned lo = (i + 1 < doff + chunk) ?
+                          out[l3 + ihl + i + 1] : 0;
+
+            sum += (hi << 8) | lo;
+        }
+        while (sum >> 16) {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        c = ~sum;
+        if (!c) {
+            c = 0xffff;
+        }
+        out[l3 + ihl + 16] = c >> 8;
+        out[l3 + ihl + 17] = c & 0xff;
+
+        if (s->nic) {
+            qemu_send_packet(qemu_get_queue(s->nic), out, hdr + chunk);
+        }
+    }
+}
+
 static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
 {
     uint32_t p = s->qtx_dtx;
     uint32_t base = s->qtx_base;
     int guard = 0;
     unsigned sent = 0;
+    /*
+     * One frame can span several descriptors (skb head + page fragments);
+     * the engine concatenates them until it meets TX_DMA_LS0.  Keep the
+     * partially assembled frame across calls.
+     */
+    static uint8_t frame[0x10000];
+    static size_t flen;
+    static bool frame_started;
+    static unsigned frame_fport;
+    static bool frame_csum;
+    static bool frame_tso;
 
     if (!base || p < base || p >= base + TX_RING_BYTES ||
         ctx < base || ctx >= base + TX_RING_BYTES) {
         /* the ring was re-allocated: resynchronise and send nothing */
+        flen = 0;
+        frame_started = false;
         s->qtx_dtx = ctx;
         s->qtx_base = ctx;
         return;
@@ -734,49 +990,65 @@ static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
                                              MEMTXATTRS_UNSPECIFIED, NULL);
         unsigned len = (txd3 >> 16) & 0x3fff;
         bool filled = !(txd3 & TX_DMA_OWNER_CPU);
-        bool forward = false;
+        bool last = !!(txd3 & TX_DMA_LS0);
 
-        if (filled && txd1 && len && s->nic) {
-            uint8_t frame[0x4000];
-            unsigned fport = (txd4 >> TX_DMA_FPORT_SHIFT) & 0x7;
-
-            if (len > sizeof(frame)) {
-                len = sizeof(frame);
+        if (filled && txd1 && len) {
+            if (!frame_started) {
+                frame_started = true;
+                frame_fport = (txd4 >> TX_DMA_FPORT_SHIFT) & 0x7;
+                frame_csum = !!(txd4 & TX_DMA_CHKSUM);
+                frame_tso = !!(txd4 & TX_DMA_TSO);
+            }
+            if (len > sizeof(frame) - flen) {
+                len = sizeof(frame) - flen;
             }
             address_space_read(&address_space_memory, txd1,
-                               MEMTXATTRS_UNSPECIFIED, frame, len);
+                               MEMTXATTRS_UNSPECIFIED, frame + flen, len);
+            flen += len;
 
-            /*
-             * Frames sent through GMAC1 (the DSA master) carry the MTK
-             * special tag at offset 12: byte 12 is the tag type and byte 13
-             * the destination port bitmap.  Only frames the switch would
-             * put on our port may leave through this backend; GMAC2 (the
-             * wan MAC) is not behind the switch at all.
-             */
-            if (fport == 1) {
-                if (len > 18 && (frame[12] & 0xfe) <= 2 &&
-                    !(frame[13] & 0xc0)) {
-                    if (frame[13] & (1u << s->eth_port)) {
-                        memmove(frame + 12, frame + 16, len - 16);
-                        len -= 4;
-                        forward = true;
+            if (last) {
+                bool forward = false;
+
+                /*
+                 * Frames sent through GMAC1 (the DSA master) carry the MTK
+                 * special tag at offset 12: byte 12 is the tag type and
+                 * byte 13 the destination port bitmap.  Only frames the
+                 * switch would put on our port may leave through this
+                 * backend; GMAC2 (the wan MAC) is not behind the switch.
+                 */
+                if (frame_fport == 1 && flen > 18) {
+                    if ((frame[12] & 0xfe) <= 2 && !(frame[13] & 0xc0)) {
+                        if (frame[13] & (1u << s->eth_port)) {
+                            memmove(frame + 12, frame + 16, flen - 16);
+                            flen -= 4;
+                            forward = true;
+                        }
+                    } else {
+                        forward = true;     /* untagged conduit frame */
                     }
-                } else {
-                    forward = true;     /* untagged conduit frame */
                 }
-            }
 
-            if (forward && getenv("MT7621_ETHLOG") && sent < 4) {
-                fprintf(stderr, "eth: txf dst=%02x:%02x:%02x:%02x:%02x:%02x "
-                        "src=%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x "
-                        "len=%u\n",
-                        frame[0], frame[1], frame[2], frame[3], frame[4],
-                        frame[5], frame[6], frame[7], frame[8], frame[9],
-                        frame[10], frame[11], frame[12], frame[13], len);
-            }
-            if (forward) {
-                qemu_send_packet(qemu_get_queue(s->nic), frame, len);
-                sent++;
+                if (forward && frame_tso) {
+                    mt7621_eth_tx_tso(s, frame, flen);
+                    forward = false;
+                } else if (forward && frame_csum) {
+                    mt7621_eth_tx_csum(frame, flen);
+                }
+
+                if (forward && getenv("MT7621_ETHLOG") && sent < 8) {
+                    fprintf(stderr, "eth: txf dst=%02x:%02x:%02x:%02x:%02x:%02x "
+                            "src=%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x "
+                            "len=%zu\n",
+                            frame[0], frame[1], frame[2], frame[3], frame[4],
+                            frame[5], frame[6], frame[7], frame[8], frame[9],
+                            frame[10], frame[11], frame[12], frame[13], flen);
+                }
+                if (forward && s->nic) {
+                    qemu_send_packet(qemu_get_queue(s->nic), frame, flen);
+                    sent++;
+                }
+                flen = 0;
+                frame_started = false;
             }
         }
 
