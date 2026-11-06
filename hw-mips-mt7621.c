@@ -37,6 +37,7 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "target/mips/cpu-qom.h"
 #include "target/mips/internal.h"
 
@@ -122,6 +123,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MT7621State, MT7621_MACHINE)
 #define ETH_PRX_DRX_IDX0        0x090c
 #define ETH_PDMA_INT_STATUS     0x0a20
 #define ETH_PDMA_INT_MASK       0x0a28
+#define ETH_QDMA_GLO_CFG        0x1a04
 #define ETH_QTX_CTX_PTR         0x1b00
 #define ETH_QTX_DTX_PTR         0x1b04
 #define ETH_QTX_DRX_PTR         0x1b14
@@ -130,7 +132,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(MT7621State, MT7621_MACHINE)
 
 #define PDMA_RX_DONE            (1u << 30)
 #define QDMA_TX_DONE            (1u << 28)
-#define TX_DMA_DONE             (1u << 31)
+/*
+ * TX descriptor ownership: the CPU fills a descriptor (owner bit clear) and
+ * the DMA engine sets it again once the frame has left the chip.  The driver
+ * only reclaims descriptors whose owner bit is set, so it must be written
+ * back here.
+ */
+#define TX_DMA_OWNER_CPU        (1u << 31)
+#define TX_DMA_FPORT_SHIFT      25
+/* QDMA TX ring: 2048 descriptors of 16 bytes. */
+#define TX_RING_BYTES           0x8000
+
+/* RX descriptor bits. */
+#define RX_DMA_FPORT_SHIFT      19
+#define RX_DMA_SPECIAL_TAG      (1u << 22)
 #define TX_DMA_PLEN0(x)         ((((x) & 0x3fff)) << 16)
 #define RX_DMA_DONE             (1u << 31)
 #define RX_DMA_PLEN0(x)         ((((x) & 0x3fff)) << 16)
@@ -204,7 +219,9 @@ struct MT7621State {
     qemu_irq eth_irq;
     uint32_t rx_drx_idx;
     unsigned eth_port;          /* DSA user port exposed to the backend */
-    uint32_t qtx_dtx;
+    uint32_t qtx_dtx;           /* forward DMA pointer (next to send) */
+    uint32_t qtx_base;          /* start of the TX descriptor ring */
+    bool qtx_en;                /* QDMA TX DMA enable */
     MemoryRegion cm;
     MemoryRegion eth;
     MemoryRegion ram_alias[8];
@@ -407,15 +424,33 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
                 (unsigned)off, val, size);
     }
 
-    if (off == ETH_QTX_DTX_PTR || off == ETH_QTX_DRX_PTR) {
-        /* ring base / last completed descriptor: track where to start */
+    if (off == ETH_QDMA_GLO_CFG) {
+        s->qtx_en = !!(val & 1);
+        s->eth_regs[off >> 2] = val;
+        return;
+    }
+    if (off == ETH_QTX_DTX_PTR) {
+        /*
+         * The driver points this at the start of a freshly allocated ring
+         * before enabling the DMA, so it is both the forward pointer and
+         * the ring base.
+         */
         s->qtx_dtx = val;
+        s->qtx_base = val;
+        s->eth_regs[off >> 2] = val;
+        return;
+    }
+    if (off == ETH_QTX_DRX_PTR) {
         s->eth_regs[off >> 2] = val;
         return;
     }
     if (off == ETH_QTX_CTX_PTR) {
         s->eth_regs[off >> 2] = val;
-        mt7621_eth_tx(s, val);
+        /* Kicks that arrive while the engine is off (ring setup) are
+         * ignored, exactly like the hardware does. */
+        if (s->qtx_en) {
+            mt7621_eth_tx(s, val);
+        }
         return;
     }
     if (off == ETH_PDMA_INT_STATUS) {
@@ -425,6 +460,28 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
     }
     if (off == ETH_QDMA_INT_STATUS) {
         s->eth_regs[off >> 2] &= ~val;
+        mt7621_eth_update_irq(s);
+        return;
+    }
+    if (off == ETH_PRX_BASE_PTR0) {
+        /* new RX ring: the DMA restarts at descriptor 0 */
+        s->eth_regs[off >> 2] = val;
+        s->rx_drx_idx = 0;
+        return;
+    }
+    if (off == ETH_PRX_MAX_CNT0) {
+        s->eth_regs[off >> 2] = val;
+        if (s->rx_drx_idx >= val) {
+            s->rx_drx_idx = 0;
+        }
+        return;
+    }
+    if (off == ETH_QDMA_INT_MASK || off == ETH_PDMA_INT_MASK) {
+        /*
+         * A level-triggered line must drop as soon as the driver masks the
+         * source, otherwise the CPU stays in the interrupt handler forever.
+         */
+        s->eth_regs[off >> 2] = val;
         mt7621_eth_update_irq(s);
         return;
     }
@@ -493,16 +550,33 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     uint32_t base = s->eth_regs[ETH_PRX_BASE_PTR0 / 4];
     uint32_t cnt = s->eth_regs[ETH_PRX_MAX_CNT0 / 4];
     uint32_t idx = s->rx_drx_idx;
-    uint32_t desc, rxd1, rxd2, cap;
-    uint8_t buf_copy[1600];
+    uint32_t desc, rxd1, rxd2, cap, crx;
+    uint8_t tagged[1600];
+    size_t flen;
     bool took_bql = !bql_locked();
     static int dbg;
 
-    if (!base || !cnt) {
+    if (!base || !cnt || len < 14) {
+        if (getenv("MT7621_ETHLOG")) {
+            fprintf(stderr, "eth: rx drop no-ring base=%08x cnt=%u len=%zu\n",
+                    base, cnt, len);
+        }
         return;
     }
     if (idx >= cnt) {
         idx = 0;
+    }
+
+    /*
+     * Sanity guard against a desynchronised ring: never reuse the
+     * descriptor the driver has just handed back.
+     */
+    crx = s->eth_regs[ETH_PRX_CRX_IDX0 / 4];
+    if (idx == crx) {
+        if (getenv("MT7621_ETHLOG")) {
+            fprintf(stderr, "eth: rx drop ring-full idx=%u crx=%u\n", idx, crx);
+        }
+        return;
     }
 
     if (took_bql) {
@@ -520,47 +594,77 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
         cap = 1536;
     }
     if (!rxd1) {
+        if (getenv("MT7621_ETHLOG")) {
+            fprintf(stderr, "eth: rx drop no-buffer idx=%u desc=%08x\n",
+                    idx, desc);
+        }
         goto out;
     }
-    if (len > cap) {
-        len = cap;             /* never write past the driver's buffer */
-    }
 
-    {
-        uint8_t tagged[1600];
-
-        if (len >= 14 && len + 4 <= sizeof(tagged)) {
-            memcpy(tagged, buf, 12);
-            tagged[12] = 0x00;                 /* TPID marker (8100) */
-            tagged[13] = s->eth_port & 0x3f;   /* source port seen by DSA */
-            tagged[14] = 0x00;
-            tagged[15] = 0x00;
-            memcpy(tagged + 16, buf + 12, len - 12);
-            memcpy(buf_copy, tagged, len + 4);
-            len += 4;
-        } else {
-            memcpy(buf_copy, buf, len);
-        }
+    /*
+     * Insert the MTK DSA tag after the source MAC, exactly like the switch
+     * does for a frame arriving on a user port.  mtk_tag_rcv() takes the
+     * port number from the second byte and hands the frame to that slave.
+     */
+    if (len + 4 > sizeof(tagged)) {
+        len = sizeof(tagged) - 4;
     }
-    address_space_write(&address_space_memory, rxd1, MEMTXATTRS_UNSPECIFIED,
-                        buf_copy, len);
+    memcpy(tagged, buf, 12);
+    tagged[12] = 0x00;                    /* untagged special tag */
+    tagged[13] = s->eth_port & 0x3f;      /* source port */
+
+    tagged[14] = 0x00;
+    tagged[15] = 0x00;
+    memcpy(tagged + 16, buf + 12, len - 12);
+    flen = len + 4;
+
+    if (flen > cap) {
+        flen = cap;                        /* stay inside the driver buffer */
+    }
+    /*
+     * PDMA_GLO_CFG has RX_2B_OFFSET set, so the engine starts the frame two
+     * bytes into the descriptor buffer; the driver's skb_reserve() accounts
+     * for that offset.
+     */
+    address_space_write(&address_space_memory, rxd1 + 2,
+                        MEMTXATTRS_UNSPECIFIED, tagged, flen);
+
+    /* rxd2's DONE bit is the release flag, so write it last. */
+    address_space_stl_le(&address_space_memory, desc + 8, 0,
+                         MEMTXATTRS_UNSPECIFIED, NULL);
+    address_space_stl_le(&address_space_memory, desc + 12,
+                         (1u << RX_DMA_FPORT_SHIFT),   /* fport 1 = GMAC1 */
+                         MEMTXATTRS_UNSPECIFIED, NULL);
     address_space_stl_le(&address_space_memory, desc + 4,
-                         RX_DMA_DONE | RX_DMA_PLEN0(len),
+                         RX_DMA_DONE | RX_DMA_PLEN0(flen),
                          MEMTXATTRS_UNSPECIFIED, NULL);
 
     s->rx_drx_idx = (idx + 1) % cnt;
-    s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = s->rx_drx_idx;
+    s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = idx;
     s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_RX_DONE;
 
-    if (getenv("MT7621_ETHLOG") && dbg < 8) {
-        fprintf(stderr, "eth: rx[%d] desc=%08x buf=%08x len=%zu cap=%u st=%08x mask=%08x\n",
-                dbg, desc, rxd1, len, cap,
-                s->eth_regs[ETH_PDMA_INT_STATUS / 4],
-                s->eth_regs[ETH_PDMA_INT_MASK / 4]);
-        dbg++;
+    dbg++;
+    if (getenv("MT7621_ETHLOG") && dbg < 16) {
+        uint32_t prev = desc - 16;
+        uint32_t prev_rxd2 = address_space_ldl_le(&address_space_memory,
+                                                  prev + 4,
+                                                  MEMTXATTRS_UNSPECIFIED, NULL);
+
+        fprintf(stderr, "eth: rx[%d] desc=%08x len=%zu/%u idx=%u crx=%u "
+                "proto=%02x%02x dst=%02x:%02x:%02x:%02x:%02x:%02x "
+                "prev_done=%d\n",
+                dbg, desc, flen, cap, idx, crx, tagged[12], tagged[13],
+                tagged[0], tagged[1], tagged[2], tagged[3], tagged[4],
+                tagged[5], !!(prev_rxd2 & RX_DMA_DONE));
     }
 
     mt7621_eth_update_irq(s);
+
+    /*
+     * The NIC always has room, so tell the net core to retry anything the
+     * backend queued while the core was busy.
+     */
+    qemu_flush_queued_packets(qemu_get_queue(s->nic));
 
 out:
     if (took_bql) {
@@ -603,46 +707,99 @@ static NetClientInfo mt7621_net_info = {
 static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
 {
     uint32_t p = s->qtx_dtx;
+    uint32_t base = s->qtx_base;
     int guard = 0;
+    unsigned sent = 0;
 
-    while (p && p != ctx && guard++ < 256) {
+    if (!base || p < base || p >= base + TX_RING_BYTES ||
+        ctx < base || ctx >= base + TX_RING_BYTES) {
+        /* the ring was re-allocated: resynchronise and send nothing */
+        s->qtx_dtx = ctx;
+        s->qtx_base = ctx;
+        return;
+    }
+
+    if (getenv("MT7621_ETHLOG")) {
+        fprintf(stderr, "eth: tx ctx=%08x start=%08x\n", ctx, p);
+    }
+
+    while (p != ctx && guard++ < TX_RING_BYTES / 16) {
         uint32_t txd1 = address_space_ldl_le(&address_space_memory, p,
                                              MEMTXATTRS_UNSPECIFIED, NULL);
         uint32_t txd2 = address_space_ldl_le(&address_space_memory, p + 4,
                                              MEMTXATTRS_UNSPECIFIED, NULL);
         uint32_t txd3 = address_space_ldl_le(&address_space_memory, p + 8,
                                              MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t txd4 = address_space_ldl_le(&address_space_memory, p + 12,
+                                             MEMTXATTRS_UNSPECIFIED, NULL);
         unsigned len = (txd3 >> 16) & 0x3fff;
+        bool filled = !(txd3 & TX_DMA_OWNER_CPU);
+        bool forward = false;
 
-        if (txd1 && len && s->nic) {
+        if (filled && txd1 && len && s->nic) {
             uint8_t frame[0x4000];
+            unsigned fport = (txd4 >> TX_DMA_FPORT_SHIFT) & 0x7;
 
             if (len > sizeof(frame)) {
                 len = sizeof(frame);
             }
             address_space_read(&address_space_memory, txd1,
                                MEMTXATTRS_UNSPECIFIED, frame, len);
+
             /*
-             * Frames from the CPU port carry the MTK DSA tag at offset 12
-             * (4 bytes: tpid, port bitmap, 0, 0).  Strip it so the host
-             * sees a plain Ethernet frame.
+             * Frames sent through GMAC1 (the DSA master) carry the MTK
+             * special tag at offset 12: byte 12 is the tag type and byte 13
+             * the destination port bitmap.  Only frames the switch would
+             * put on our port may leave through this backend; GMAC2 (the
+             * wan MAC) is not behind the switch at all.
              */
-            if (len > 18) {
-                memmove(frame + 12, frame + 16, len - 16);
-                len -= 4;
+            if (fport == 1) {
+                if (len > 18 && (frame[12] & 0xfe) <= 2 &&
+                    !(frame[13] & 0xc0)) {
+                    if (frame[13] & (1u << s->eth_port)) {
+                        memmove(frame + 12, frame + 16, len - 16);
+                        len -= 4;
+                        forward = true;
+                    }
+                } else {
+                    forward = true;     /* untagged conduit frame */
+                }
             }
-            qemu_send_packet(qemu_get_queue(s->nic), frame, len);
+
+            if (forward && getenv("MT7621_ETHLOG") && sent < 4) {
+                fprintf(stderr, "eth: txf dst=%02x:%02x:%02x:%02x:%02x:%02x "
+                        "src=%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x "
+                        "len=%u\n",
+                        frame[0], frame[1], frame[2], frame[3], frame[4],
+                        frame[5], frame[6], frame[7], frame[8], frame[9],
+                        frame[10], frame[11], frame[12], frame[13], len);
+            }
+            if (forward) {
+                qemu_send_packet(qemu_get_queue(s->nic), frame, len);
+                sent++;
+            }
         }
-        /*
-         * txd2 is the link to the next descriptor in QDMA mode -- do not
-         * touch it.  Completion is published through QTX_DRX_PTR below.
-         */
+
+        /* Hand the descriptor back to the CPU (TX_DMA_DONE). */
+        if (filled) {
+            address_space_stl_le(&address_space_memory, p + 8,
+                                 txd3 | TX_DMA_OWNER_CPU,
+                                 MEMTXATTRS_UNSPECIFIED, NULL);
+        }
         p = txd2;
     }
 
+    if (getenv("MT7621_ETHLOG")) {
+        fprintf(stderr, "eth: tx done p=%08x ctx=%08x sent=%u guard=%d\n",
+                p, ctx, sent, guard);
+    }
+
+    s->qtx_dtx = p;
+    s->eth_regs[ETH_QTX_DRX_PTR / 4] = p;
+    if (s->nic) {
+        qemu_flush_queued_packets(qemu_get_queue(s->nic));
+    }
     if (p == ctx) {
-        s->qtx_dtx = ctx;
-        s->eth_regs[ETH_QTX_DRX_PTR / 4] = ctx;
         s->eth_regs[ETH_QDMA_INT_STATUS / 4] |= QDMA_TX_DONE;
         mt7621_eth_update_irq(s);
     }
@@ -1530,7 +1687,7 @@ static void mt7621_machine_init(MachineState *machine)
      */
     {
         const char *p = getenv("MT7621_ETH_PORT");
-        s->eth_port = p ? (unsigned)atoi(p) : 1;   /* lan1 */
+        s->eth_port = p ? (unsigned)atoi(p) : 4;   /* lan1 */
     }
     s->eth_irq = qdev_get_gpio_in(s->gic, 3);
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
