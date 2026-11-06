@@ -376,9 +376,11 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
         [1]  = 0x796d,          /* BMSR: link up, autoneg complete */
         [2]  = 0x0362,          /* PHY ID1 */
         [3]  = 0x5c30,          /* PHY ID2 */
-        [4]  = 0x01e1,          /* advertise */
-        [5]  = 0x45e1,          /* link partner ability */
-        [9]  = 0x0300,          /* 1000BASE-T control */
+        [4]  = 0x01e1,          /* 10/100 advertise */
+        [5]  = 0x45e1,          /* 10/100 link partner ability */
+        [9]  = 0x0300,          /* MII_CTRL1000: advertise 1000BASE-T f/h */
+        [10] = 0x3800,          /* MII_STAT1000: partner 1000BASE-T full,
+                                 * local/remote receiver OK */
     };
     /* Nothing plugged in: no link, no link partner, autoneg still running. */
     static const uint16_t phy_down[32] = {
@@ -388,6 +390,7 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
         [3]  = 0x5c30,
         [4]  = 0x01e1,
         [9]  = 0x0300,
+        [10] = 0x0000,          /* no link partner */
     };
 
     if (phy == 0x1f) {
