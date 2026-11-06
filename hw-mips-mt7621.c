@@ -22,15 +22,18 @@
 #include "hw/boards.h"
 #include "hw/char/serial-mm.h"
 #include "hw/char/serial.h"
+#include "hw/intc/mips_gic.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
 #include "hw/mips/mips.h"
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
+#include "hw/sysbus.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/system.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "system/reset.h"
 #include "target/mips/cpu-qom.h"
 #include "target/mips/internal.h"
@@ -44,9 +47,33 @@ OBJECT_DECLARE_SIMPLE_TYPE(MT7621State, MT7621_MACHINE)
 #define MT7621_PERIPH_SIZE      0x00200000
 
 #define MT7621_SYSCTL_OFF       0x00000000
+#define MT7621_SYSTICK_OFF      0x00000500
 #define MT7621_UART0_OFF        0x00000c00
 #define MT7621_NFI_OFF          0x00003000
 #define MT7621_DRAMC_OFF        0x00005000
+
+/*
+ * Interrupt wiring taken from the DTB appended to the flash kernel:
+ * a MIPS GIC at 0x1fbc0000, UART0 on shared interrupt 26 and the
+ * "ralink,mt7621-systick" 50 kHz counter on shared interrupt 5.
+ */
+#define MT7621_GIC_BASE         0x1fbc0000
+#define MT7621_GIC_NUM_IRQ      256
+#define MT7621_UART0_IRQ        26
+#define MT7621_SYSTICK_IRQ      5
+
+/*
+ * ralink,cevt-systick: a 16-bit up-counter clocked at 50 kHz.  Linux
+ * programs COMPARE with "COUNT + delta" and expects an interrupt when
+ * the counter reaches it.
+ */
+#define MT7621_SYSTICK_HZ       50000
+#define MT7621_SYSTICK_PERIOD   50      /* 1 ms at 50 kHz */
+#define SYSTICK_CONFIG          0x00
+#define SYSTICK_COMPARE         0x04
+#define SYSTICK_COUNT           0x08
+#define SYSTICK_CFG_CNT_EN      (1u << 0)
+#define SYSTICK_CFG_EXT_STK_EN  (1u << 1)
 /* Every KSEG0/KSEG1 physical address the CPU can generate, for aliasing. */
 #define MT7621_KSEG1_WINDOW     0x20000000
 #define MT7621_SRAM_BASE        0x1e100000
@@ -97,21 +124,33 @@ struct MT7621State {
 
     MIPSCPU *cpu;
     Clock *cpuclk;
+    DeviceState *gic;
 
     MemoryRegion ram;
     MemoryRegion periph;
     MemoryRegion sysctl;
+    MemoryRegion systick;
     MemoryRegion dramc;
     MemoryRegion nfi;
     MemoryRegion sram;
     MemoryRegion cm;
+    MemoryRegion eth;
     MemoryRegion ram_alias[8];
     int ram_alias_count;
 
     uint32_t sysctl_regs[SYSCTL_WORDS];
+    uint32_t systick_regs[4];
     uint32_t dramc_regs[DRAMC_WORDS];
     uint32_t nfi_regs[NFI_WORDS];
     uint32_t cm_regs[MT7621_CM_SIZE / 4];
+
+    /* systick state: count = base + elapsed, anchored at base_ns */
+    QEMUTimer *systick_timer;
+    QEMUTimer *systick_pulse_off;
+    qemu_irq systick_irq;
+    int64_t systick_base_ns;
+    uint32_t systick_base_count;
+    bool systick_pending;
 
     /* boot image */
     uint32_t load_addr;
@@ -145,9 +184,173 @@ static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
     regs[(addr & 0xfff) >> 2] = val;
 }
 
+static uint64_t mt7621_stub_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static void mt7621_stub_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+}
+
+static const MemoryRegionOps mt7621_stub_ops = {
+    .read = mt7621_stub_read,
+    .write = mt7621_stub_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
 static const MemoryRegionOps mt7621_reg_ops = {
     .read = mt7621_reg_read,
     .write = mt7621_reg_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
+/*
+ * ralink,cevt-systick: 16-bit up-counter at 50 kHz with a compare register.
+ * Linux uses it as a oneshot clockevent, so the only event we need to model
+ * is "counter reached COMPARE".
+ */
+static uint32_t mt7621_systick_count(MT7621State *s, int64_t now)
+{
+    int64_t elapsed;
+
+    if (!(s->systick_regs[SYSTICK_CONFIG / 4] & SYSTICK_CFG_CNT_EN)) {
+        return s->systick_base_count & 0xffff;
+    }
+
+    elapsed = now - s->systick_base_ns;
+    if (elapsed < 0) {
+        elapsed = 0;
+    }
+    return (s->systick_base_count +
+            (uint32_t)(elapsed * MT7621_SYSTICK_HZ / NANOSECONDS_PER_SECOND))
+           & 0xffff;
+}
+
+static void mt7621_systick_set_pending(MT7621State *s, bool pending)
+{
+    s->systick_pending = pending;
+    qemu_set_irq(s->systick_irq, pending);
+}
+
+static void mt7621_systick_rearm(MT7621State *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t count, compare, delta;
+
+    timer_del(s->systick_timer);
+    if (!(s->systick_regs[SYSTICK_CONFIG / 4] & SYSTICK_CFG_CNT_EN)) {
+        return;
+    }
+
+    count = mt7621_systick_count(s, now);
+    compare = s->systick_regs[SYSTICK_COMPARE / 4] & 0xffff;
+    delta = (compare - count) & 0xffff;
+    if (!delta) {
+        delta = 0x10000;
+    }
+
+    /* Re-anchor so the counter keeps its current value. */
+    s->systick_base_count = count;
+    s->systick_base_ns = now;
+    timer_mod(s->systick_timer,
+              now + (int64_t)delta * NANOSECONDS_PER_SECOND / MT7621_SYSTICK_HZ);
+}
+
+/*
+ * The 16-bit counter free-runs and matches COMPARE once per wrap, so the
+ * device keeps ticking whether or not the guest re-arms it.  The interrupt
+ * is asserted as a short pulse: the real one stays up until the handler
+ * writes COMPARE, but a pulse keeps a guest that never acknowledges it
+ * from wedging the CPU in the ISR.
+ */
+static void mt7621_systick_expire(void *opaque)
+{
+    MT7621State *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    s->systick_base_count = s->systick_regs[SYSTICK_COMPARE / 4] & 0xffff;
+    s->systick_base_ns = now;
+    mt7621_systick_set_pending(s, true);
+    timer_mod(s->systick_pulse_off, now + 20000);
+    /* Auto-reload: keep a steady tick even if the guest never writes COMPARE. */
+    s->systick_regs[SYSTICK_COMPARE / 4] =
+        (s->systick_base_count + MT7621_SYSTICK_PERIOD) & 0xffff;
+    mt7621_systick_rearm(s);
+}
+
+static void mt7621_systick_pulse_release(void *opaque)
+{
+    MT7621State *s = opaque;
+
+    mt7621_systick_set_pending(s, false);
+}
+
+static uint64_t mt7621_systick_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MT7621State *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t val;
+
+    switch (addr & 0xf) {
+    case SYSTICK_COUNT:
+        val = mt7621_systick_count(s, now);
+        break;
+    default:
+        val = s->systick_regs[(addr & 0xf) >> 2];
+        break;
+    }
+
+    if (mt7621_trace) {
+        qemu_log_mask(LOG_UNIMP, "mt7621: systick read %08" HWADDR_PRIx
+                      " -> %08x\n", addr, val);
+    }
+    return val;
+}
+
+static void mt7621_systick_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    MT7621State *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (mt7621_trace) {
+        qemu_log_mask(LOG_UNIMP, "mt7621: systick write %08" HWADDR_PRIx
+                      " <- %08" PRIx64 "\n", addr, val);
+    }
+
+    switch (addr & 0xf) {
+    case SYSTICK_CONFIG:
+        s->systick_base_count = mt7621_systick_count(s, now);
+        s->systick_base_ns = now;
+        s->systick_regs[SYSTICK_CONFIG / 4] = val;
+        if (!(val & SYSTICK_CFG_CNT_EN)) {
+            timer_del(s->systick_timer);
+            mt7621_systick_set_pending(s, false);
+        } else {
+            mt7621_systick_rearm(s);
+        }
+        break;
+    case SYSTICK_COMPARE:
+        s->systick_regs[SYSTICK_COMPARE / 4] = val;
+        /* The compare write both clears the match and arms the next one. */
+        mt7621_systick_set_pending(s, false);
+        mt7621_systick_rearm(s);
+        break;
+    default:
+        s->systick_regs[(addr & 0xf) >> 2] = val;
+        break;
+    }
+}
+
+static const MemoryRegionOps mt7621_systick_ops = {
+    .read = mt7621_systick_read,
+    .write = mt7621_systick_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
     .valid = { .min_access_size = 4, .max_access_size = 4 },
     .impl = { .min_access_size = 4, .max_access_size = 4 },
@@ -196,11 +399,6 @@ static const MemoryRegionOps mt7621_cm_ops = {
     .valid = { .min_access_size = 4, .max_access_size = 4 },
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
-
-static void mt7621_irq_noop(void *opaque, int n, int level)
-{
-    /* No interrupt controller yet: the console is polled at this stage. */
-}
 
 static void mt7621_load_image(MT7621State *s, const char *filename)
 {
@@ -317,6 +515,34 @@ static void mt7621_load_image(MT7621State *s, const char *filename)
     s->entry = entry;
 }
 
+/*
+ * The MT7621 uses the legacy MIPS GIC, and its reset mapping sends every
+ * shared interrupt to VP0 pin 0, i.e. CPU interrupt line 2.  That is why
+ * Breed only programs SMASK/POL and then enables IM2: it never writes the
+ * mapping registers.  QEMU's GIC model resets everything unmapped, so put
+ * the SoC default back after the device reset has run.
+ */
+static void mt7621_gic_default_map(MT7621State *s)
+{
+    MIPSGICState *gic;
+    int i;
+
+    if (!s->gic) {
+        return;
+    }
+
+    gic = MIPS_GIC(s->gic);
+    for (i = 0; i < gic->num_irq; i++) {
+        gic->irq_state[i].map_pin = 0;
+        gic->irq_state[i].map_vp = 0;
+    }
+}
+
+static void mt7621_gic_reset(void *opaque)
+{
+    mt7621_gic_default_map(opaque);
+}
+
 static void mt7621_reset(void *opaque)
 {
     MT7621State *s = opaque;
@@ -325,6 +551,24 @@ static void mt7621_reset(void *opaque)
     /* Malta does the same when a -kernel image is supplied. */
     env->CP0_Status &= ~(1 << 2); /* CP0St_ERL */
     env->active_tc.PC = s->entry;
+
+    /*
+     * The MT7621 BootROM hands over with the 50 kHz systick already running
+     * and its compare interrupt enabled; Breed only hooks GIC IRQ 5 and
+     * relies on that.  Reproduce the hand-over state.
+     */
+    if (s->systick_timer) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        s->systick_regs[SYSTICK_CONFIG / 4] =
+            SYSTICK_CFG_CNT_EN | SYSTICK_CFG_EXT_STK_EN;
+        s->systick_regs[SYSTICK_COMPARE / 4] = MT7621_SYSTICK_PERIOD;
+        s->systick_base_count = 0;
+        s->systick_base_ns = now;
+        mt7621_systick_set_pending(s, false);
+        mt7621_systick_rearm(s);
+    }
+
 }
 
 static void mt7621_machine_init(MachineState *machine)
@@ -376,6 +620,36 @@ static void mt7621_machine_init(MachineState *machine)
                                     &s->ram_alias[i]);
     }
 
+    /*
+     * Ethernet/sysctl blocks the firmware probes: reads must not return
+     * 0xffffffff, which makes ring-size computations overflow.
+     */
+    memory_region_init_io(&s->eth, NULL, &mt7621_stub_ops, s, "mt7621.eth",
+                          0x10000);
+    memory_region_add_subregion(sysmem, 0x1e100000, &s->eth);
+
+    /*
+     * The SoC interrupt controller is a MIPS GIC at 0x1fbc0000 (not the
+     * RT305x-style INTC of older Ralink parts).  Directing a shared
+     * interrupt to CPU line 0 gives Cause IP2, which is the line both
+     * Breed and Linux expect for it.
+     *
+     * Map it after the DDR aliases: those cover 1 GiB..2 GiB, which
+     * contains 0x1fbc0000, and a later subregion wins.
+     */
+    s->gic = qdev_new(TYPE_MIPS_GIC);
+    qdev_prop_set_uint32(s->gic, "num-vp", 1);
+    qdev_prop_set_uint32(s->gic, "num-irq", MT7621_GIC_NUM_IRQ);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->gic), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->gic), 0, MT7621_GIC_BASE);
+
+    /*
+     * Reset notifiers run in registration order, and the GIC registers its
+     * own reset when the device is created, so register ours afterwards to
+     * keep the SoC default mapping.
+     */
+    qemu_register_reset(mt7621_gic_reset, s);
+
     /* palmbus */
     memory_region_init(&s->periph, NULL, "mt7621.periph",
                        MT7621_PERIPH_SIZE);
@@ -393,6 +667,20 @@ static void mt7621_machine_init(MachineState *machine)
     memory_region_init_io(&s->sysctl, NULL, &mt7621_reg_ops, s->sysctl_regs,
                           "mt7621.sysctl", 0x1000);
     memory_region_add_subregion(&s->periph, MT7621_SYSCTL_OFF, &s->sysctl);
+
+    /* systick: compare interrupt routed through the GIC */
+    memset(s->systick_regs, 0, sizeof(s->systick_regs));
+    s->systick_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->systick_base_count = 0;
+    s->systick_irq = qdev_get_gpio_in(s->gic, MT7621_SYSTICK_IRQ);
+    s->systick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                    mt7621_systick_expire, s);
+    s->systick_pulse_off = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                        mt7621_systick_pulse_release, s);
+    memory_region_init_io(&s->systick, NULL, &mt7621_systick_ops, s,
+                          "mt7621.systick", 0x10);
+    memory_region_add_subregion(&s->periph, MT7621_SYSTICK_OFF,
+                                &s->systick);
 
     memset(s->dramc_regs, 0, sizeof(s->dramc_regs));
     s->dramc_regs[0x604 / 4] = 0x00000000;
@@ -418,14 +706,18 @@ static void mt7621_machine_init(MachineState *machine)
     s->cm_regs[(MT7621_GCR_OFF + GCR_CONFIG) / 4] = 0x00000004; /* 4 cores */
     s->cm_regs[(MT7621_GCR_OFF + GCR_BASE) / 4]   = 0x1fbf8000;
     s->cm_regs[(MT7621_GCR_OFF + GCR_REV) / 4]    = 0x00000002;
-    /* No GIC in the MT7621 CM; a CPC is present. */
+    /*
+     * The MT7621 GIC is the legacy MIPS GIC at 0x1fbc0000, not a CM-managed
+     * GIC; advertising one in the GCR makes Breed take a CM-GIC path that
+     * does not exist on this SoC and crash.
+     */
     s->cm_regs[(MT7621_GCR_OFF + GCR_GIC_STATUS) / 4] = 0x00000000;
     s->cm_regs[(MT7621_GCR_OFF + GCR_CPC_STATUS) / 4] = 0x00000001;
     memory_region_init_io(&s->cm, NULL, &mt7621_cm_ops, s->cm_regs,
                           "mt7621.cm", MT7621_CM_SIZE);
     memory_region_add_subregion(sysmem, MT7621_CM_BASE, &s->cm);
 
-    uart_irq = qemu_allocate_irq(mt7621_irq_noop, s, 0);
+    uart_irq = qdev_get_gpio_in(s->gic, MT7621_UART0_IRQ);
     serial_mm_init(&s->periph, MT7621_UART0_OFF, 2, uart_irq,
                    MT7621_UART_BAUD_BASE, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
