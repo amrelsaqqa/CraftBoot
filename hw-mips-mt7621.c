@@ -222,6 +222,8 @@ struct MT7621State {
     MemReentrancyGuard nic_guard;
     qemu_irq eth_irq;
     uint32_t rx_drx_idx;
+    int64_t phy_link_ns;        /* when the tapped PHY reports link up */
+    uint16_t phy_regs[32][32];  /* MDIO register file per address */
     unsigned eth_port;          /* DSA user port exposed to the backend */
     uint32_t qtx_dtx;           /* forward DMA pointer (next to send) */
     uint32_t qtx_base;          /* start of the TX descriptor ring */
@@ -370,28 +372,7 @@ static uint32_t *mt7621_sw_word(MT7621State *s, unsigned page, unsigned r)
 
 static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
 {
-    /* A connected PHY: 100BASE-TX full duplex, autonegotiation done. */
-    static const uint16_t phy_up[32] = {
-        [0]  = 0x1140,          /* BMCR: autoneg, full duplex */
-        [1]  = 0x796d,          /* BMSR: link up, autoneg complete */
-        [2]  = 0x0362,          /* PHY ID1 */
-        [3]  = 0x5c30,          /* PHY ID2 */
-        [4]  = 0x01e1,          /* 10/100 advertise */
-        [5]  = 0x45e1,          /* 10/100 link partner ability */
-        [9]  = 0x0300,          /* MII_CTRL1000: advertise 1000BASE-T f/h */
-        [10] = 0x3800,          /* MII_STAT1000: partner 1000BASE-T full,
-                                 * local/remote receiver OK */
-    };
-    /* Nothing plugged in: no link, no link partner, autoneg still running. */
-    static const uint16_t phy_down[32] = {
-        [0]  = 0x1140,
-        [1]  = 0x7949,
-        [2]  = 0x0362,
-        [3]  = 0x5c30,
-        [4]  = 0x01e1,
-        [9]  = 0x0300,
-        [10] = 0x0000,          /* no link partner */
-    };
+    bool up;
 
     if (phy == 0x1f) {
         unsigned r = reg & 0x1f;
@@ -417,13 +398,38 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
         }
         return *mt7621_sw_word(s, s->sw_page, r) & 0xffff;
     }
+
     /*
      * Only the switch port that owns the net backend has a cable in it.
      * The internal PHYs are addressed by port number (lan4 = 1 ... lan1 = 4)
      * and the wan PHY sits at address 0.
+     *
+     * A real PHY reports link only after autonegotiation finished; claiming
+     * it on the very first poll makes genphy_read_status() resolve the link
+     * once, before phylink programmed the advertisement, and it then
+     * short-circuits every later poll, leaving the port at a stale speed.
      */
-    return (phy && phy == s->eth_port) ? phy_up[reg & 0x1f]
-                                       : phy_down[reg & 0x1f];
+    up = phy && phy == s->eth_port;
+    if (up) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        if (!s->phy_link_ns) {
+            s->phy_link_ns = now + 2500 * 1000 * 1000LL;
+        }
+        up = now >= s->phy_link_ns;
+    }
+
+    switch (reg & 0x1f) {
+    case 1:                             /* BMSR: live status */
+        /* No autoneg: the PHY is strapped to 1000BASE-T full duplex. */
+        return up ? 0x7965 : 0x7941;
+    case 10:                            /* MII_STAT1000: link partner */
+        return up ? 0x3800 : 0x0000;
+    case 15:                            /* MII_ESTATUS: capabilities */
+        return 0xc000;                  /* 1000BASE-T full/half */
+    default:
+        return s->phy_regs[phy & 0x1f][reg & 0x1f];
+    }
 }
 
 static uint64_t mt7621_eth_read(void *opaque, hwaddr addr, unsigned size)
@@ -1986,6 +1992,23 @@ static void mt7621_poweroff_poll(void *opaque)
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
 }
 
+static void mt7621_phy_defaults(MT7621State *s)
+{
+    unsigned p, r;
+
+    memset(s->phy_regs, 0, sizeof(s->phy_regs));
+    for (p = 0; p < 32; p++) {
+        s->phy_regs[p][0]  = 0x0140;    /* BMCR: 1000BASE-T full duplex
+                                         * (bit 6 = speed MSB, no autoneg) */
+        s->phy_regs[p][2]  = 0x0362;    /* PHY ID1 */
+        s->phy_regs[p][3]  = 0x5c30;    /* PHY ID2 */
+        s->phy_regs[p][4]  = 0x01e1;    /* 10/100 advertise */
+        s->phy_regs[p][9]  = 0x0300;    /* MII_CTRL1000: 1000BASE-T f/h */
+    }
+    s->phy_link_ns = 0;
+    (void)r;
+}
+
 static void mt7621_switch_defaults(MT7621State *s)
 {
     /*
@@ -2012,6 +2035,7 @@ static void mt7621_reset(void *opaque)
     s->qtx_base = 0;
     s->qtx_en = false;
     s->rx_drx_idx = 0;
+    mt7621_phy_defaults(s);
     s->nfi_fifo_len = 0;
     s->nfi_fifo_pos = 0;
     s->nfi_col = 0;
@@ -2156,6 +2180,7 @@ static void mt7621_machine_init(MachineState *machine)
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
 
     mt7621_switch_defaults(s);
+    mt7621_phy_defaults(s);
 
     /*
      * The frame engine's NIC is part of the SoC, so attach it to the user's
