@@ -448,9 +448,15 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
                      * operation and polls ATC_BUSY (bit 31) until it clears.
                      * Complete it immediately.
                      */
-                    if ((((unsigned)s->sw_page << 6) |
-                         ((unsigned)s->sw_r << 2)) == 0x90) {
-                        *w &= ~0x80000000u;
+                    {
+                        unsigned regno = ((unsigned)s->sw_page << 6) |
+                                         ((unsigned)s->sw_r << 2);
+
+                        if (regno == 0x80) {
+                            *w &= ~0x00008000u;  /* MT7530_ATC: ATC_BUSY */
+                        } else if (regno == 0x90) {
+                            *w &= ~0x80000000u;
+                        }
                     }
                 } else {
                     uint32_t *w;
