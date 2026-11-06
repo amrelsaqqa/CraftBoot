@@ -194,6 +194,7 @@ struct MT7621State {
     uint32_t eth_regs[MT7621_ETH_SIZE / 4];
     NICState *nic;
     NICConf nic_conf;
+    MemReentrancyGuard nic_guard;
     qemu_irq eth_irq;
     uint32_t rx_drx_idx;
     uint32_t qtx_dtx;
@@ -1415,7 +1416,8 @@ static void mt7621_machine_init(MachineState *machine)
             qemu_macaddr_default_if_unset(&s->nic_conf.macaddr);
             s->nic_conf.peers.ncs[0] = peer;
             s->nic = qemu_new_nic(&mt7621_net_info, &s->nic_conf,
-                                  "mt7621-eth", "mt7621-eth", NULL, s);
+                                  "mt7621-eth", "mt7621-eth",
+                                  &s->nic_guard, s);
             qemu_set_info_str(qemu_get_queue(s->nic), "mt7621-eth");
         }
     }
