@@ -44,7 +44,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MT7621State, MT7621_MACHINE)
 /* SoC memory map */
 #define MT7621_RAM_BASE         0x00000000
 #define MT7621_PERIPH_BASE      0x1e000000
-#define MT7621_PERIPH_SIZE      0x00200000
+#define MT7621_PERIPH_SIZE      0x00100000
 
 #define MT7621_SYSCTL_OFF       0x00000000
 #define MT7621_SYSTICK_OFF      0x00000500
@@ -100,8 +100,18 @@ OBJECT_DECLARE_SIMPLE_TYPE(MT7621State, MT7621_MACHINE)
 #define SYSTICK_CFG_EXT_STK_EN  (1u << 1)
 /* Every KSEG0/KSEG1 physical address the CPU can generate, for aliasing. */
 #define MT7621_KSEG1_WINDOW     0x20000000
-#define MT7621_SRAM_BASE        0x1e100000
-#define MT7621_SRAM_SIZE        0x00010000
+/*
+ * Frame engine / switch register block.  The DT says 64 KiB but the MDIO
+ * control register lives at 0x10004, so map 128 KiB.
+ */
+#define MT7621_ETH_SIZE         0x00020000
+#define MT7621_ETH_IAC          0x10004
+
+#define ETH_IAC_ACCESS          (1u << 31)
+#define ETH_IAC_WRITE           (1u << 18)
+#define ETH_IAC_START           (1u << 16)
+#define ETH_IAC_ADDR_SHIFT      20
+#define ETH_IAC_REG_SHIFT       25
 
 /*
  * MIPS Coherence Manager (CM) / Cluster Power Controller (CPC).
@@ -159,7 +169,8 @@ struct MT7621State {
     MemoryRegion systick;
     MemoryRegion dramc;
     MemoryRegion nfi;
-    MemoryRegion sram;
+    MemoryRegion sram;            /* unused, kept for layout stability */
+    uint32_t eth_regs[MT7621_ETH_SIZE / 4];
     MemoryRegion cm;
     MemoryRegion eth;
     MemoryRegion ram_alias[8];
@@ -278,22 +289,77 @@ static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
     regs[(addr & 0xfff) >> 2] = val;
 }
 
-static uint64_t mt7621_stub_read(void *opaque, hwaddr addr, unsigned size)
+/*
+ * Ethernet frame engine + MDIO.  Only what firmware needs to identify the
+ * PHY and bring the MAC up is modelled: the MDIO control register performs
+ * the transaction immediately, and the switch/PHY at address 31 answers
+ * with a plausible MT7530 identity.
+ */
+static uint16_t mt7621_eth_phy_read(unsigned phy, unsigned reg)
 {
-    return 0;
+    static const uint16_t phy_regs[32] = {
+        [0]  = 0x1140,          /* BMCR: autoneg, full duplex */
+        [1]  = 0x796d,          /* BMSR: link up, autoneg complete */
+        [2]  = 0x0362,          /* PHY ID1 */
+        [3]  = 0x5c30,          /* PHY ID2 */
+        [4]  = 0x01e1,          /* advertise */
+        [5]  = 0x45e1,          /* link partner ability */
+        [9]  = 0x0300,          /* 1000BASE-T control */
+    };
+
+    if (phy != 0x1f) {
+        return 0xffff;          /* nothing on the other addresses */
+    }
+    return phy_regs[reg & 0x1f];
 }
 
-static void mt7621_stub_write(void *opaque, hwaddr addr, uint64_t val,
-                              unsigned size)
+static uint64_t mt7621_eth_read(void *opaque, hwaddr addr, unsigned size)
 {
+    MT7621State *s = opaque;
+    uint32_t off = addr & (MT7621_ETH_SIZE - 1);
+    uint32_t val = s->eth_regs[off >> 2];
+
+    if (getenv("MT7621_ETHLOG")) {
+        fprintf(stderr, "eth: read %04x -> %08x (size %u)\n",
+                (unsigned)off, val, size);
+    }
+    return val;
 }
 
-static const MemoryRegionOps mt7621_stub_ops = {
-    .read = mt7621_stub_read,
-    .write = mt7621_stub_write,
+static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
+                             unsigned size)
+{
+    MT7621State *s = opaque;
+    uint32_t off = addr & (MT7621_ETH_SIZE - 1);
+    uint32_t val = (uint32_t)val64;
+
+    if (getenv("MT7621_ETHLOG")) {
+        fprintf(stderr, "eth: write %04x <- %08x (size %u)\n",
+                (unsigned)off, val, size);
+    }
+
+    if (off == MT7621_ETH_IAC &&
+        (val & ETH_IAC_ACCESS) && (val & ETH_IAC_START)) {
+        unsigned phy = (val >> ETH_IAC_ADDR_SHIFT) & 0x1f;
+        unsigned reg = (val >> ETH_IAC_REG_SHIFT) & 0x1f;
+
+        if (val & ETH_IAC_WRITE) {
+            val &= ~ETH_IAC_ACCESS;
+        } else {
+            val = (val & ~(ETH_IAC_ACCESS | 0xffff)) |
+                  mt7621_eth_phy_read(phy, reg);
+        }
+    }
+
+    s->eth_regs[off >> 2] = val;
+}
+
+static const MemoryRegionOps mt7621_eth_ops = {
+    .read = mt7621_eth_read,
+    .write = mt7621_eth_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 8 },
-    .impl = { .min_access_size = 1, .max_access_size = 8 },
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 /*
@@ -1137,8 +1203,8 @@ static void mt7621_machine_init(MachineState *machine)
      * Ethernet/sysctl blocks the firmware probes: reads must not return
      * 0xffffffff, which makes ring-size computations overflow.
      */
-    memory_region_init_io(&s->eth, NULL, &mt7621_stub_ops, s, "mt7621.eth",
-                          0x10000);
+    memory_region_init_io(&s->eth, NULL, &mt7621_eth_ops, s, "mt7621.eth",
+                          MT7621_ETH_SIZE);
     memory_region_add_subregion(sysmem, 0x1e100000, &s->eth);
 
     /*
@@ -1225,10 +1291,7 @@ static void mt7621_machine_init(MachineState *machine)
                           "mt7621.nfi", 0x1000);
     memory_region_add_subregion(&s->periph, MT7621_NFI_OFF, &s->nfi);
 
-    /* Boot SRAM: the BootROM/stage1 handshake lives at 0x1e10ad00. */
-    memory_region_init_ram(&s->sram, NULL, "mt7621.sram",
-                           MT7621_SRAM_SIZE, &error_fatal);
-    memory_region_add_subregion(sysmem, MT7621_SRAM_BASE, &s->sram);
+
 
     /* Coherence manager + cluster power controller */
     memset(s->cm_regs, 0, sizeof(s->cm_regs));
