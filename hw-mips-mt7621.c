@@ -203,6 +203,7 @@ struct MT7621State {
     MemReentrancyGuard nic_guard;
     qemu_irq eth_irq;
     uint32_t rx_drx_idx;
+    unsigned eth_port;          /* DSA user port exposed to the backend */
     uint32_t qtx_dtx;
     MemoryRegion cm;
     MemoryRegion eth;
@@ -493,6 +494,7 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     uint32_t cnt = s->eth_regs[ETH_PRX_MAX_CNT0 / 4];
     uint32_t idx = s->rx_drx_idx;
     uint32_t desc, rxd1, rxd2, cap;
+    uint8_t buf_copy[1600];
     bool took_bql = !bql_locked();
     static int dbg;
 
@@ -524,8 +526,24 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
         len = cap;             /* never write past the driver's buffer */
     }
 
+    {
+        uint8_t tagged[1600];
+
+        if (len >= 14 && len + 4 <= sizeof(tagged)) {
+            memcpy(tagged, buf, 12);
+            tagged[12] = 0x00;                 /* TPID marker (8100) */
+            tagged[13] = s->eth_port & 0x3f;   /* source port seen by DSA */
+            tagged[14] = 0x00;
+            tagged[15] = 0x00;
+            memcpy(tagged + 16, buf + 12, len - 12);
+            memcpy(buf_copy, tagged, len + 4);
+            len += 4;
+        } else {
+            memcpy(buf_copy, buf, len);
+        }
+    }
     address_space_write(&address_space_memory, rxd1, MEMTXATTRS_UNSPECIFIED,
-                        buf, len);
+                        buf_copy, len);
     address_space_stl_le(&address_space_memory, desc + 4,
                          RX_DMA_DONE | RX_DMA_PLEN0(len),
                          MEMTXATTRS_UNSPECIFIED, NULL);
@@ -604,6 +622,15 @@ static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
             }
             address_space_read(&address_space_memory, txd1,
                                MEMTXATTRS_UNSPECIFIED, frame, len);
+            /*
+             * Frames from the CPU port carry the MTK DSA tag at offset 12
+             * (4 bytes: tpid, port bitmap, 0, 0).  Strip it so the host
+             * sees a plain Ethernet frame.
+             */
+            if (len > 18) {
+                memmove(frame + 12, frame + 16, len - 16);
+                len -= 4;
+            }
             qemu_send_packet(qemu_get_queue(s->nic), frame, len);
         }
         /*
@@ -1501,6 +1528,10 @@ static void mt7621_machine_init(MachineState *machine)
      * DMA rings move frames between guest memory and a QEMU net backend,
      * so a tap device on the host is bridged at layer 2.
      */
+    {
+        const char *p = getenv("MT7621_ETH_PORT");
+        s->eth_port = p ? (unsigned)atoi(p) : 1;   /* lan1 */
+    }
     s->eth_irq = qdev_get_gpio_in(s->gic, 3);
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
 
