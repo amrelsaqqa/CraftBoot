@@ -193,6 +193,11 @@ struct MT7621State {
     MemoryRegion nfi;
     MemoryRegion sram;            /* unused, kept for layout stability */
     uint32_t eth_regs[MT7621_ETH_SIZE / 4];
+    /* MT7530 indirect register file (page/lo/hi via MDIO addr 0x1f) */
+    uint32_t sw_regs[0x400 * 16];
+    uint16_t sw_page;
+    uint16_t sw_r;
+
     NICState *nic;
     NICConf nic_conf;
     MemReentrancyGuard nic_guard;
@@ -326,7 +331,18 @@ static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
 static void mt7621_eth_update_irq(MT7621State *s);
 static void mt7621_eth_tx(MT7621State *s, uint32_t ctx);
 
-static uint16_t mt7621_eth_phy_read(unsigned phy, unsigned reg)
+/*
+ * MT7530 behind the MDIO bus: Linux talks to it through PHY address 0x1f
+ * with a page/lo/hi protocol (mt7530_mii_read/write):
+ *   write(0x1f, 0x1f, page); lo = read(0x1f, r); hi = read(0x1f, 0x10)
+ * where page = (reg >> 6) & 0x3ff and r = (reg >> 2) & 0xf.
+ */
+static uint32_t *mt7621_sw_word(MT7621State *s, unsigned page, unsigned r)
+{
+    return &s->sw_regs[((page & 0x3ff) << 4) | (r & 0xf)];
+}
+
+static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
 {
     static const uint16_t phy_regs[32] = {
         [0]  = 0x1140,          /* BMCR: autoneg, full duplex */
@@ -338,8 +354,17 @@ static uint16_t mt7621_eth_phy_read(unsigned phy, unsigned reg)
         [9]  = 0x0300,          /* 1000BASE-T control */
     };
 
-    if (phy != 0x1f) {
-        return 0xffff;          /* nothing on the other addresses */
+    if (phy == 0x1f) {
+        unsigned r = reg & 0x1f;
+
+        if (r == 0x1f) {
+            return 0xffff;      /* page register: data ignored on read */
+        }
+        if (r == 0x10) {
+            return (*mt7621_sw_word(s, s->sw_page, s->sw_r) >> 16) & 0xffff;
+        }
+        s->sw_r = r;
+        return *mt7621_sw_word(s, s->sw_page, r) & 0xffff;
     }
     return phy_regs[reg & 0x1f];
 }
@@ -397,10 +422,27 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
         unsigned reg = (val >> ETH_IAC_REG_SHIFT) & 0x1f;
 
         if (val & ETH_IAC_WRITE) {
+            unsigned data = val & 0xffff;
+
+            if (phy == 0x1f) {
+                if (reg == 0x1f) {
+                    s->sw_page = data & 0x3ff;
+                } else if (reg == 0x10) {
+                    uint32_t *w = mt7621_sw_word(s, s->sw_page, s->sw_r);
+
+                    *w = (*w & 0xffff) | (data << 16);
+                } else {
+                    uint32_t *w;
+
+                    s->sw_r = reg;
+                    w = mt7621_sw_word(s, s->sw_page, reg);
+                    *w = (*w & 0xffff0000) | data;
+                }
+            }
             val &= ~ETH_IAC_ACCESS;
         } else {
             val = (val & ~(ETH_IAC_ACCESS | 0xffff)) |
-                  mt7621_eth_phy_read(phy, reg);
+                  mt7621_eth_phy_read(s, phy, reg);
         }
     }
 
@@ -1434,6 +1476,15 @@ static void mt7621_machine_init(MachineState *machine)
      */
     s->eth_irq = qdev_get_gpio_in(s->gic, 3);
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
+
+    /*
+     * MT7530 identity: CREV (0x7ffc) >> 16 must be 0x7530 and HWTRAP
+     * (0x7800) must read non-zero, otherwise mt7530-mdio refuses the chip
+     * and DSA never creates the lan/wan ports.
+     */
+    memset(s->sw_regs, 0, sizeof(s->sw_regs));
+    *mt7621_sw_word(s, (0x7ffc >> 6) & 0x3ff, (0x7ffc >> 2) & 0xf) = 0x75300000;
+    *mt7621_sw_word(s, (0x7800 >> 6) & 0x3ff, (0x7800 >> 2) & 0xf) = 0x00000001;
 
     /*
      * The frame engine's NIC is part of the SoC, so attach it to the user's
