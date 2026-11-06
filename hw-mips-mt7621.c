@@ -29,6 +29,7 @@
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
+#include "net/net.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/system.h"
@@ -113,6 +114,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(MT7621State, MT7621_MACHINE)
 #define ETH_IAC_ADDR_SHIFT      20
 #define ETH_IAC_REG_SHIFT       25
 
+/* DMA engines (MT7621: PDMA receive rings, QDMA transmit) */
+#define ETH_PRX_BASE_PTR0       0x0900
+#define ETH_PRX_MAX_CNT0        0x0904
+#define ETH_PRX_CRX_IDX0        0x0908
+#define ETH_PRX_DRX_IDX0        0x090c
+#define ETH_PDMA_INT_STATUS     0x0a20
+#define ETH_PDMA_INT_MASK       0x0a28
+#define ETH_QTX_CTX_PTR         0x1b00
+#define ETH_QTX_DTX_PTR         0x1b04
+#define ETH_QTX_DRX_PTR         0x1b14
+#define ETH_QDMA_INT_STATUS     0x1a18
+#define ETH_QDMA_INT_MASK       0x1a1c
+
+#define PDMA_RX_DONE            (1u << 30)
+#define QDMA_TX_DONE            (1u << 28)
+#define TX_DMA_DONE             (1u << 31)
+#define TX_DMA_PLEN0(x)         ((((x) & 0x3fff)) << 16)
+#define RX_DMA_DONE             (1u << 31)
+#define RX_DMA_PLEN0(x)         ((((x) & 0x3fff)) << 16)
+
 /*
  * MIPS Coherence Manager (CM) / Cluster Power Controller (CPC).
  * CPC sits at 0x1fbf0000, the global control registers (GCR) at 0x1fbf8000.
@@ -171,6 +192,10 @@ struct MT7621State {
     MemoryRegion nfi;
     MemoryRegion sram;            /* unused, kept for layout stability */
     uint32_t eth_regs[MT7621_ETH_SIZE / 4];
+    NICState *nic;
+    qemu_irq eth_irq;
+    uint32_t rx_drx_idx;
+    uint32_t qtx_dtx;
     MemoryRegion cm;
     MemoryRegion eth;
     MemoryRegion ram_alias[8];
@@ -295,6 +320,9 @@ static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
  * the transaction immediately, and the switch/PHY at address 31 answers
  * with a plausible MT7530 identity.
  */
+static void mt7621_eth_update_irq(MT7621State *s);
+static void mt7621_eth_tx(MT7621State *s, uint32_t ctx);
+
 static uint16_t mt7621_eth_phy_read(unsigned phy, unsigned reg)
 {
     static const uint16_t phy_regs[32] = {
@@ -338,6 +366,22 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
                 (unsigned)off, val, size);
     }
 
+    if (off == ETH_QTX_CTX_PTR) {
+        s->eth_regs[off >> 2] = val;
+        mt7621_eth_tx(s, val);
+        return;
+    }
+    if (off == ETH_PDMA_INT_STATUS) {
+        s->eth_regs[off >> 2] &= ~val;     /* write 1 to clear */
+        mt7621_eth_update_irq(s);
+        return;
+    }
+    if (off == ETH_QDMA_INT_STATUS) {
+        s->eth_regs[off >> 2] &= ~val;
+        mt7621_eth_update_irq(s);
+        return;
+    }
+
     if (off == MT7621_ETH_IAC &&
         (val & ETH_IAC_ACCESS) && (val & ETH_IAC_START)) {
         unsigned phy = (val >> ETH_IAC_ADDR_SHIFT) & 0x1f;
@@ -352,6 +396,119 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
     }
 
     s->eth_regs[off >> 2] = val;
+}
+
+static void mt7621_eth_update_irq(MT7621State *s)
+{
+    uint32_t pdma = s->eth_regs[ETH_PDMA_INT_STATUS / 4] &
+                    s->eth_regs[ETH_PDMA_INT_MASK / 4];
+    uint32_t qdma = s->eth_regs[ETH_QDMA_INT_STATUS / 4] &
+                    s->eth_regs[ETH_QDMA_INT_MASK / 4];
+
+    qemu_set_irq(s->eth_irq, (pdma | qdma) != 0);
+}
+
+/* Move one received frame into the next PDMA descriptor. */
+static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
+{
+    uint32_t base = s->eth_regs[ETH_PRX_BASE_PTR0 / 4];
+    uint32_t cnt = s->eth_regs[ETH_PRX_MAX_CNT0 / 4];
+    uint32_t idx = s->rx_drx_idx;
+    uint32_t desc, rxd1, rxd2;
+
+    if (!base || !cnt || len > 0x3fff) {
+        return;
+    }
+    if (idx >= cnt) {
+        idx = 0;
+    }
+
+    desc = base + idx * 16;
+    rxd1 = address_space_ldl_le(&address_space_memory, desc,
+                                MEMTXATTRS_UNSPECIFIED, NULL);
+    if (!rxd1) {
+        return;
+    }
+
+    address_space_write(&address_space_memory, rxd1, MEMTXATTRS_UNSPECIFIED,
+                        buf, len);
+    rxd2 = RX_DMA_DONE | RX_DMA_PLEN0(len);
+    address_space_stl_le(&address_space_memory, desc + 4, rxd2,
+                         MEMTXATTRS_UNSPECIFIED, NULL);
+
+    s->rx_drx_idx = (idx + 1) % cnt;
+    s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = s->rx_drx_idx;
+    s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_RX_DONE;
+    mt7621_eth_update_irq(s);
+}
+
+static bool mt7621_eth_can_receive(NetClientState *nc)
+{
+    return true;
+}
+
+static ssize_t mt7621_eth_receive(NetClientState *nc, const uint8_t *buf,
+                                  size_t size)
+{
+    MT7621State *s = qemu_get_nic_opaque(nc);
+
+    mt7621_eth_rx(s, buf, size);
+    return size;
+}
+
+static void mt7621_eth_cleanup(NetClientState *nc)
+{
+}
+
+static NetClientInfo mt7621_net_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NICState),
+    .can_receive = mt7621_eth_can_receive,
+    .receive = mt7621_eth_receive,
+    .cleanup = mt7621_eth_cleanup,
+};
+
+/*
+ * Transmit: the Linux driver enqueues descriptors and then writes the
+ * physical address of the newest one to MTK_QTX_CTX_PTR.  Walk the chain
+ * from the last completed descriptor, hand each buffer to the net backend
+ * and publish the new done pointer.
+ */
+static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
+{
+    uint32_t p = s->qtx_dtx;
+    int guard = 0;
+
+    while (p && p != ctx && guard++ < 256) {
+        uint32_t txd1 = address_space_ldl_le(&address_space_memory, p,
+                                             MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t txd2 = address_space_ldl_le(&address_space_memory, p + 4,
+                                             MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t txd3 = address_space_ldl_le(&address_space_memory, p + 8,
+                                             MEMTXATTRS_UNSPECIFIED, NULL);
+        unsigned len = (txd3 >> 16) & 0x3fff;
+
+        if (txd1 && len && s->nic) {
+            uint8_t frame[0x4000];
+
+            if (len > sizeof(frame)) {
+                len = sizeof(frame);
+            }
+            address_space_read(&address_space_memory, txd1,
+                               MEMTXATTRS_UNSPECIFIED, frame, len);
+            qemu_send_packet(qemu_get_queue(s->nic), frame, len);
+        }
+        address_space_stl_le(&address_space_memory, p + 4,
+                             txd2 | TX_DMA_DONE, MEMTXATTRS_UNSPECIFIED, NULL);
+        p = txd2;
+    }
+
+    if (p == ctx) {
+        s->qtx_dtx = ctx;
+        s->eth_regs[ETH_QTX_DRX_PTR / 4] = ctx;
+        s->eth_regs[ETH_QDMA_INT_STATUS / 4] |= QDMA_TX_DONE;
+        mt7621_eth_update_irq(s);
+    }
 }
 
 static const MemoryRegionOps mt7621_eth_ops = {
@@ -1228,6 +1385,34 @@ static void mt7621_machine_init(MachineState *machine)
      * keep the SoC default mapping.
      */
     qemu_register_reset(mt7621_gic_reset, s);
+
+    /*
+     * Ethernet.  The frame engine raises GIC shared interrupt 3 and its
+     * DMA rings move frames between guest memory and a QEMU net backend,
+     * so a tap device on the host is bridged at layer 2.
+     */
+    s->eth_irq = qdev_get_gpio_in(s->gic, 3);
+    memset(s->eth_regs, 0, sizeof(s->eth_regs));
+
+    /*
+     * The frame engine's NIC is part of the SoC, so attach it to the user's
+     * netdev (documented as id=net0) directly instead of going through the
+     * pluggable-device matching.
+     */
+    {
+        NetClientState *peer = qemu_find_netdev("net0");
+
+        if (peer && getenv("MT7621_NET")) {
+            NICConf conf;
+
+            memset(&conf, 0, sizeof(conf));
+            qemu_macaddr_default_if_unset(&conf.macaddr);
+            conf.peers.ncs[0] = peer;
+            s->nic = qemu_new_nic(&mt7621_net_info, &conf, "mt7621-eth",
+                                  "mt7621-eth", NULL, s);
+            qemu_set_info_str(qemu_get_queue(s->nic), "mt7621-eth");
+        }
+    }
 
     /* palmbus */
     memory_region_init(&s->periph, NULL, "mt7621.periph",
