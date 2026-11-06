@@ -206,6 +206,7 @@ struct MT7621State {
     MemoryRegion ram;
     MemoryRegion periph;
     MemoryRegion sysctl;
+    MemoryRegion rstctl;
     MemoryRegion systick;
     MemoryRegion dramc;
     MemoryRegion nfi;
@@ -268,6 +269,7 @@ struct MT7621State {
     uint32_t load_addr;
     uint32_t entry;
     bool uimage;
+    char *image_file;           /* boot image, reloaded on reset */
 };
 
 static bool mt7621_trace;
@@ -1520,6 +1522,40 @@ static void mt7621_nand_load(MT7621State *s, const char *filename)
     close(fd);
 }
 
+/*
+ * SYS_RSTCTL (0x34): Linux's ralink restart handler ends with
+ * rt_sysc_w32(RSTCTL_RESET_SYSTEM, SYSC_REG_RESET_CTRL), i.e. a 32-bit
+ * write of bit 0.  Anything else (peripheral reset bits, the PCI reset
+ * mask the same handler does first) is just latched.
+ */
+static void mt7621_rstctl_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
+{
+    MT7621State *s = opaque;
+    uint32_t old = s->sysctl_regs[SYS_RSTCTL / 4];
+
+    s->sysctl_regs[SYS_RSTCTL / 4] = val;
+
+    if ((val & 1) && !(old & 1)) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
+
+static uint64_t mt7621_rstctl_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MT7621State *s = opaque;
+
+    return s->sysctl_regs[SYS_RSTCTL / 4];
+}
+
+static const MemoryRegionOps mt7621_rstctl_ops = {
+    .read = mt7621_rstctl_read,
+    .write = mt7621_rstctl_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4 },
+    .impl = { .min_access_size = 4, .max_access_size = 4 },
+};
+
 static const MemoryRegionOps mt7621_reg_ops = {
     .read = mt7621_reg_read,
     .write = mt7621_reg_write,
@@ -1861,10 +1897,79 @@ static void mt7621_gic_reset(void *opaque)
     mt7621_gic_default_map(opaque);
 }
 
+static void mt7621_sysctl_defaults(MT7621State *s)
+{
+    memset(s->sysctl_regs, 0, sizeof(s->sysctl_regs));
+    /*
+     * "MT76" / "21  ".  Linux's ralink SoC probe compares these two words
+     * and panics with "mt7621: unknown SoC" if they do not match.
+     */
+    s->sysctl_regs[SYS_CHIP_NAME0 / 4]   = 0x3637544d;
+    s->sysctl_regs[SYS_CHIP_NAME1 / 4]   = 0x20203132;
+    /*
+     * SYS_CHIP_REV_ID, decoded the way U-Boot and Breed do it:
+     * bit 17 = CPU_ID (second core present), bit 16 = PKG_ID, bits 11:8
+     * = version, bits 3:0 = eco.  A real MT7621A has both bits set.
+     */
+    s->sysctl_regs[SYS_CHIP_REV_ID / 4]  = 0x00030000 | (1 << 8) | 0;
+    /*
+     * SYSCFG0: CHIP_MODE[3:0] tells the firmware which boot flash is wired
+     * up; 0 means "no NAND" and makes board_init skip the NFI entirely.
+     * Bits above it: DRAM type and xtal mode.
+     */
+    s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000180 | MT7621_CHIP_MODE;
+    s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x40000000; /* CPU_CLK_SEL = 1 */
+    s->sysctl_regs[SYS_CUR_CLK_STS / 4]  = 0x00000101; /* /1 * 1 */
+    /*
+     * 0x3fc is polled for bit 10 before Breed's DDR3 init: it reports the
+     * DDR/PLL calibration as finished. Our DDR is always ready.
+     */
+    s->sysctl_regs[0x3fc / 4]            = 0x00000400;
+}
+
+static void mt7621_switch_defaults(MT7621State *s)
+{
+    /*
+     * MT7530 identity: CREV (0x7ffc) >> 16 must be 0x7530 and HWTRAP
+     * (0x7800) must read non-zero, otherwise mt7530-mdio refuses the chip
+     * and DSA never creates the lan/wan ports.
+     */
+    memset(s->sw_regs, 0, sizeof(s->sw_regs));
+    s->sw_page = 0;
+    s->sw_r = 0;
+    *mt7621_sw_word(s, (0x7ffc >> 6) & 0x3ff, (0x7ffc >> 2) & 0xf) = 0x75300000;
+    *mt7621_sw_word(s, (0x7800 >> 6) & 0x3ff, (0x7800 >> 2) & 0xf) = 0x00000001;
+}
+
 static void mt7621_reset(void *opaque)
 {
     MT7621State *s = opaque;
     CPUMIPSState *env = &s->cpu->env;
+
+    /* Everything the guest programmed is gone after a real reset. */
+    memset(s->eth_regs, 0, sizeof(s->eth_regs));
+    memset(s->nfi_regs, 0, sizeof(s->nfi_regs));
+    s->qtx_dtx = 0;
+    s->qtx_base = 0;
+    s->qtx_en = false;
+    s->rx_drx_idx = 0;
+    s->nfi_fifo_len = 0;
+    s->nfi_fifo_pos = 0;
+    s->nfi_col = 0;
+    s->nfi_row = 0;
+    s->nfi_served = 0;
+    s->nfi_last_cmd = 0;
+    s->nfi_addr_len = 0;
+    mt7621_sysctl_defaults(s);
+    mt7621_switch_defaults(s);
+
+    /*
+     * Linux scribbled over the RAM the bootloader lived in, so the BootROM
+     * has to load it again before the CPU is released.
+     */
+    if (s->image_file) {
+        mt7621_load_image(s, s->image_file);
+    }
 
     /* Malta does the same when a -kernel image is supplied. */
     env->CP0_Status &= ~(1 << 2); /* CP0St_ERL */
@@ -1980,14 +2085,7 @@ static void mt7621_machine_init(MachineState *machine)
     s->eth_irq = qdev_get_gpio_in(s->gic, 3);
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
 
-    /*
-     * MT7530 identity: CREV (0x7ffc) >> 16 must be 0x7530 and HWTRAP
-     * (0x7800) must read non-zero, otherwise mt7530-mdio refuses the chip
-     * and DSA never creates the lan/wan ports.
-     */
-    memset(s->sw_regs, 0, sizeof(s->sw_regs));
-    *mt7621_sw_word(s, (0x7ffc >> 6) & 0x3ff, (0x7ffc >> 2) & 0xf) = 0x75300000;
-    *mt7621_sw_word(s, (0x7800 >> 6) & 0x3ff, (0x7800 >> 2) & 0xf) = 0x00000001;
+    mt7621_switch_defaults(s);
 
     /*
      * The frame engine's NIC is part of the SoC, so attach it to the user's
@@ -2013,34 +2111,12 @@ static void mt7621_machine_init(MachineState *machine)
     memory_region_init(&s->periph, NULL, "mt7621.periph",
                        MT7621_PERIPH_SIZE);
 
-    memset(s->sysctl_regs, 0, sizeof(s->sysctl_regs));
-    /*
-     * "MT76" / "21  ".  Linux's ralink SoC probe compares these two words
-     * and panics with "mt7621: unknown SoC" if they do not match.
-     */
-    s->sysctl_regs[SYS_CHIP_NAME0 / 4]   = 0x3637544d;
-    s->sysctl_regs[SYS_CHIP_NAME1 / 4]   = 0x20203132;
-    /*
-     * SYS_CHIP_REV_ID, decoded the way U-Boot and Breed do it:
-     * bit 17 = CPU_ID (second core present), bit 16 = PKG_ID, bits 11:8
-     * = version, bits 3:0 = eco.  A real MT7621A has both bits set.
-     */
-    s->sysctl_regs[SYS_CHIP_REV_ID / 4]  = 0x00030000 | (1 << 8) | 0;
-    /*
-     * SYSCFG0: CHIP_MODE[3:0] tells the firmware which boot flash is wired
-     * up; 0 means "no NAND" and makes board_init skip the NFI entirely.
-     * Bits above it: DRAM type and xtal mode.
-     */
-    s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000180 | MT7621_CHIP_MODE;
-    s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x40000000; /* CPU_CLK_SEL = 1 */
-    s->sysctl_regs[SYS_CUR_CLK_STS / 4]  = 0x00000101; /* /1 * 1 */
-    /*
-     * 0x3fc is polled for bit 10 before Breed's DDR3 init: it reports the
-     * DDR/PLL calibration as finished. Our DDR is always ready.
-     */
-    s->sysctl_regs[0x3fc / 4]            = 0x00000400;
+    mt7621_sysctl_defaults(s);
     memory_region_init_io(&s->sysctl, NULL, &mt7621_reg_ops, s->sysctl_regs,
                           "mt7621.sysctl", 0x1000);
+    memory_region_init_io(&s->rstctl, NULL, &mt7621_rstctl_ops, s,
+                          "mt7621.rstctl", 4);
+    memory_region_add_subregion(&s->sysctl, SYS_RSTCTL, &s->rstctl);
     memory_region_add_subregion(&s->periph, MT7621_SYSCTL_OFF, &s->sysctl);
 
     /* systick: compare interrupt routed through the GIC */
@@ -2110,6 +2186,7 @@ static void mt7621_machine_init(MachineState *machine)
 
     /* Boot image */
     if (machine->kernel_filename) {
+        s->image_file = g_strdup(machine->kernel_filename);
         mt7621_nand_load(s, machine->kernel_filename);
         mt7621_load_image(s, machine->kernel_filename);
     } else {
