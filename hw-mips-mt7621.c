@@ -258,6 +258,9 @@ struct MT7621State {
     uint32_t cm_regs[MT7621_CM_SIZE / 4];
 
     /* systick state: count = base + elapsed, anchored at base_ns */
+    QEMUTimer *poweroff_timer;  /* detects a parked CPU (poweroff/halt) */
+    unsigned halt_ticks;
+    bool halt_seen_running;
     QEMUTimer *systick_timer;
     QEMUTimer *systick_pulse_off;
     qemu_irq systick_irq;
@@ -1927,6 +1930,59 @@ static void mt7621_sysctl_defaults(MT7621State *s)
     s->sysctl_regs[0x3fc / 4]            = 0x00000400;
 }
 
+static void mt7621_cm_defaults(MT7621State *s)
+{
+    memset(s->cm_regs, 0, sizeof(s->cm_regs));
+    s->cm_regs[(MT7621_GCR_OFF + GCR_CONFIG) / 4] = 0x00000004; /* 4 cores */
+    s->cm_regs[(MT7621_GCR_OFF + GCR_BASE) / 4]   = 0x1fbf8000;
+    s->cm_regs[(MT7621_GCR_OFF + GCR_REV) / 4]    = 0x00000002;
+    /*
+     * The MT7621 GIC is the legacy MIPS GIC at 0x1fbc0000, not a CM-managed
+     * GIC; advertising one in the GCR makes Breed take a CM-GIC path that
+     * does not exist on this SoC and crash.
+     */
+    s->cm_regs[(MT7621_GCR_OFF + GCR_GIC_STATUS) / 4] = 0x00000000;
+    s->cm_regs[(MT7621_GCR_OFF + GCR_CPC_STATUS) / 4] = 0x00000001;
+}
+
+static void mt7621_dramc_defaults(MT7621State *s)
+{
+    memset(s->dramc_regs, 0, sizeof(s->dramc_regs));
+    s->dramc_regs[0x604 / 4] = 0x00000000;
+    s->dramc_regs[0x618 / 4] = 0x00000190;
+    s->dramc_regs[0x648 / 4] = 0x03800000;
+    s->dramc_regs[0x3fc / 4] = 0x00000400;
+}
+
+/*
+ * `poweroff` and `halt` on this SoC both end in machine_hang(): interrupts
+ * are disabled, all of them are masked and the CPU parks in WAIT.  Nothing
+ * is written to the system controller, so the only way to notice is that a
+ * CPU which can no longer be woken stays halted.
+ */
+static void mt7621_poweroff_poll(void *opaque)
+{
+    MT7621State *s = opaque;
+    CPUState *cs = CPU(s->cpu);
+    CPUMIPSState *env = &s->cpu->env;
+    bool parked = cs->halted && !(env->CP0_Status & (1 << CP0St_IE));
+
+    if (!s->halt_seen_running) {
+        if (!cs->halted) {
+            s->halt_seen_running = true;
+        }
+    } else if (parked) {
+        if (++s->halt_ticks >= 4) {
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        }
+    } else {
+        s->halt_ticks = 0;
+    }
+
+    timer_mod(s->poweroff_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
+}
+
 static void mt7621_switch_defaults(MT7621State *s)
 {
     /*
@@ -1960,8 +2016,14 @@ static void mt7621_reset(void *opaque)
     s->nfi_served = 0;
     s->nfi_last_cmd = 0;
     s->nfi_addr_len = 0;
+    s->nfi_addr_pending = 0;
+    s->nfi_wbuf_len = 0;
+    s->nfi_writing = false;
     mt7621_sysctl_defaults(s);
     mt7621_switch_defaults(s);
+    mt7621_dramc_defaults(s);
+    mt7621_cm_defaults(s);
+    memset(s->systick_regs, 0, sizeof(s->systick_regs));
 
     /*
      * Linux scribbled over the RAM the bootloader lived in, so the BootROM
@@ -2017,6 +2079,11 @@ static void mt7621_machine_init(MachineState *machine)
     cpu_mips_irq_init_cpu(s->cpu);
     cpu_mips_clock_init(s->cpu);
     qemu_register_reset(mt7621_reset, s);
+
+    s->poweroff_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                     mt7621_poweroff_poll, s);
+    timer_mod(s->poweroff_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
 
     /* DDR */
     memory_region_init_ram(&s->ram, NULL, "mt7621.ddr", ram_size,
@@ -2133,11 +2200,7 @@ static void mt7621_machine_init(MachineState *machine)
     memory_region_add_subregion(&s->periph, MT7621_SYSTICK_OFF,
                                 &s->systick);
 
-    memset(s->dramc_regs, 0, sizeof(s->dramc_regs));
-    s->dramc_regs[0x604 / 4] = 0x00000000;
-    s->dramc_regs[0x618 / 4] = 0x00000190;
-    s->dramc_regs[0x648 / 4] = 0x03800000;
-    s->dramc_regs[0x3fc / 4] = 0x00000400;
+    mt7621_dramc_defaults(s);
     memory_region_init_io(&s->dramc, NULL, &mt7621_reg_ops, s->dramc_regs,
                           "mt7621.dramc", 0x1000);
     memory_region_add_subregion(&s->periph, MT7621_DRAMC_OFF, &s->dramc);
@@ -2150,17 +2213,7 @@ static void mt7621_machine_init(MachineState *machine)
 
 
     /* Coherence manager + cluster power controller */
-    memset(s->cm_regs, 0, sizeof(s->cm_regs));
-    s->cm_regs[(MT7621_GCR_OFF + GCR_CONFIG) / 4] = 0x00000004; /* 4 cores */
-    s->cm_regs[(MT7621_GCR_OFF + GCR_BASE) / 4]   = 0x1fbf8000;
-    s->cm_regs[(MT7621_GCR_OFF + GCR_REV) / 4]    = 0x00000002;
-    /*
-     * The MT7621 GIC is the legacy MIPS GIC at 0x1fbc0000, not a CM-managed
-     * GIC; advertising one in the GCR makes Breed take a CM-GIC path that
-     * does not exist on this SoC and crash.
-     */
-    s->cm_regs[(MT7621_GCR_OFF + GCR_GIC_STATUS) / 4] = 0x00000000;
-    s->cm_regs[(MT7621_GCR_OFF + GCR_CPC_STATUS) / 4] = 0x00000001;
+    mt7621_cm_defaults(s);
     memory_region_init_io(&s->cm, NULL, &mt7621_cm_ops, s->cm_regs,
                           "mt7621.cm", MT7621_CM_SIZE);
     memory_region_add_subregion(sysmem, MT7621_CM_BASE, &s->cm);
