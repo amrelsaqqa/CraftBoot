@@ -554,8 +554,9 @@ static uint64_t mt7621_nfi_read(void *opaque, hwaddr addr, unsigned size)
         val = 0;
         break;
     case NFI_ADDRCNTR:
-        /* sector counter used to detect program completion */
-        val = s->nfi_writing ? 0x00000010 : 0x00000010;
+        /* SEC_CNTR is bits 15:12; report all sectors transferred so the
+         * driver's program-completion poll succeeds immediately. */
+        val = 0x0000f000;
         break;
     case 0xa0 ... 0xbf:
         /*
