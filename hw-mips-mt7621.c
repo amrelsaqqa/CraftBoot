@@ -365,7 +365,8 @@ static uint32_t *mt7621_sw_word(MT7621State *s, unsigned page, unsigned r)
 
 static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
 {
-    static const uint16_t phy_regs[32] = {
+    /* A connected PHY: 100BASE-TX full duplex, autonegotiation done. */
+    static const uint16_t phy_up[32] = {
         [0]  = 0x1140,          /* BMCR: autoneg, full duplex */
         [1]  = 0x796d,          /* BMSR: link up, autoneg complete */
         [2]  = 0x0362,          /* PHY ID1 */
@@ -373,6 +374,15 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
         [4]  = 0x01e1,          /* advertise */
         [5]  = 0x45e1,          /* link partner ability */
         [9]  = 0x0300,          /* 1000BASE-T control */
+    };
+    /* Nothing plugged in: no link, no link partner, autoneg still running. */
+    static const uint16_t phy_down[32] = {
+        [0]  = 0x1140,
+        [1]  = 0x7949,
+        [2]  = 0x0362,
+        [3]  = 0x5c30,
+        [4]  = 0x01e1,
+        [9]  = 0x0300,
     };
 
     if (phy == 0x1f) {
@@ -399,7 +409,13 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
         }
         return *mt7621_sw_word(s, s->sw_page, r) & 0xffff;
     }
-    return phy_regs[reg & 0x1f];
+    /*
+     * Only the switch port that owns the net backend has a cable in it.
+     * The internal PHYs are addressed by port number (lan4 = 1 ... lan1 = 4)
+     * and the wan PHY sits at address 0.
+     */
+    return (phy && phy == s->eth_port) ? phy_up[reg & 0x1f]
+                                       : phy_down[reg & 0x1f];
 }
 
 static uint64_t mt7621_eth_read(void *opaque, hwaddr addr, unsigned size)
