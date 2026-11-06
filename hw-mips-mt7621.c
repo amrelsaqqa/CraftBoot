@@ -791,7 +791,7 @@ static void mt7621_systick_expire(void *opaque)
     s->systick_base_ns = now;
     mt7621_systick_set_pending(s, true);
     timer_mod(s->systick_pulse_off, now + 20000);
-    /* Auto-reload: keep a steady tick even if the guest never writes COMPARE. */
+    /* Keep a steady tick for firmware that arms COMPARE only once. */
     s->systick_regs[SYSTICK_COMPARE / 4] =
         (s->systick_base_count + MT7621_SYSTICK_PERIOD) & 0xffff;
     mt7621_systick_rearm(s);
@@ -1075,7 +1075,7 @@ static void mt7621_reset(void *opaque)
 
         s->systick_regs[SYSTICK_CONFIG / 4] =
             SYSTICK_CFG_CNT_EN | SYSTICK_CFG_EXT_STK_EN;
-        s->systick_regs[SYSTICK_COMPARE / 4] = MT7621_SYSTICK_PERIOD;
+        s->systick_regs[SYSTICK_COMPARE / 4] = 0xffff;
         s->systick_base_count = 0;
         s->systick_base_ns = now;
         mt7621_systick_set_pending(s, false);
@@ -1186,7 +1186,7 @@ static void mt7621_machine_init(MachineState *machine)
      * Bits above it: DRAM type and xtal mode.
      */
     s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000180 | MT7621_CHIP_MODE;
-    s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x00000000; /* CPU PLL 500 MHz */
+    s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x40000000; /* CPU_CLK_SEL = 1 */
     s->sysctl_regs[SYS_CUR_CLK_STS / 4]  = 0x00000101; /* /1 * 1 */
     /*
      * 0x3fc is polled for bit 10 before Breed's DDR3 init: it reports the
