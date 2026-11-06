@@ -5332,6 +5332,7 @@ static IPQRegFile *add_regfile(MemoryRegion *parent, hwaddr base, hwaddr size,
 /* Implemented with the MDIO/PHY model below; the packet path needs them first. */
 static const char *ipq_port_name(int port);
 static void ipq_eth_set_host_link(int switch_port, bool up);
+static void ipq_eth_plug_host(int switch_port, bool up);
 
 /*
  * The EDMA is the DMA engine between the CPU and the switch that is built
@@ -6137,7 +6138,7 @@ static void edma_connect_netdev(IPQEdma *e)
                        &e->rx_guard, e);
     e->nc = qemu_get_queue(nic);
     e->host_link = !peer->link_down;
-    ipq_eth_set_host_link(e->bridge_port, e->host_link);
+    ipq_eth_plug_host(e->bridge_port, e->host_link);
     info_report("ipq4019: eth0 -> -netdev '%s' on switch port %d (%s)",
                 id, e->bridge_port, ipq_port_name(e->bridge_port));
 }
@@ -6601,6 +6602,33 @@ static void ipq_eth_set_host_link(int switch_port, bool up)
                     ipq_port_name(switch_port), up ? "up" : "down");
     }
     p->link = up;
+}
+
+/*
+ * The host's wire goes into one socket.  A board in front of someone has that
+ * one cable in it, so attaching a backend is also saying what the rest of the
+ * front panel looks like: the port the -netdev sits behind gets the host's
+ * carrier, and every other copper PHY is an empty socket that reads link down.
+ * Only done when a backend exists -- with no -netdev there is no host wire at
+ * all, and the board's own eth-ports link states are what the guest sees.
+ */
+static void ipq_eth_plug_host(int switch_port, bool up)
+{
+    int i;
+
+    if (!ipq->mdio) {
+        return;
+    }
+    for (i = 0; i < ipq->mdio->nphy; i++) {
+        IPQPhy *p = &ipq->mdio->phy[i];
+
+        /* the port with the wire, and the switch's PCS (not a socket) */
+        if (p->addr == switch_port - 1 || p->addr == IPQ_PSGMII_ADDR) {
+            continue;
+        }
+        p->link = 0;
+    }
+    ipq_eth_set_host_link(switch_port, up);
 }
 
 static uint64_t mdio_read(void *opaque, hwaddr off, unsigned size)
