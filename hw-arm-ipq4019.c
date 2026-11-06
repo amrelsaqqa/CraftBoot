@@ -5226,6 +5226,15 @@ struct IPQRegFile {
         uint32_t mask;
     } clr[8];
     int nclr;
+    /*
+     * The contents at the end of machine init, i.e. what the hardware reads
+     * after power-on.  A system reset drops whatever the previous OS left
+     * behind and restores this, not zeroes: registers whose value is
+     * configuration (the switch's device id) have already been programmed by
+     * the time the guest runs, and the reset it gets before its first
+     * instruction must not wipe them.
+     */
+    uint32_t *por;
 };
 
 static uint64_t regfile_read(void *opaque, hwaddr off, unsigned size)
@@ -8492,7 +8501,27 @@ static void reset_regfiles(void)
     for (i = 0; i < (int)ipq->regfile_list->len; i++) {
         IPQRegFile *r = g_ptr_array_index(ipq->regfile_list, i);
 
-        memset(r->regs, 0, r->nregs * sizeof(uint32_t));
+        if (r->por) {
+            memcpy(r->regs, r->por, r->nregs * sizeof(uint32_t));
+        } else {
+            memset(r->regs, 0, r->nregs * sizeof(uint32_t));
+        }
+    }
+}
+
+/* Freeze every register file at its power-on contents; call once, at init. */
+static void regfile_seal_all(void)
+{
+    int i;
+
+    if (!ipq->regfile_list) {
+        return;
+    }
+    for (i = 0; i < (int)ipq->regfile_list->len; i++) {
+        IPQRegFile *r = g_ptr_array_index(ipq->regfile_list, i);
+
+        r->por = g_renew(uint32_t, r->por, r->nregs);
+        memcpy(r->por, r->regs, r->nregs * sizeof(uint32_t));
     }
 }
 
@@ -9160,7 +9189,9 @@ static void ipq4019_init(MachineState *machine)
          * what qca8k_read_switch_id() insists on before it will bind -- with
          * the register reading 0 the driver bails out with
          * "Switch id detected 0 but expected 14" (both %x) and no DSA ports
-         * ever appear.
+         * ever appear.  This is a power-on value, so it has to survive the
+         * reset the machine gets before the guest runs; regfile_seal_all()
+         * is what freezes it (see IPQRegFile::por).
          */
         ess->regs[0] = 0x1402;
         /* command registers whose busy bit clears when the op completes */
@@ -9459,6 +9490,13 @@ static void ipq4019_init(MachineState *machine)
         }
         arm_load_kernel(ARM_CPU(first_cpu), machine, &ipq4019_binfo);
     }
+
+    /*
+     * Everything the machine programmed into a register file during init is
+     * the hardware's power-on state.  Freeze it before the first reset, which
+     * happens as the machine starts and would otherwise zero it.
+     */
+    regfile_seal_all();
 
     /*
      * The QSEE handover policy, if the image has a QSEE stage.  Installed
