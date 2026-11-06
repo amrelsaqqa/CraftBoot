@@ -361,9 +361,16 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
             return 0xffff;      /* page register: data ignored on read */
         }
         if (r == 0x10) {
-            return (*mt7621_sw_word(s, s->sw_page, s->sw_r) >> 16) & 0xffff;
+            uint32_t w = *mt7621_sw_word(s, s->sw_page, s->sw_r);
+
+            s->sw_r = 0;
+            return (w >> 16) & 0xffff;
         }
         s->sw_r = r;
+        if (getenv("MT7621_ETHLOG")) {
+            fprintf(stderr, "eth: sw rd page=%03x r=%x -> %08x\n",
+                    s->sw_page, r, *mt7621_sw_word(s, s->sw_page, r));
+        }
         return *mt7621_sw_word(s, s->sw_page, r) & 0xffff;
     }
     return phy_regs[reg & 0x1f];
