@@ -3200,6 +3200,7 @@ typedef struct IPQQpicBamPipe {
 
 typedef struct IPQQpicBam {
     MemoryRegion mr;
+    qemu_irq irq;               /* SPI 101, level high */
     uint32_t ctrl, desc_trshld, cfg_bits;
     uint32_t irq_stts, irq_en;
     uint32_t irq_srcs_msk, irq_srcs_msk_ee;
@@ -3219,6 +3220,20 @@ static uint32_t qpic_bam_irq_pending(IPQQpicBam *b)
         }
     }
     return srcs & (b->irq_srcs_msk_ee | b->irq_srcs_msk);
+}
+
+/*
+ * Raise the BAM's line the way the BLSP1 BAM does.  RouterBOOT polls the
+ * command pipe, which is why the QPIC worked with no line at all, but a Linux
+ * NAND driver enables the pipe's "transfer end" source and waits for the
+ * interrupt -- with nothing driving SPI 101 the wait times out and the probe
+ * reports "NAND is not detected".
+ */
+static void qpic_bam_update_irq(IPQQpicBam *b)
+{
+    if (b->irq) {
+        qemu_set_irq(b->irq, qpic_bam_irq_pending(b) != 0);
+    }
 }
 
 static void qpic_bam_data_in(IPQQpic *q, uint32_t addr, uint32_t len)
@@ -3367,6 +3382,7 @@ static void qpic_bam_run(IPQQpicBam *b, int n, uint32_t doorbell)
     }
     p->irq_stts |= QB_P_IRQ_PRCSD | QB_P_IRQ_TRNSFR_END;
     p->irq_stts &= ~QB_P_IRQ_OUT_DESC;
+    qpic_bam_update_irq(b);
 }
 
 static uint64_t qpic_bam_read(void *opaque, hwaddr off, unsigned size)
@@ -3443,10 +3459,17 @@ static void qpic_bam_write(void *opaque, hwaddr off, uint64_t val,
             if (val & 1) {
                 p->cons = 0;
                 p->irq_stts = 0;
+                qpic_bam_update_irq(b);
             }
             break;
-        case QB_P_IRQ_CLR:   p->irq_stts &= ~(uint32_t)val; break;
-        case QB_P_IRQ_EN:    p->irq_en = (uint32_t)val; break;
+        case QB_P_IRQ_CLR:
+            p->irq_stts &= ~(uint32_t)val;
+            qpic_bam_update_irq(b);
+            break;
+        case QB_P_IRQ_EN:
+            p->irq_en = (uint32_t)val;
+            qpic_bam_update_irq(b);
+            break;
         case QB_P_EVNT_REG:
             p->evnt_reg = (uint32_t)val;
             qpic_bam_run(b, n, (uint32_t)val);
@@ -3464,10 +3487,22 @@ static void qpic_bam_write(void *opaque, hwaddr off, uint64_t val,
     case QB_CTRL:        b->ctrl = (uint32_t)val; break;
     case QB_DESC_TRSHLD: b->desc_trshld = (uint32_t)val; break;
     case QB_CNFG_BITS:   b->cfg_bits = (uint32_t)val; break;
-    case QB_IRQ_CLR:     b->irq_stts &= ~(uint32_t)val; break;
-    case QB_IRQ_EN:      b->irq_en = (uint32_t)val; break;
-    case QB_IRQ_SRCS_MSK: b->irq_srcs_msk = (uint32_t)val; break;
-    case QB_IRQ_SRCS_MSK_EE: b->irq_srcs_msk_ee = (uint32_t)val; break;
+    case QB_IRQ_CLR:
+        b->irq_stts &= ~(uint32_t)val;
+        qpic_bam_update_irq(b);
+        break;
+    case QB_IRQ_EN:
+        b->irq_en = (uint32_t)val;
+        qpic_bam_update_irq(b);
+        break;
+    case QB_IRQ_SRCS_MSK:
+        b->irq_srcs_msk = (uint32_t)val;
+        qpic_bam_update_irq(b);
+        break;
+    case QB_IRQ_SRCS_MSK_EE:
+        b->irq_srcs_msk_ee = (uint32_t)val;
+        qpic_bam_update_irq(b);
+        break;
     default: break;
     }
 }
@@ -3569,6 +3604,7 @@ static void qpic_dev_reset(void)
     for (i = 0; i < QB_PIPES; i++) {
         memset(&b->pipe[i], 0, sizeof(b->pipe[i]));
     }
+    qpic_bam_update_irq(b);
 }
 
 static void ipq_board_add_qpic_nand(MemoryRegion *sysmem)
@@ -10151,6 +10187,10 @@ static void ipq4019_init(MachineState *machine)
              * gic_set_irq(), so input line n is SPI n.
              */
             bam->irq = qdev_get_gpio_in(gicdev, 238);
+            /* QPIC's own BAM: <GIC_SPI 101> (qcom-ipq4019.dtsi, dma@7984000) */
+            if (ipq_qpic_bam) {
+                ipq_qpic_bam->irq = qdev_get_gpio_in(gicdev, 101);
+            }
             if (ipq->qup_spi) {
                 ipq->qup_spi->irq = qdev_get_gpio_in(gicdev, 95);
             }
