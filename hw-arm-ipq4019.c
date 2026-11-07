@@ -3056,6 +3056,14 @@ static void qpic_exec(IPQQpic *q)
     uint32_t op = cmd & QN_CMD_OP_MASK;
     uint32_t page = ((q->reg[QN_ADDR1 / 4] & 0xff) << 16) |
                     ((q->reg[QN_ADDR0 / 4] >> 16) & 0xffff);
+    /*
+     * The erase command is the odd one out: it carries the row in ADDR0[15:0]
+     * (ADDR1[7:0] for the high bits) instead of ADDR0[31:16].  Reading it like
+     * a page command made every erase land on page 0, so the blocks being
+     * formatted were never erased and the filesystem could not be mounted.
+     */
+    uint32_t row_erase = (q->reg[QN_ADDR0 / 4] & 0xffff) |
+                         ((q->reg[QN_ADDR1 / 4] & 0xff) << 16);
 
     /*
      * The command pipe and the data pipe are independent: EXEC can arrive
@@ -3094,7 +3102,7 @@ static void qpic_exec(IPQQpic *q)
         break;
 
     case QN_OP_BLOCK_ERASE:
-        qpic_die_erase(q->die, page);
+        qpic_die_erase(q->die, row_erase);
         /*
          * The page buffer holds what the last read put there; the array has
          * just changed underneath it, so the next read of the same page has to
@@ -10528,7 +10536,22 @@ static void ipq4019_init(MachineState *machine)
      * out, which the driver turns into a failed probe instead of a fault.  A
      * real card in the slot is a later, separate piece of work.
      */
-    add_stub_ex(sysmem, 0x40000000, 0x00010000, "pcie0-dbi", 0);
+    {
+        /*
+         * The DBI as the core reports itself at power-on: Qualcomm vendor id,
+         * a PCI-to-PCI bridge header (so hdr_type is 0x01, not 0xff) and the
+         * bridge class code.  The installer's pcie_qcom reads these before it
+         * programs the inbound window, and all-ones makes it take a path that
+         * writes the iATU before it has looked at the header at all.
+         */
+        IPQStub *dbi = add_stub_ex(sysmem, 0x40000000, 0x00100000, "pcie0-dbi",
+                                   0);
+
+        dbi->def_read = 0;                      /* an idle core reports 0 */
+        stub_pin(dbi, 0x000, 0x17cb0101u);      /* vendor 0x17cb, device 0x0101 */
+        stub_pin(dbi, 0x008, 0x06040001u);      /* class: PCI bridge */
+        stub_pin(dbi, 0x00c, 0x00010008u);      /* header type 0x01 = bridge */
+    }
     add_stub_ex(sysmem, 0x40100000, 0x00001000, "pcie0-config", 0);
     /*
      * The root complex's own outbound windows: IO at 0x40200000 (1 MiB) and
