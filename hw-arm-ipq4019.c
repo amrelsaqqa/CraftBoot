@@ -3193,14 +3193,24 @@ static void qpic_reg_write(IPQQpic *q, uint32_t off, uint32_t val)
     }
 }
 
+/*
+ * Direct register accesses, separate from the command elements: a driver's
+ * probe reads the version and writes the config registers before it posts a
+ * single command, so "no exec at all" cannot tell a probe that failed early
+ * from a driver that never bound.  These lines are few -- the bulk of the
+ * traffic goes through the BAM -- so they stay readable during a scan.
+ */
 static uint64_t qpic_mmio_read(void *opaque, hwaddr off, unsigned size)
 {
     IPQQpic *q = opaque;
+    uint64_t v;
 
     if (off >= IPQ_QPIC_NANDC_SIZE) {
         return 0;
     }
-    return qpic_reg_read(q, (uint32_t)off);
+    v = qpic_reg_read(q, (uint32_t)off);
+    qpic_log("qpic: mmio read off=%#x -> %08x\n", (uint32_t)off, (uint32_t)v);
+    return v;
 }
 
 static void qpic_mmio_write(void *opaque, hwaddr off, uint64_t val,
@@ -3211,6 +3221,8 @@ static void qpic_mmio_write(void *opaque, hwaddr off, uint64_t val,
     if (off >= IPQ_QPIC_NANDC_SIZE) {
         return;
     }
+    qpic_log("qpic: mmio write off=%#x <- %08x\n", (uint32_t)off,
+             (uint32_t)val);
     qpic_reg_write(q, (uint32_t)off, (uint32_t)val);
 }
 
