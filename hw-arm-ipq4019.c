@@ -10539,7 +10539,7 @@ static void ipq4019_init(MachineState *machine)
      * panic was the DBI page, this is the next one, one window further in.
      * Plain RAM makes an empty window harmless.
      */
-    add_mem(sysmem, 0x40200000, 0x00e00000, "pcie0-window");
+    add_stub(sysmem, 0x40200000, 0x00e00000, "pcie0-window");
 
     /*
      * qca-gcnt is the 32.768 kHz sleep counter.  Firmware delay loops use the
