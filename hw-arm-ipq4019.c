@@ -2814,10 +2814,18 @@ static bool ipq_nand_store_loaded;
  */
 #define IPQ_QPIC_BAM_BASE    (IPQ_QPIC_BASE + 0x00004000u)  /* 0x07984000 */
 #define IPQ_QPIC_BAM_SIZE    0x0001a000u
+/*
+ * The BAM node in the board tree maps 0x1a000 bytes, but the driver also uses
+ * the pipe-attribute page at BAM+0x1c000 (QPIC+0x20100), reached through the
+ * command pipe like any other register.  Those bytes are modelled as a plain
+ * shadow: what is written there reads back.
+ */
+#define IPQ_QPIC_BAM_EXT     0x00006000u
 #define IPQ_QPIC_NANDC_BASE  (IPQ_QPIC_BASE + 0x00030000u)  /* 0x079b0000 */
 #define IPQ_QPIC_NANDC_SIZE  0x00001000u
 /* what a command element puts in its low 24 bits (see qpic_bam_ce) */
 #define QN_CE_BASE           ((IPQ_QPIC_BASE + 0x00030000u) & 0xffffffu)
+#define QN_BAM_CE            ((IPQ_QPIC_BASE + 0x00004000u) & 0xffffffu)
 
 /* NANDc register offsets (nand-qpic-common.h) */
 #define QN_CMD              0x000
@@ -3250,6 +3258,7 @@ typedef struct IPQQpicBam {
     uint32_t irq_stts, irq_en;
     uint32_t irq_srcs_msk, irq_srcs_msk_ee;
     IPQQpicBamPipe pipe[QB_PIPES];
+    uint32_t ext[IPQ_QPIC_BAM_EXT / 4];    /* pipe-attribute page and up */
 } IPQQpicBam;
 
 static IPQQpicBam *ipq_qpic_bam;
@@ -3344,6 +3353,10 @@ static void qpic_bam_data_out(IPQQpic *q, uint32_t addr, uint32_t len)
  * NAND_FLASH_CMD, exactly like a CPU store would.  The command pipe's own FIFO
  * holds ordinary {addr,len} descriptors whose payload is an array of these.
  */
+static uint64_t qpic_bam_read_raw(void *opaque, hwaddr off, unsigned size);
+static void qpic_bam_write(void *opaque, hwaddr off, uint64_t val,
+                           unsigned size);
+
 static void qpic_bam_ce(IPQQpicBam *b, uint32_t ce_addr, uint32_t ce_size)
 {
     IPQQpic *q = ipq_board->qpic;
@@ -3380,6 +3393,30 @@ static void qpic_bam_ce(IPQQpicBam *b, uint32_t ce_addr, uint32_t ce_size)
          * i.e. (QPIC base + BAM offset + register offset) & 0xffffff.  On this
          * SoC that is 0x9b0000 + reg_off.
          */
+        if (off >= QN_BAM_CE && off - QN_BAM_CE < IPQ_QPIC_BAM_SIZE +
+                                                    IPQ_QPIC_BAM_EXT) {
+            uint32_t roff = off - QN_BAM_CE;
+
+            /*
+             * The command pipe's 24-bit address covers the whole QPIC block,
+             * so a driver can read and write BAM registers with a command
+             * element -- MikroTik's does, for the pipe-attribute page at
+             * BAM+0x1c000 (QPIC+0x20100), which is where the SPS layer looks
+             * before it hands a pipe to the NAND engine.
+             */
+            if (c == 1) {
+                uint64_t dst = (uint64_t)hi << 32 | data;
+                uint32_t v = qpic_bam_read_raw(b, roff, 4);
+
+                qpic_log("qpic: ce read off=%#x -> %08x\n", off, v);
+                address_space_write(&address_space_memory, dst,
+                                    MEMTXATTRS_UNSPECIFIED, &v, 4);
+            } else {
+                qpic_log("qpic: ce write off=%#x <- %08x (bam)\n", off, data);
+                qpic_bam_write(b, roff, data, 4);
+            }
+            continue;
+        }
         if (off < QN_CE_BASE || off - QN_CE_BASE + 4 > IPQ_QPIC_NANDC_SIZE) {
             continue;       /* not a NANDc register: the BAM is not ours */
         }
@@ -3474,6 +3511,11 @@ static uint64_t qpic_bam_read_raw(void *opaque, hwaddr off, unsigned size)
         default:             return 0;
         }
     }
+    if (off >= IPQ_QPIC_BAM_SIZE) {
+        unsigned idx = (off - IPQ_QPIC_BAM_SIZE) / 4;
+
+        return idx < ARRAY_SIZE(b->ext) ? b->ext[idx] : 0;
+    }
     switch (off) {
     case QB_CTRL:        return b->ctrl;
     case QB_DESC_TRSHLD: return b->desc_trshld;
@@ -3540,6 +3582,14 @@ static void qpic_bam_write(void *opaque, hwaddr off, uint64_t val,
         case QB_P_EVNT_TRSHLD: p->evnt_trshld = (uint32_t)val; break;
         case QB_P_EVNT_DEST: p->evnt_dest = (uint32_t)val; break;
         default: break;
+        }
+        return;
+    }
+    if (off >= IPQ_QPIC_BAM_SIZE) {
+        unsigned idx = (off - IPQ_QPIC_BAM_SIZE) / 4;
+
+        if (idx < ARRAY_SIZE(b->ext)) {
+            b->ext[idx] = (uint32_t)val;
         }
         return;
     }
