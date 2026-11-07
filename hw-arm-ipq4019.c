@@ -2923,9 +2923,17 @@ static void qpic_die_persist(IPQParNand *d, const void *src, uint32_t off,
 static void qpic_die_erase(IPQParNand *d, uint32_t page)
 {
     uint32_t blk = page / NAND_PPBLK;
-    uint32_t off = blk * NAND_PPBLK * NAND_STRIDE;
-    uint32_t len = NAND_PPBLK * NAND_STRIDE;
+    uint32_t off = blk * NAND_BLKBYTES;
+    uint32_t len = NAND_BLKBYTES;
 
+    /*
+     * A block address past the part does not decode, so there is nothing to
+     * erase -- and this must not walk off the end of the array when a
+     * bootloader believes the part is larger than the die it was given.
+     */
+    if (blk >= d->pages / NAND_PPBLK) {
+        return;
+    }
     memset(d->data + off, 0xff, len);
     qpic_die_persist(d, d->data + off, off, len);
     ipq_die_store_sync(&d->store);
@@ -3008,6 +3016,8 @@ static void qpic_commit_program(IPQQpic *q)
     qpic_die_program(q->die, q->last_page, q->wr_col, q->buf, q->in_len);
     q->in_len = 0;
     ipq_die_store_sync(&q->die->store);
+    q->have_page = false;
+    q->last_page = UINT32_MAX;
 }
 
 static void qpic_exec(IPQQpic *q)
@@ -3055,6 +3065,15 @@ static void qpic_exec(IPQQpic *q)
 
     case QN_OP_BLOCK_ERASE:
         qpic_die_erase(q->die, page);
+        /*
+         * The page buffer holds what the last read put there; the array has
+         * just changed underneath it, so the next read of the same page has to
+         * fetch again.  Without this a read-after-erase (RouterBOOT verifies
+         * its own writes that way) would answer with the erased page's previous
+         * contents.
+         */
+        q->have_page = false;
+        q->last_page = UINT32_MAX;
         break;
 
     case QN_OP_PAGE_READ:
@@ -3085,6 +3104,8 @@ static void qpic_exec(IPQQpic *q)
             qpic_die_program(q->die, page, q->wr_col, q->buf, q->in_len);
             q->in_len = 0;
             ipq_die_store_sync(&q->die->store);
+            q->have_page = false;
+            q->last_page = UINT32_MAX;
         } else {
             /*
              * The engine and the data channel are independent: the command
