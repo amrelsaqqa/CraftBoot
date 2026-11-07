@@ -236,6 +236,7 @@ typedef struct IPQEdma IPQEdma;
 typedef struct IPQMdio IPQMdio;
 typedef struct IPQUart IPQUart;
 typedef struct IPQBootStage IPQBootStage;
+typedef struct IPQQpic IPQQpic;
 
 typedef struct IPQ4019State {
     /* on-die buses and controllers */
@@ -285,6 +286,7 @@ typedef struct IPQKey {
 typedef struct IPQBoardState {
     IPQMem *nor;                /* the die behind the QUP's chip select 0 */
     IPQNand *nand;              /* ... and chip select 1 */
+    IPQQpic *qpic;              /* the die behind the QPIC parallel controller */
 
     IPQLed *leds;               /* the board's lamps, in configuration order */
     unsigned n_leds;
@@ -347,6 +349,7 @@ typedef enum IPQBootDev {
     IPQ_BOOT_NONE = 0,
     IPQ_BOOT_SPI_NOR,           /* SPI NOR behind the QUP, flash type 6 */
     IPQ_BOOT_SPI_NAND,          /* SPI NAND behind the QUP, still type 6 */
+    IPQ_BOOT_QPIC_NAND,         /* parallel NAND behind the QPIC, type 2 */
 } IPQBootDev;
 
 typedef struct IPQBoardConfig {
@@ -363,6 +366,20 @@ typedef struct IPQBoardConfig {
     const char *nand_file;
     const char *nand_drive;
     const char *nand_image;
+
+    /*
+     * ... and a *parallel* NAND behind the QPIC controller?  That is a
+     * different part on a different bus: the QPIC controller drives the NAND
+     * bus itself (and a BAM moves the bytes), where the SPI NAND above hangs
+     * off the QUP's second chip select.  A board can have either, both or
+     * neither; the hAP ac3 has a NOR and this one.
+     */
+    bool qpic_nand;
+    uint32_t qpic_nand_size;
+    const char *qpic_nand_id;
+    const char *qpic_nand_file;
+    const char *qpic_nand_drive;
+    const char *qpic_nand_image;
 
     /* the TLMM pins the board wires to the dies' chip selects */
     uint32_t nor_cs_gpio;
@@ -412,6 +429,12 @@ enum {
     IPQ_CFG_ETH_BRIDGE = 1u << 18,
     IPQ_CFG_ETH_PHY_ID = 1u << 19,
     IPQ_CFG_POWEROFF   = 1u << 20,
+    IPQ_CFG_QPIC_NAND       = 1u << 21,
+    IPQ_CFG_QPIC_NAND_SIZE  = 1u << 22,
+    IPQ_CFG_QPIC_NAND_ID    = 1u << 23,
+    IPQ_CFG_QPIC_NAND_FILE  = 1u << 24,
+    IPQ_CFG_QPIC_NAND_DRIVE = 1u << 25,
+    IPQ_CFG_QPIC_NAND_IMAGE = 1u << 26,
 };
 
 typedef struct IPQBoardPreset {
@@ -464,6 +487,30 @@ static const IPQBoardPreset ipq_board_presets[] = {
         .nand_id = "c212",
         .nand_cs_gpio = 59,
         .leds = "user-led:3;power-led:0;usb-power-off:2:al",
+        .eth_ports = "0;1;2;3;4",
+        .boot = IPQ_BOOT_SPI_NOR,
+    } },
+    /*
+     * MikroTik hAP ac3 (RBD53iG-5HacD2HnD-TC), from its own device tree
+     * (qcom-ipq4019-hap-ac3.dts): a 16 MiB NOR and a 128 MiB *parallel* NAND
+     * behind the QPIC controller.  Every pin here is a `gpios =` line in that
+     * tree; the NAND is a MX30LF1G18AC (its id is what the driver prints as
+     * c2 f1 80 1d), 2048+64 byte pages in 64-page blocks.
+     *
+     * The board boots from the NOR in this preset because that is what the
+     * dumps of it in circulation are; RouterBOOT finds the rest of the
+     * installation on the NAND.
+     */
+    { "hap-ac3", {
+        .nor = true,
+        .nor_size = 16777216,
+        .nor_id = "ef4018",
+        .nor_cs_gpio = 54,
+        .qpic_nand = true,
+        .qpic_nand_size = NAND_BYTES_DEF,
+        .qpic_nand_id = "c2f1801d",
+        .leds = "status-blue:0;status-red:1;status-green:3;wlan:23;"
+                "ethernet:22;wan:28;lan1:29;lan2:30;lan3:31;lan4:32;poe:36",
         .eth_ports = "0;1;2;3;4",
         .boot = IPQ_BOOT_SPI_NOR,
     } },
@@ -576,6 +623,12 @@ static void ipq_board_config_resolve(MachineState *machine)
     if (ipq_cfg_set & IPQ_CFG_NAND_FILE)  { ipq_cfg.nand_file  = want.nand_file; }
     if (ipq_cfg_set & IPQ_CFG_NAND_DRIVE) { ipq_cfg.nand_drive = want.nand_drive; }
     if (ipq_cfg_set & IPQ_CFG_NAND_IMAGE) { ipq_cfg.nand_image = want.nand_image; }
+    if (ipq_cfg_set & IPQ_CFG_QPIC_NAND)       { ipq_cfg.qpic_nand       = want.qpic_nand; }
+    if (ipq_cfg_set & IPQ_CFG_QPIC_NAND_SIZE)  { ipq_cfg.qpic_nand_size  = want.qpic_nand_size; }
+    if (ipq_cfg_set & IPQ_CFG_QPIC_NAND_ID)    { ipq_cfg.qpic_nand_id    = want.qpic_nand_id; }
+    if (ipq_cfg_set & IPQ_CFG_QPIC_NAND_FILE)  { ipq_cfg.qpic_nand_file  = want.qpic_nand_file; }
+    if (ipq_cfg_set & IPQ_CFG_QPIC_NAND_DRIVE) { ipq_cfg.qpic_nand_drive = want.qpic_nand_drive; }
+    if (ipq_cfg_set & IPQ_CFG_QPIC_NAND_IMAGE) { ipq_cfg.qpic_nand_image = want.qpic_nand_image; }
     if (ipq_cfg_set & IPQ_CFG_BOOT)       { ipq_cfg.boot      = want.boot; }
     if (ipq_cfg_set & IPQ_CFG_NOR_CS)     { ipq_cfg.nor_cs_gpio  = want.nor_cs_gpio; }
     if (ipq_cfg_set & IPQ_CFG_NAND_CS)    { ipq_cfg.nand_cs_gpio = want.nand_cs_gpio; }
@@ -682,6 +735,14 @@ static void ipq_board_config_resolve(MachineState *machine)
             ipq_cfg.nand_cs_gpio = 59;
         }
     }
+    if (ipq_cfg.qpic_nand) {
+        if (!ipq_cfg.qpic_nand_size) {
+            ipq_cfg.qpic_nand_size = NAND_BYTES_DEF;
+        }
+        if (!ipq_cfg.qpic_nand_id) {
+            ipq_cfg.qpic_nand_id = "c2f1801d";  /* MX30LF1G18AC */
+        }
+    }
     if (!ipq_cfg.eth_phy_id) {
         ipq_cfg.eth_phy_id = IPQ_ETH_DEFAULT_PHY_ID;
     }
@@ -702,19 +763,28 @@ static void ipq_board_config_resolve(MachineState *machine)
 
     /* the boot device has to exist: that is the whole point of naming it */
     if (ipq_cfg.boot != IPQ_BOOT_NONE) {
-        bool boot_nor = ipq_cfg.boot == IPQ_BOOT_SPI_NOR;
+        bool have = ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? ipq_cfg.nor :
+                    ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? ipq_cfg.nand :
+                    ipq_cfg.qpic_nand;
 
-        if (boot_nor ? !ipq_cfg.nor : !ipq_cfg.nand) {
+        if (!have) {
             error_report("ipq4019: boot-device=%s but no %s die is configured "
                          "(add %s=on, or pick another boot device)",
-                         boot_nor ? "spi-nor" : "spi-nand",
-                         boot_nor ? "NOR" : "NAND",
-                         boot_nor ? "nor" : "nand");
+                         ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? "spi-nor" :
+                         ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? "spi-nand" :
+                         "qpic-nand",
+                         ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? "NOR" :
+                         ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? "SPI NAND" :
+                         "parallel NAND",
+                         ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? "nor" :
+                         ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? "nand" :
+                         "qpic-nand");
             exit(1);
         }
-    } else if (ipq_cfg.nor || ipq_cfg.nand) {
+    } else if (ipq_cfg.nor || ipq_cfg.nand || ipq_cfg.qpic_nand) {
         /* a board with dies but no boot strap: the NOR is what a strap does */
-        ipq_cfg.boot = ipq_cfg.nor ? IPQ_BOOT_SPI_NOR : IPQ_BOOT_SPI_NAND;
+        ipq_cfg.boot = ipq_cfg.nor ? IPQ_BOOT_SPI_NOR :
+                       ipq_cfg.nand ? IPQ_BOOT_SPI_NAND : IPQ_BOOT_QPIC_NAND;
     }
 
     /*
@@ -729,11 +799,14 @@ static void ipq_board_config_resolve(MachineState *machine)
                      machine->kernel_filename);
         exit(1);
     }
-    if (machine->kernel_filename && !ipq_cfg.nor_image && !ipq_cfg.nand_image) {
+    if (machine->kernel_filename && !ipq_cfg.nor_image && !ipq_cfg.nand_image
+        && !ipq_cfg.qpic_nand_image) {
         if (ipq_cfg.boot == IPQ_BOOT_SPI_NOR) {
             ipq_cfg.nor_image = machine->kernel_filename;
         } else if (ipq_cfg.boot == IPQ_BOOT_SPI_NAND) {
             ipq_cfg.nand_image = machine->kernel_filename;
+        } else if (ipq_cfg.boot == IPQ_BOOT_QPIC_NAND) {
+            ipq_cfg.qpic_nand_image = machine->kernel_filename;
         }
     }
 
@@ -754,9 +827,23 @@ static void ipq_board_config_resolve(MachineState *machine)
     } else {
         fprintf(stderr, "none, ");
     }
+    fprintf(stderr, "qpic-nand ");
+    if (ipq_cfg.qpic_nand) {
+        if (ipq_cfg.qpic_nand_size % MiB) {
+            fprintf(stderr, "%u bytes", ipq_cfg.qpic_nand_size);
+        } else {
+            fprintf(stderr, "%u MiB", (unsigned)(ipq_cfg.qpic_nand_size / MiB));
+        }
+        fprintf(stderr, "%s, ",
+                (ipq_cfg.qpic_nand_file || ipq_cfg.qpic_nand_drive) ?
+                " (store)" : "");
+    } else {
+        fprintf(stderr, "none, ");
+    }
     fprintf(stderr, "boot-device %s\n",
             ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? "spi-nor" :
-            ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? "spi-nand" : "none");
+            ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? "spi-nand" :
+            ipq_cfg.boot == IPQ_BOOT_QPIC_NAND ? "qpic-nand" : "none");
 
     ipq_cfg_ready = true;
 }
@@ -2678,6 +2765,901 @@ static uint8_t nand_miso(IPQQupl *q)
 static bool ipq_nor_store_loaded;
 static bool ipq_nand_store_loaded;
 
+/* ====================================================================== */
+/* QPIC: the parallel NAND controller (and the BAM that feeds it)         */
+/* ====================================================================== */
+
+/*
+ * The other way a board can carry a NAND: not a serial die behind the QUP's
+ * second chip select, but a parallel one behind the QPIC controller, which
+ * drives the bus itself and hands the bytes to a BAM.  The hAP ac3 is such a
+ * board -- 16 MiB NOR for the boot chain, 128 MiB parallel NAND for the
+ * installation -- and RouterBOOT reaches for the NAND early, so the model has
+ * to answer the register protocol *and* run the engine, or the first poll
+ * never finishes.
+ *
+ * Register offsets are the mainline ones (nand-qpic-common.h), the BAM is the
+ * v1.7 layout the board's own DTS names (`qcom,bam-v1.7.0`: EE registers at
+ * 0x3000, pipes at 0x13000 + 0x1000*n), and a command element carries the
+ * NANDc register offset in its low 24 bits, relative to the QPIC block --
+ * which is how the driver builds it (`bam_offset + reg_off`, 0x30000 here).
+ *
+ * The die itself is the same abstraction as the SPI NAND: a byte array in
+ * which every page is NAND_PAGE data bytes followed by NAND_OOB spare bytes,
+ * erased to 0xff, with a store behind it when the board's programming has to
+ * survive the machine exiting.
+ */
+#define IPQ_QPIC_BAM_BASE    (IPQ_QPIC_BASE + 0x00004000u)  /* 0x07984000 */
+#define IPQ_QPIC_BAM_SIZE    0x0001a000u
+#define IPQ_QPIC_NANDC_BASE  (IPQ_QPIC_BASE + 0x00030000u)  /* 0x079b0000 */
+#define IPQ_QPIC_NANDC_SIZE  0x00001000u
+/* what a command element puts in its low 24 bits (see qpic_bam_ce) */
+#define QN_CE_BASE           ((IPQ_QPIC_BASE + 0x00030000u) & 0xffffffu)
+
+/* NANDc register offsets (nand-qpic-common.h) */
+#define QN_CMD              0x000
+#define QN_ADDR0            0x004
+#define QN_ADDR1            0x008
+#define QN_CHIP_SEL         0x00c
+#define QN_EXEC             0x010
+#define QN_FLASH_STATUS     0x014
+#define QN_BUFFER_STATUS    0x018
+#define QN_DEV0_CFG0        0x020
+#define QN_DEV0_CFG1        0x024
+#define QN_DEV0_ECC_CFG     0x028
+#define QN_READ_ID          0x040
+#define QN_READ_STATUS      0x044
+#define QN_DEV_CMD0         0x0a0
+#define QN_DEV_CMD1         0x0a4
+#define QN_DEV_CMD2         0x0a8
+#define QN_DEV_CMD_VLD      0x0ac
+#define QN_CW_DETECT_CFG    0x0e8
+#define QN_CW_DETECT_STATUS 0x0ec
+#define QN_EBI2_ECC_BUF_CFG 0x0f0
+#define QN_BUF_ACC          0x100
+#define QN_CTRL             0xf00
+#define QN_VERSION          0xf08
+#define QN_RD_LOC0          0xf20
+#define QN_RD_LOC_LAST0     0xf40
+
+/* NAND_FLASH_CMD opcodes */
+#define QN_OP_PAGE_READ         0x2
+#define QN_OP_PAGE_READ_ECC     0x3
+#define QN_OP_PAGE_READ_SPARE   0x4
+#define QN_OP_ONFI_READ         0x5
+#define QN_OP_PROGRAM_PAGE      0x6
+#define QN_OP_PROGRAM_PAGE_ECC  0x7
+#define QN_OP_PROGRAM_SPARE     0x9
+#define QN_OP_BLOCK_ERASE       0xa
+#define QN_OP_FETCH_ID          0xb
+#define QN_OP_CHECK_STATUS      0xc
+#define QN_OP_RESET_DEVICE      0xd
+
+#define QN_CMD_OP_MASK          0x0fu       /* bits 4/5 are PAGE_ACC/LAST_PAGE */
+#define QN_CFG0_CW_PER_PAGE     GENMASK(8, 6)
+
+/* BAM registers (v1.7 layout) */
+#define QB_CTRL             0x00000
+#define QB_DESC_TRSHLD      0x00008
+#define QB_IRQ_STTS         0x00014
+#define QB_IRQ_CLR          0x00018
+#define QB_IRQ_EN           0x0001c
+#define QB_CNFG_BITS        0x0007c
+#define QB_REVISION         0x01000
+#define QB_NUM_PIPES        0x01008
+#define QB_IRQ_SRCS         0x03010
+#define QB_IRQ_SRCS_MSK     0x03014
+#define QB_IRQ_SRCS_EE      0x03000
+#define QB_IRQ_SRCS_MSK_EE  0x03004
+#define QB_PIPE_BASE        0x13000
+#define QB_PIPE_STRIDE      0x1000
+#define QB_P_CTRL           0x000
+#define QB_P_RST            0x004
+#define QB_P_HALT           0x008
+#define QB_P_IRQ_STTS       0x010
+#define QB_P_IRQ_CLR        0x014
+#define QB_P_IRQ_EN         0x018
+#define QB_P_SW_OFSTS       0x800
+#define QB_P_EVNT_REG       0x818
+#define QB_P_DESC_FIFO      0x81c
+#define QB_P_FIFO_SIZES     0x820
+#define QB_P_DATA_FIFO      0x824
+#define QB_P_EVNT_TRSHLD    0x828
+#define QB_P_EVNT_DEST      0x82c
+
+#define QB_P_EN             (1u << 1)
+#define QB_P_DIRECTION      (1u << 3)
+#define QB_P_SYS_MODE       (1u << 5)
+#define QB_P_CMD_MODE       (1u << 16)      /* command (CE) pipe */
+
+#define QB_P_IRQ_PRCSD      (1u << 0)
+#define QB_P_IRQ_OUT_DESC   (1u << 3)
+#define QB_P_IRQ_ERR        (1u << 4)
+#define QB_P_IRQ_TRNSFR_END (1u << 5)
+
+#define QB_PIPES            3               /* tx, rx, cmd */
+#define QB_PIPE_TX          0
+#define QB_PIPE_RX          1
+#define QB_PIPE_CMD         2
+
+typedef struct IPQParNand {
+    uint8_t *data;              /* NAND_STRIDE bytes per page */
+    uint32_t bytes;
+    uint32_t pages;
+    uint8_t id[8];
+    int id_len;
+    IPQDieStore store;          /* qpic-nand-file= / -drive= */
+} IPQParNand;
+
+struct IPQQpic {
+    MemoryRegion mr;
+    IPQParNand *die;
+
+    uint32_t reg[IPQ_QPIC_NANDC_SIZE / 4];
+
+    uint8_t buf[NAND_STRIDE];   /* the controller's page buffer */
+    uint32_t in_len;            /* program bytes the data pipe delivered */
+    uint32_t wr_col;            /* column the pending program starts at */
+    uint32_t rd_pos;            /* read stream cursor inside buf */
+    uint32_t last_page;         /* page the stream belongs to */
+    bool have_page;
+    bool program_pending;
+};
+
+static bool ipq_qpic_store_loaded;
+
+/* ---- the die ---------------------------------------------------------- */
+
+static void qpic_die_persist(IPQParNand *d, const void *src, uint32_t off,
+                             uint32_t len)
+{
+    if (off >= d->bytes) {
+        return;
+    }
+    ipq_die_store_pwrite(&d->store, src, MIN(len, d->bytes - off), off);
+}
+
+static void qpic_die_erase(IPQParNand *d, uint32_t page)
+{
+    uint32_t blk = page / NAND_PPBLK;
+    uint32_t off = blk * NAND_PPBLK * NAND_STRIDE;
+    uint32_t len = NAND_PPBLK * NAND_STRIDE;
+
+    memset(d->data + off, 0xff, len);
+    qpic_die_persist(d, d->data + off, off, len);
+    ipq_die_store_sync(&d->store);
+}
+
+static void qpic_die_program(IPQParNand *d, uint32_t page, uint32_t col,
+                             const uint8_t *buf, uint32_t len)
+{
+    uint32_t off = page * NAND_STRIDE;
+    uint32_t i;
+
+    if (page >= d->pages || col >= NAND_STRIDE) {
+        return;
+    }
+    /*
+     * Programming a NAND only clears bits, and 0xff is a no-op, so the page
+     * keeps whatever was never written.  That is the same rule the SPI part
+     * uses, and it is what makes a double program of a zeroed byte fail
+     * exactly like the silicon does.
+     *
+     * The column matters: a page write lands at column 0 with all 2112 bytes,
+     * a spare-only write lands at column 2048 with 64, and both are the same
+     * "program" opcode with a different address.
+     */
+    for (i = 0; i < len && col + i < NAND_STRIDE; i++) {
+        d->data[off + col + i] &= buf[i];
+    }
+    qpic_die_persist(d, d->data + off, off, NAND_STRIDE);
+}
+
+/* ---- the controller --------------------------------------------------- */
+
+/*
+ * What one EXEC exports to the data pipe.
+ *
+ * A page read is issued once per codeword -- the driver rewrites CMD and EXEC
+ * for each step of the same page -- so the controller keeps one cursor over
+ * the raw page (data and spare in die order) and each EXEC pulls from where
+ * the previous one stopped.  That is the observable behaviour of the
+ * read-location registers for the one-location-per-step sequence both
+ * RouterBOOT and the mainline driver produce, without inventing a codeword
+ * layout the register set does not carry.
+ */
+static uint32_t qpic_pull(IPQQpic *q, uint8_t *dst, uint32_t len)
+{
+    uint32_t n = 0;
+
+    while (n < len) {
+        uint32_t take;
+
+        if (q->rd_pos >= NAND_STRIDE) {
+            q->rd_pos = 0;
+        }
+        take = MIN(len - n, (uint32_t)NAND_STRIDE - q->rd_pos);
+        memcpy(dst + n, q->buf + q->rd_pos, take);
+        q->rd_pos += take;
+        n += take;
+    }
+    return n;
+}
+
+static void qpic_push(IPQQpic *q, const uint8_t *src, uint32_t len)
+{
+    while (len && q->in_len < NAND_STRIDE) {
+        uint32_t take = MIN(len, (uint32_t)NAND_STRIDE - q->in_len);
+
+        memcpy(q->buf + q->in_len, src, take);
+        q->in_len += take;
+        src += take;
+        len -= take;
+    }
+}
+
+static void qpic_commit_program(IPQQpic *q)
+{
+    if (!q->program_pending) {
+        return;
+    }
+    q->program_pending = false;
+    qpic_die_program(q->die, q->last_page, q->wr_col, q->buf, q->in_len);
+    q->in_len = 0;
+    ipq_die_store_sync(&q->die->store);
+}
+
+static void qpic_exec(IPQQpic *q)
+{
+    uint32_t cmd = q->reg[QN_CMD / 4];
+    uint32_t op = cmd & QN_CMD_OP_MASK;
+    uint32_t page = ((q->reg[QN_ADDR1 / 4] & 0xff) << 16) |
+                    ((q->reg[QN_ADDR0 / 4] >> 16) & 0xffff);
+
+    /*
+     * The command pipe and the data pipe are independent: EXEC can arrive
+     * before the page bytes do.  A program that was left pending is committed
+     * by whichever command comes next -- normally the status poll -- and by
+     * the time it is committed the data long since landed.
+     */
+    if (q->program_pending && q->in_len) {
+        qpic_commit_program(q);
+    }
+
+    if (env_true("QEMU_IPQ_QPIC_LOG")) {
+        qemu_log_mask(LOG_UNIMP,
+                      "qpic: exec op=%u page=%u col=%u cmd=%08x addr0=%08x "
+                      "addr1=%08x cfg0=%08x ecc=%08x loc=%08x in=%u\n",
+                      op, page, q->reg[QN_ADDR0 / 4] & 0xffff, cmd,
+                      q->reg[QN_ADDR0 / 4], q->reg[QN_ADDR1 / 4],
+                      q->reg[QN_DEV0_CFG0 / 4], q->reg[QN_DEV0_ECC_CFG / 4],
+                      q->reg[QN_RD_LOC0 / 4], q->in_len);
+    }
+
+    switch (op) {
+    case QN_OP_RESET_DEVICE:
+        break;
+
+    case QN_OP_FETCH_ID:
+        q->reg[QN_READ_ID / 4] =
+            (uint32_t)q->die->id[0] |
+            ((uint32_t)q->die->id[1] << 8) |
+            ((uint32_t)q->die->id[2] << 16) |
+            ((uint32_t)q->die->id[3] << 24);
+        break;
+
+    case QN_OP_CHECK_STATUS:
+        q->reg[QN_READ_STATUS / 4] = 0x00;      /* ready, no failure */
+        break;
+
+    case QN_OP_BLOCK_ERASE:
+        qpic_die_erase(q->die, page);
+        break;
+
+    case QN_OP_PAGE_READ:
+    case QN_OP_PAGE_READ_ECC:
+    case QN_OP_PAGE_READ_SPARE:
+    case QN_OP_ONFI_READ:
+        if (!q->have_page || page != q->last_page) {
+            q->last_page = page;
+            q->have_page = true;
+            q->rd_pos = 0;
+            if (page < q->die->pages) {
+                memcpy(q->buf, q->die->data + (size_t)page * NAND_STRIDE,
+                       NAND_STRIDE);
+            } else {
+                memset(q->buf, 0xff, NAND_STRIDE);
+            }
+        }
+        /* A read that follows a program of the same page commits it first. */
+        qpic_commit_program(q);
+        break;
+
+    case QN_OP_PROGRAM_PAGE:
+    case QN_OP_PROGRAM_PAGE_ECC:
+    case QN_OP_PROGRAM_SPARE:
+        q->last_page = page;
+        q->wr_col = q->reg[QN_ADDR0 / 4] & 0xffff;
+        if (q->in_len) {
+            qpic_die_program(q->die, page, q->wr_col, q->buf, q->in_len);
+            q->in_len = 0;
+            ipq_die_store_sync(&q->die->store);
+        } else {
+            /*
+             * The engine and the data channel are independent: the command
+             * pipe can reach EXEC before the data has landed.  Remember the
+             * program and let the data commit it when it arrives.
+             */
+            q->program_pending = true;
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+static uint32_t qpic_reg_read(IPQQpic *q, uint32_t off)
+{
+    if (off >= QN_BUF_ACC && off < QN_BUF_ACC + NAND_STRIDE) {
+        return q->buf[off - QN_BUF_ACC];        /* byte addressable window */
+    }
+    if (off == QN_FLASH_STATUS) {
+        /*
+         * FS_READY_BSY_N is "ready" when set: the driver writes it back to
+         * clear the status and then polls until it reappears, so a device
+         * that is never busy returns it every time.
+         */
+        return 0x20;
+    }
+    if (off == QN_BUFFER_STATUS) {
+        return 0;                               /* no ECC errors */
+    }
+    if (off == QN_VERSION) {
+        return 0x00020000u;                     /* QPIC v2.0 */
+    }
+    if (off == QN_CTRL) {
+        return q->reg[QN_CTRL / 4];
+    }
+    return q->reg[off / 4];
+}
+
+static void qpic_reg_write(IPQQpic *q, uint32_t off, uint32_t val)
+{
+    if (off >= QN_BUF_ACC && off < QN_BUF_ACC + NAND_STRIDE) {
+        q->buf[off - QN_BUF_ACC] = (uint8_t)val;
+        return;
+    }
+    q->reg[off / 4] = val;
+
+    if (off == QN_EXEC && (val & 1)) {
+        qpic_exec(q);
+    }
+}
+
+static uint64_t qpic_mmio_read(void *opaque, hwaddr off, unsigned size)
+{
+    IPQQpic *q = opaque;
+
+    if (off >= IPQ_QPIC_NANDC_SIZE) {
+        return 0;
+    }
+    return qpic_reg_read(q, (uint32_t)off);
+}
+
+static void qpic_mmio_write(void *opaque, hwaddr off, uint64_t val,
+                            unsigned size)
+{
+    IPQQpic *q = opaque;
+
+    if (off >= IPQ_QPIC_NANDC_SIZE) {
+        return;
+    }
+    qpic_reg_write(q, (uint32_t)off, (uint32_t)val);
+}
+
+static const MemoryRegionOps qpic_ops = {
+    .read = qpic_mmio_read,
+    .write = qpic_mmio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* ---- the BAM ---------------------------------------------------------- */
+
+typedef struct IPQQpicBamPipe {
+    uint32_t ctrl, irq_stts, irq_en;
+    uint32_t sw_ofsts, evnt_reg, desc_fifo, fifo_sizes;
+    uint32_t data_fifo, evnt_trshld, evnt_dest;
+    uint32_t cons;              /* next FIFO slot this model will read */
+} IPQQpicBamPipe;
+
+typedef struct IPQQpicBam {
+    MemoryRegion mr;
+    uint32_t ctrl, desc_trshld, cfg_bits;
+    uint32_t irq_stts, irq_en;
+    uint32_t irq_srcs_msk, irq_srcs_msk_ee;
+    IPQQpicBamPipe pipe[QB_PIPES];
+} IPQQpicBam;
+
+static IPQQpicBam *ipq_qpic_bam;
+
+static uint32_t qpic_bam_irq_pending(IPQQpicBam *b)
+{
+    uint32_t srcs = 0;
+    int i;
+
+    for (i = 0; i < QB_PIPES; i++) {
+        if (b->pipe[i].irq_stts & b->pipe[i].irq_en) {
+            srcs |= 1u << i;
+        }
+    }
+    return srcs & (b->irq_srcs_msk_ee | b->irq_srcs_msk);
+}
+
+static void qpic_bam_data_in(IPQQpic *q, uint32_t addr, uint32_t len)
+{
+    uint8_t chunk[512];
+    uint32_t done = 0;
+
+    while (done < len) {
+        uint32_t take = MIN(len - done, (uint32_t)sizeof(chunk));
+
+        address_space_read(&address_space_memory, addr + done,
+                           MEMTXATTRS_UNSPECIFIED, chunk, take);
+        qpic_push(q, chunk, take);
+        done += take;
+    }
+}
+
+static void qpic_bam_data_out(IPQQpic *q, uint32_t addr, uint32_t len)
+{
+    uint8_t chunk[512];
+    uint32_t done = 0;
+
+    while (done < len) {
+        uint32_t take = MIN(len - done, (uint32_t)sizeof(chunk));
+
+        qpic_pull(q, chunk, take);
+        if (env_true("QEMU_IPQ_QPIC_LOG")) {
+            qemu_log_mask(LOG_UNIMP,
+                          "qpic: out %08x +%u from page %u pos %u: "
+                          "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                          addr + done, take, q->last_page,
+                          q->rd_pos - take,
+                          chunk[0], take > 1 ? chunk[1] : 0,
+                          take > 2 ? chunk[2] : 0, take > 3 ? chunk[3] : 0,
+                          take > 4 ? chunk[4] : 0, take > 5 ? chunk[5] : 0,
+                          take > 6 ? chunk[6] : 0, take > 7 ? chunk[7] : 0);
+        }
+        address_space_write(&address_space_memory, addr + done,
+                            MEMTXATTRS_UNSPECIFIED, chunk, take);
+        done += take;
+    }
+}
+
+/*
+ * One command element: {cmd_and_addr, data, mask, reserved}, 16 bytes.  Bits
+ * 31:24 of the first word are the command (0 = write, 1 = read) and bits 23:0
+ * are the offset inside the QPIC block, so a CE write to 0x30000 lands on
+ * NAND_FLASH_CMD, exactly like a CPU store would.  The command pipe's own FIFO
+ * holds ordinary {addr,len} descriptors whose payload is an array of these.
+ */
+static void qpic_bam_ce(IPQQpicBam *b, uint32_t ce_addr, uint32_t ce_size)
+{
+    IPQQpic *q = ipq_board->qpic;
+    uint8_t raw[256];
+    uint32_t i;
+
+    if (!q || ce_size < 16) {
+        return;
+    }
+    if (ce_size > sizeof(raw)) {
+        ce_size = sizeof(raw);
+    }
+    address_space_read(&address_space_memory, ce_addr, MEMTXATTRS_UNSPECIFIED,
+                       raw, ce_size);
+    for (i = 0; i + 16 <= ce_size; i += 16) {
+        uint32_t ca = (uint32_t)raw[i] | ((uint32_t)raw[i + 1] << 8) |
+                      ((uint32_t)raw[i + 2] << 16) |
+                      ((uint32_t)raw[i + 3] << 24);
+        uint32_t data = (uint32_t)raw[i + 4] | ((uint32_t)raw[i + 5] << 8) |
+                        ((uint32_t)raw[i + 6] << 16) |
+                        ((uint32_t)raw[i + 7] << 24);
+        uint32_t hi = (uint32_t)raw[i + 8] | ((uint32_t)raw[i + 9] << 8) |
+                      ((uint32_t)raw[i + 10] << 16) |
+                      ((uint32_t)raw[i + 11] << 24);
+        uint32_t c = ca >> 24;
+        uint32_t off = ca & 0xffffffu;
+
+        if (env_true("QEMU_IPQ_QPIC_LOG")) {
+            qemu_log_mask(LOG_UNIMP, "qpic: ce %s off=%#x data=%08x\n",
+                          c == 1 ? "read" : "write", off, data);
+        }
+        /*
+         * A CE carries the *low 24 bits* of the absolute register address,
+         * i.e. (QPIC base + BAM offset + register offset) & 0xffffff.  On this
+         * SoC that is 0x9b0000 + reg_off.
+         */
+        if (off < QN_CE_BASE || off - QN_CE_BASE + 4 > IPQ_QPIC_NANDC_SIZE) {
+            continue;       /* not a NANDc register: the BAM is not ours */
+        }
+        off -= QN_CE_BASE;
+        if (c == 1) {       /* register -> memory (mask = upper address bits) */
+            uint64_t dst = (uint64_t)hi << 32 | data;
+            uint32_t v = qpic_reg_read(q, off);
+
+            address_space_write(&address_space_memory, dst,
+                                MEMTXATTRS_UNSPECIFIED, &v, 4);
+        } else {
+            qpic_reg_write(q, off, data);
+        }
+    }
+}
+
+static void qpic_bam_run(IPQQpicBam *b, int n, uint32_t doorbell)
+{
+    IPQQpicBamPipe *p = &b->pipe[n];
+    IPQQpic *q = ipq_board->qpic;
+    uint32_t slots = p->fifo_sizes ? (p->fifo_sizes & 0xffff) / 8 : 0;
+    uint32_t guard = 0;
+
+    if (!q || !p->desc_fifo || !slots || !(p->ctrl & QB_P_EN)) {
+        return;
+    }
+    {
+        uint32_t tail = (doorbell / 8) % slots;
+
+        if (p->cons >= slots) {
+            p->cons = 0;
+        }
+        while (p->cons != tail && guard++ < 4096) {
+            uint32_t d[2];
+
+            address_space_read(&address_space_memory,
+                               p->desc_fifo + p->cons * 8,
+                               MEMTXATTRS_UNSPECIFIED, d, sizeof(d));
+            if (d[1] & 0xffff) {
+                if (n == QB_PIPE_CMD) {
+                    qpic_bam_ce(b, d[0], d[1] & 0xffff);
+                } else if (p->ctrl & QB_P_DIRECTION) {
+                    if (env_true("QEMU_IPQ_QPIC_LOG")) {
+                        qemu_log_mask(LOG_UNIMP,
+                                      "qpic: rx desc %08x len %u\n",
+                                      d[0], d[1] & 0xffff);
+                    }
+                    qpic_bam_data_out(q, d[0], d[1] & 0xffff);
+                } else {
+                    if (env_true("QEMU_IPQ_QPIC_LOG")) {
+                        qemu_log_mask(LOG_UNIMP,
+                                      "qpic: tx desc %08x len %u\n",
+                                      d[0], d[1] & 0xffff);
+                    }
+                    qpic_bam_data_in(q, d[0], d[1] & 0xffff);
+                }
+            }
+            p->cons = (p->cons + 1) % slots;
+        }
+    }
+    p->irq_stts |= QB_P_IRQ_PRCSD | QB_P_IRQ_TRNSFR_END;
+    p->irq_stts &= ~QB_P_IRQ_OUT_DESC;
+}
+
+static uint64_t qpic_bam_read(void *opaque, hwaddr off, unsigned size)
+{
+    IPQQpicBam *b = opaque;
+    int n = -1;
+    uint32_t roff = 0;
+
+    if (off >= QB_PIPE_BASE) {
+        uint32_t rel = off - QB_PIPE_BASE;
+
+        n = rel / QB_PIPE_STRIDE;
+        roff = rel % QB_PIPE_STRIDE;
+        if (n >= QB_PIPES) {
+            return 0;
+        }
+    }
+    if (n >= 0) {
+        IPQQpicBamPipe *p = &b->pipe[n];
+
+        switch (roff) {
+        case QB_P_CTRL:      return p->ctrl;
+        case QB_P_IRQ_STTS:  return p->irq_stts;
+        case QB_P_IRQ_EN:    return p->irq_en;
+        case QB_P_SW_OFSTS:  return p->cons * 8;
+        case QB_P_EVNT_REG:  return p->evnt_reg;
+        case QB_P_DESC_FIFO: return p->desc_fifo;
+        case QB_P_FIFO_SIZES:return p->fifo_sizes;
+        default:             return 0;
+        }
+    }
+    switch (off) {
+    case QB_CTRL:        return b->ctrl;
+    case QB_DESC_TRSHLD: return b->desc_trshld;
+    case QB_CNFG_BITS:   return b->cfg_bits;
+    case QB_IRQ_STTS:    return b->irq_stts;
+    case QB_IRQ_EN:      return b->irq_en;
+    case QB_REVISION:    return 0x00010007u;    /* v1.7 */
+    case QB_NUM_PIPES:   return QB_PIPES;
+    case QB_IRQ_SRCS:    return qpic_bam_irq_pending(b);
+    case QB_IRQ_SRCS_MSK:return b->irq_srcs_msk;
+    case QB_IRQ_SRCS_EE: return qpic_bam_irq_pending(b);
+    case QB_IRQ_SRCS_MSK_EE: return b->irq_srcs_msk_ee;
+    default:             return 0;
+    }
+}
+
+static void qpic_bam_write(void *opaque, hwaddr off, uint64_t val,
+                           unsigned size)
+{
+    IPQQpicBam *b = opaque;
+    int n = -1;
+    uint32_t roff = 0;
+
+    if (env_true("QEMU_IPQ_QPIC_LOG")) {
+        qemu_log_mask(LOG_UNIMP, "qpic-bam: write %#x <- %08x\n",
+                      (uint32_t)off, (uint32_t)val);
+    }
+    if (off >= QB_PIPE_BASE) {
+        uint32_t rel = off - QB_PIPE_BASE;
+
+        n = rel / QB_PIPE_STRIDE;
+        roff = rel % QB_PIPE_STRIDE;
+        if (n >= QB_PIPES) {
+            return;
+        }
+    }
+    if (n >= 0) {
+        IPQQpicBamPipe *p = &b->pipe[n];
+
+        switch (roff) {
+        case QB_P_CTRL:      p->ctrl = (uint32_t)val; break;
+        case QB_P_RST:
+            if (val & 1) {
+                p->cons = 0;
+                p->irq_stts = 0;
+            }
+            break;
+        case QB_P_IRQ_CLR:   p->irq_stts &= ~(uint32_t)val; break;
+        case QB_P_IRQ_EN:    p->irq_en = (uint32_t)val; break;
+        case QB_P_EVNT_REG:
+            p->evnt_reg = (uint32_t)val;
+            qpic_bam_run(b, n, (uint32_t)val);
+            break;
+        case QB_P_DESC_FIFO: p->desc_fifo = (uint32_t)val; break;
+        case QB_P_FIFO_SIZES:p->fifo_sizes = (uint32_t)val; break;
+        case QB_P_DATA_FIFO: p->data_fifo = (uint32_t)val; break;
+        case QB_P_EVNT_TRSHLD: p->evnt_trshld = (uint32_t)val; break;
+        case QB_P_EVNT_DEST: p->evnt_dest = (uint32_t)val; break;
+        default: break;
+        }
+        return;
+    }
+    switch (off) {
+    case QB_CTRL:        b->ctrl = (uint32_t)val; break;
+    case QB_DESC_TRSHLD: b->desc_trshld = (uint32_t)val; break;
+    case QB_CNFG_BITS:   b->cfg_bits = (uint32_t)val; break;
+    case QB_IRQ_CLR:     b->irq_stts &= ~(uint32_t)val; break;
+    case QB_IRQ_EN:      b->irq_en = (uint32_t)val; break;
+    case QB_IRQ_SRCS_MSK: b->irq_srcs_msk = (uint32_t)val; break;
+    case QB_IRQ_SRCS_MSK_EE: b->irq_srcs_msk_ee = (uint32_t)val; break;
+    default: break;
+    }
+}
+
+static const MemoryRegionOps qpic_bam_ops = {
+    .read = qpic_bam_read,
+    .write = qpic_bam_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/* ---- building the board's part ---------------------------------------- */
+
+/*
+ * Programming source for a die that does not hold one yet -- `-kernel` when the
+ * boot chain comes from the die, or a board's own image on a blank part.  Two
+ * shapes are accepted, because both are what ends up on disk:
+ *
+ *   * a whole-chip image, pages with the spare interleaved (`nanddump -o`, or
+ *     `./nanddie.py to-die`), and
+ *   * a data-only image, the page data with no spare at all (`cat /dev/mtdN`,
+ *     `nanddump` without -o, and RouterBOOT's own NAND dumps).
+ *
+ * The length decides, so no caller has to declare which one it has: an image of
+ * exactly the part's page data, or one that is not a whole number of stride
+ * records, is data-only; anything else that divides by the stride is a chip
+ * image.  Only page data is copied either way -- the destination's spare area
+ * stays erased, which is what a bootloader that writes pages leaves behind.
+ */
+static void ipq_die_program_image(uint8_t *data, uint32_t bytes,
+                                  const char *path, const char *what)
+{
+    uint32_t pages = bytes / NAND_STRIDE;
+    gchar *buf = NULL;
+    gsize len = 0, p;
+    bool chip_layout;
+
+    if (!path || !*path || !g_file_get_contents(path, &buf, &len, NULL)) {
+        return;
+    }
+    chip_layout = len % NAND_STRIDE == 0 && len != (gsize)pages * NAND_PAGE;
+
+    for (p = 0; p < pages; p++) {
+        gsize src = chip_layout ? p * NAND_STRIDE : p * NAND_PAGE;
+        gsize avail = src < len ? len - src : 0;
+
+        if (avail > NAND_PAGE) {
+            avail = NAND_PAGE;
+        }
+        if (!avail) {
+            break;
+        }
+        memcpy(data + p * NAND_STRIDE, buf + src, avail);
+    }
+    fprintf(stderr, "ipq4019: %s programmed from %s (%zu bytes, %s)\n",
+            what, path, (size_t)len,
+            chip_layout ? "chip layout, spare dropped" : "page data");
+    g_free(buf);
+}
+
+/*
+ * The controller resets with the machine; the die does not, because the die is
+ * the part and the part is the store.  What has to go is everything the
+ * previous boot left *inside the controller*: a program left pending must not
+ * be committed by the next boot's first command (that would put the old page
+ * buffer into the die at a page nobody asked for), and the read cursor has to
+ * start over, or the first page read of the new boot would continue the old
+ * one instead of starting at page 0.
+ */
+static void qpic_dev_reset(void)
+{
+    IPQQpic *q = ipq_board ? ipq_board->qpic : NULL;
+    IPQQpicBam *b = ipq_qpic_bam;
+    int i;
+
+    if (!q) {
+        return;
+    }
+    memset(q->reg, 0, sizeof(q->reg));
+    memset(q->buf, 0xff, sizeof(q->buf));
+    q->in_len = 0;
+    q->wr_col = 0;
+    q->rd_pos = 0;
+    q->last_page = UINT32_MAX;
+    q->have_page = false;
+    q->program_pending = false;
+
+    if (!b) {
+        return;
+    }
+    b->ctrl = 0;
+    b->desc_trshld = 0;
+    b->cfg_bits = 0x0fffffff;
+    b->irq_stts = 0;
+    b->irq_en = 0;
+    b->irq_srcs_msk = 0;
+    b->irq_srcs_msk_ee = 0;
+    for (i = 0; i < QB_PIPES; i++) {
+        memset(&b->pipe[i], 0, sizeof(b->pipe[i]));
+    }
+}
+
+static void ipq_board_add_qpic_nand(MemoryRegion *sysmem)
+{
+    IPQParNand *d;
+    IPQQpic *q;
+    IPQQpicBam *b;
+    uint32_t per_block = NAND_STRIDE * NAND_PPBLK;
+    const char *what;
+    bool fresh = false;
+
+    if (!ipq_cfg.qpic_nand) {
+        return;
+    }
+    if (ipq_cfg.qpic_nand_size < per_block ||
+        ipq_cfg.qpic_nand_size % per_block) {
+        error_report("ipq4019: qpic-nand-size=%u must be a whole number of "
+                     "%u-byte erase blocks", ipq_cfg.qpic_nand_size, per_block);
+        exit(1);
+    }
+
+    d = g_new0(IPQParNand, 1);
+    d->bytes = ipq_cfg.qpic_nand_size;
+    d->pages = d->bytes / NAND_STRIDE;
+    d->id_len = ipq_parse_hex_bytes(ipq_cfg.qpic_nand_id ? ipq_cfg.qpic_nand_id
+                                                         : "c2f1801d",
+                                    d->id, sizeof(d->id), "qpic-nand-id");
+    d->data = g_malloc(d->bytes);
+    memset(d->data, 0xff, d->bytes);
+    d->store.fd = -1;
+    d->store.what = "qpic-nand";
+
+    what = ipq_cfg.qpic_nand_file && *ipq_cfg.qpic_nand_file
+         ? ipq_cfg.qpic_nand_file
+         : ipq_cfg.qpic_nand_drive && *ipq_cfg.qpic_nand_drive
+         ? ipq_cfg.qpic_nand_drive : NULL;
+    if (what) {
+        uint64_t len = ipq_die_store_bind(&d->store, ipq_cfg.qpic_nand_file,
+                                          ipq_cfg.qpic_nand_drive, d->bytes,
+                                          true);
+
+        if (len) {
+            if (!ipq_die_store_pread(&d->store, d->data, d->bytes, 0)) {
+                error_report("ipq4019: reading the qpic-nand store %s failed",
+                             what);
+                exit(1);
+            }
+            ipq_qpic_store_loaded = true;
+        } else {
+            if (!ipq_die_store_writable(&d->store)) {
+                error_report("ipq4019: qpic-nand store %s is empty and cannot "
+                             "be written", what);
+                exit(1);
+            }
+            fresh = true;
+        }
+    }
+    /*
+     * A blank store on a QPIC boot is programmed from -kernel, exactly like the
+     * SPI NAND above; a store that already holds a die is the part.  This has
+     * to happen before the fresh die is written out, or the store keeps the
+     * erased image.
+     */
+    if (ipq_cfg.qpic_nand_image && *ipq_cfg.qpic_nand_image &&
+        (!ipq_die_store_open(&d->store) || fresh)) {
+        ipq_die_program_image(d->data, d->bytes, ipq_cfg.qpic_nand_image,
+                              "qpic-nand die");
+    }
+    if (fresh) {
+        ipq_die_store_pwrite(&d->store, d->data, d->bytes, 0);
+        ipq_die_store_sync(&d->store);
+    }
+
+    q = g_new0(IPQQpic, 1);
+    q->die = d;
+    q->last_page = UINT32_MAX;
+    memory_region_init_io(&q->mr, NULL, &qpic_ops, q, "qpic-nand",
+                          IPQ_QPIC_NANDC_SIZE);
+    /*
+     * The decode-only QPIC stub is installed later in the machine's init (it
+     * covers the whole 0x40000 window), so these two live *inside* it and have
+     * to outrank it.
+     */
+    memory_region_add_subregion_overlap(sysmem, IPQ_QPIC_NANDC_BASE, &q->mr, 1);
+
+    b = g_new0(IPQQpicBam, 1);
+    b->cfg_bits = 0x0fffffff;
+    b->irq_srcs_msk_ee = 0;
+    memory_region_init_io(&b->mr, NULL, &qpic_bam_ops, b, "qpic-bam",
+                          IPQ_QPIC_BAM_SIZE);
+    memory_region_add_subregion_overlap(sysmem, IPQ_QPIC_BAM_BASE, &b->mr, 1);
+    ipq_qpic_bam = b;
+
+    ipq_board->qpic = q;
+
+    if (d->bytes % MiB) {
+        fprintf(stderr, "ipq4019: qpic-nand %u bytes, id", d->bytes);
+    } else {
+        fprintf(stderr, "ipq4019: qpic-nand %u MiB, id",
+                (unsigned)(d->bytes / MiB));
+    }
+    for (int i = 0; i < d->id_len; i++) {
+        fprintf(stderr, " %02x", d->id[i]);
+    }
+    fprintf(stderr, ", %u pages of %u+%u, %u blocks%s\n", d->pages,
+            NAND_PAGE, NAND_OOB, d->pages / NAND_PPBLK,
+            ipq_die_store_open(&d->store) ? " <- the store" : " (RAM only)");
+    if (env_true("QEMU_IPQ_QPIC_LOG")) {
+        qemu_log_mask(LOG_UNIMP, "qpic: nandc at %#x, bam at %#x\n",
+                      IPQ_QPIC_NANDC_BASE, IPQ_QPIC_BAM_BASE);
+    }
+}
+
+
 /*
  * The SPI NOR on chip select 0, as the board configuration describes it.
  *
@@ -2810,23 +3792,8 @@ static void ipq_board_add_nand(void)
      */
     if (ipq_cfg.nand_image && *ipq_cfg.nand_image &&
         (!ipq_die_store_open(&n->store) || fresh)) {
-        gchar *buf = NULL;
-        gsize len = 0;
-
-        if (g_file_get_contents(ipq_cfg.nand_image, &buf, &len, NULL)) {
-            uint32_t off;
-
-            /* page data only: the spare area stays erased */
-            for (off = 0; off < len && off / NAND_STRIDE < n->pages; off++) {
-                if (off % NAND_STRIDE < NAND_PAGE) {
-                    n->data[(off / NAND_STRIDE) * NAND_STRIDE +
-                            (off % NAND_STRIDE)] = (uint8_t)buf[off];
-                }
-            }
-            fprintf(stderr, "ipq4019: nand die programmed from %s (%zu bytes)\n",
-                    ipq_cfg.nand_image, len);
-            g_free(buf);
-        }
+        ipq_die_program_image(n->data, n->bytes, ipq_cfg.nand_image,
+                              "nand die");
     }
     if (fresh) {
         nand_persist_snapshot(n);
@@ -8037,6 +9004,22 @@ static gchar *ipq_boot_image(gsize *lenp, bool *owned, const char **what)
         *owned = true;
         *what = "the NAND die";
         return buf;
+    case IPQ_BOOT_QPIC_NAND: {
+        IPQParNand *d = ipq_board->qpic ? ipq_board->qpic->die : NULL;
+
+        if (!d) {
+            return NULL;
+        }
+        buf = g_malloc((gsize)d->pages * NAND_PAGE);
+        for (p = 0; p < d->pages; p++) {
+            memcpy(buf + (gsize)p * NAND_PAGE, d->data + (gsize)p * NAND_STRIDE,
+                   NAND_PAGE);
+        }
+        *lenp = (gsize)d->pages * NAND_PAGE;
+        *owned = true;
+        *what = "the QPIC NAND die";
+        return buf;
+    }
     default:
         return NULL;
     }
@@ -8541,6 +9524,11 @@ static void reset_nand(void)
     }
 }
 
+static void reset_qpic(void)
+{
+    qpic_dev_reset();
+}
+
 static void reset_regfiles(void)
 {
     int i;
@@ -8600,6 +9588,7 @@ static const IPQResetEntry ipq_reset_table[] = {
     { "TLMM",     reset_tlmm     },
     { "QUP",      reset_qup      },
     { "NAND",     reset_nand     },
+    { "QPIC",     reset_qpic     },
     { "BAM",      reset_bam      },
     { "UART",     reset_uart     },
     { "MDIO",     reset_mdio     },
@@ -8777,14 +9766,20 @@ static void ipq_boot_dev_info(const char **dev, const char **img,
                               const char **store, bool *loaded)
 {
     *dev = ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? "NOR" :
-           ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? "NAND" : NULL;
+           ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? "NAND" :
+           ipq_cfg.boot == IPQ_BOOT_QPIC_NAND ? "QPIC NAND" : NULL;
     *img = ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? ipq_cfg.nor_image :
-           ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? ipq_cfg.nand_image : NULL;
+           ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? ipq_cfg.nand_image :
+           ipq_cfg.boot == IPQ_BOOT_QPIC_NAND ? ipq_cfg.qpic_nand_image : NULL;
     *store = ipq_cfg.boot == IPQ_BOOT_SPI_NOR
            ? (ipq_cfg.nor_file ? ipq_cfg.nor_file : ipq_cfg.nor_drive)
-           : (ipq_cfg.nand_file ? ipq_cfg.nand_file : ipq_cfg.nand_drive);
+           : ipq_cfg.boot == IPQ_BOOT_SPI_NAND
+           ? (ipq_cfg.nand_file ? ipq_cfg.nand_file : ipq_cfg.nand_drive)
+           : (ipq_cfg.qpic_nand_file ? ipq_cfg.qpic_nand_file
+                                     : ipq_cfg.qpic_nand_drive);
     *loaded = ipq_cfg.boot == IPQ_BOOT_SPI_NOR ? ipq_nor_store_loaded
-            : ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? ipq_nand_store_loaded : false;
+            : ipq_cfg.boot == IPQ_BOOT_SPI_NAND ? ipq_nand_store_loaded
+            : ipq_qpic_store_loaded;
 }
 
 static void ipq4019_init(MachineState *machine)
@@ -8884,6 +9879,12 @@ static void ipq4019_init(MachineState *machine)
      * dumps are here have only the NOR, and a part nobody probes still costs
      * 132 MiB of RAM. */
     ipq_board_add_nand();
+    /*
+     * The parallel NAND, when the board has one.  It is a separate part on a
+     * separate bus (QPIC + its own BAM), so it does not share anything with
+     * the SPI die above but the die format.
+     */
+    ipq_board_add_qpic_nand(sysmem);
     /*
      * MikroTik's APPSBL ELF header is written with a file-offset-compensated
      * p_paddr: the segment starts at 0x7fffffac so that file offset 0x54 (the
@@ -9666,8 +10667,11 @@ static void ipq_prop_boot(Object *obj, Visitor *v, const char *name,
         ipq_cfg_pending.boot = IPQ_BOOT_SPI_NOR;
     } else if (g_strcmp0(s, "spi-nand") == 0) {
         ipq_cfg_pending.boot = IPQ_BOOT_SPI_NAND;
+    } else if (g_strcmp0(s, "qpic-nand") == 0) {
+        ipq_cfg_pending.boot = IPQ_BOOT_QPIC_NAND;
     } else {
-        error_setg(errp, "boot='%s' is not one of none, spi-nor, spi-nand", s);
+        error_setg(errp, "boot-device='%s' is not one of none, spi-nor, "
+                   "spi-nand, qpic-nand", s);
         g_free(s);
         return;
     }
@@ -9699,6 +10703,16 @@ static void ipq4019_machine_add_props(MachineClass *mc)
         { "nand-id",    offsetof(IPQBoardConfig, nand_id),    IPQ_CFG_NAND_ID, IPQ_PROP_STR },
         { "nand-file",  offsetof(IPQBoardConfig, nand_file),  IPQ_CFG_NAND_FILE, IPQ_PROP_STR },
         { "nand-drive", offsetof(IPQBoardConfig, nand_drive), IPQ_CFG_NAND_DRIVE, IPQ_PROP_STR },
+        { "qpic-nand",  offsetof(IPQBoardConfig, qpic_nand),
+          IPQ_CFG_QPIC_NAND, IPQ_PROP_BOOL },
+        { "qpic-nand-size", offsetof(IPQBoardConfig, qpic_nand_size),
+          IPQ_CFG_QPIC_NAND_SIZE, IPQ_PROP_SIZE },
+        { "qpic-nand-id", offsetof(IPQBoardConfig, qpic_nand_id),
+          IPQ_CFG_QPIC_NAND_ID, IPQ_PROP_STR },
+        { "qpic-nand-file", offsetof(IPQBoardConfig, qpic_nand_file),
+          IPQ_CFG_QPIC_NAND_FILE, IPQ_PROP_STR },
+        { "qpic-nand-drive", offsetof(IPQBoardConfig, qpic_nand_drive),
+          IPQ_CFG_QPIC_NAND_DRIVE, IPQ_PROP_STR },
         { "nor-cs-gpio",  offsetof(IPQBoardConfig, nor_cs_gpio),
           IPQ_CFG_NOR_CS, IPQ_PROP_UINT32 },
         { "nand-cs-gpio", offsetof(IPQBoardConfig, nand_cs_gpio),
@@ -9723,6 +10737,11 @@ static void ipq4019_machine_add_props(MachineClass *mc)
         "NAND RDID as hex, e.g. c212",
         "file that is the NAND part (survives a power cut)",
         "block backend id that is the NAND part, e.g. from -drive if=none",
+        "attach the parallel NAND die behind the QPIC controller (on/off)",
+        "parallel NAND die size in bytes, a whole number of erase blocks",
+        "parallel NAND id as hex, e.g. c2f1801d",
+        "file that is the parallel NAND part (survives a power cut)",
+        "block backend id that is the parallel NAND part",
         "TLMM pin driving the NOR chip select",
         "TLMM pin driving the NAND chip select",
         "LEDs as name:pin[:al];... (shown in QEMU's window; ';' separates)",
