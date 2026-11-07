@@ -3221,7 +3221,8 @@ typedef struct IPQQpicBam {
 
 static IPQQpicBam *ipq_qpic_bam;
 
-static uint32_t qpic_bam_irq_pending(IPQQpicBam *b)
+/* The pipes that have something to report, before any mask is applied. */
+static uint32_t qpic_bam_irq_srcs(IPQQpicBam *b)
 {
     uint32_t srcs = 0;
     int i;
@@ -3231,7 +3232,12 @@ static uint32_t qpic_bam_irq_pending(IPQQpicBam *b)
             srcs |= 1u << i;
         }
     }
-    return srcs & (b->irq_srcs_msk_ee | b->irq_srcs_msk);
+    return srcs;
+}
+
+static uint32_t qpic_bam_irq_pending(IPQQpicBam *b)
+{
+    return qpic_bam_irq_srcs(b) & (b->irq_srcs_msk_ee | b->irq_srcs_msk);
 }
 
 /*
@@ -3243,7 +3249,16 @@ static uint32_t qpic_bam_irq_pending(IPQQpicBam *b)
  */
 static void qpic_bam_update_irq(IPQQpicBam *b)
 {
-    if (b->irq) {
+    /*
+     * Off by default.  A level line whose source the consumer does not clear
+     * is worse than no line at all: MikroTik's netinstall kernel enabled the
+     * pipe source and then never acknowledged it, and the asserted line turned
+     * a failed probe into "soft lockup - CPU#0 stuck for 22s".  The BAM's
+     * status registers are all here, so QEMU_IPQ_QPIC_IRQ=1 is the way to try
+     * a driver that really wants the interrupt; until one is shown to work,
+     * the default is the polling behaviour every bootloader in this tree uses.
+     */
+    if (b->irq && env_true("QEMU_IPQ_QPIC_IRQ")) {
         qemu_set_irq(b->irq, qpic_bam_irq_pending(b) != 0);
     }
 }
@@ -3434,9 +3449,9 @@ static uint64_t qpic_bam_read(void *opaque, hwaddr off, unsigned size)
     case QB_IRQ_EN:      return b->irq_en;
     case QB_REVISION:    return 0x00010007u;    /* v1.7 */
     case QB_NUM_PIPES:   return QB_PIPES;
-    case QB_IRQ_SRCS:    return qpic_bam_irq_pending(b);
+    case QB_IRQ_SRCS:    return qpic_bam_irq_srcs(b);
     case QB_IRQ_SRCS_MSK:return b->irq_srcs_msk;
-    case QB_IRQ_SRCS_EE: return qpic_bam_irq_pending(b);
+    case QB_IRQ_SRCS_EE: return qpic_bam_irq_srcs(b);
     case QB_IRQ_SRCS_MSK_EE: return b->irq_srcs_msk_ee;
     default:             return 0;
     }
