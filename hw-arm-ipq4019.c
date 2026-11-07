@@ -3180,7 +3180,14 @@ static uint32_t qpic_reg_read(IPQQpic *q, uint32_t off)
         return 0;                               /* no ECC errors */
     }
     if (off == QN_VERSION) {
-        return 0x00020000u;                     /* QPIC v2.0 */
+        /*
+         * NAND_VERSION, mainline's field layout: major in bits 31:28, minor in
+         * 27:16 (nand-qpic-common.h).  A v2 controller is 0x20000000; the old
+         * 0x00020000 put "2" in the minor field, so MikroTik's
+         * msm_nand_version_check read major 0.0, took its fallback path, and
+         * never got an id out of the part (flashid=eeeeeeee).
+         */
+        return 0x20000000u;                     /* QPIC v2.0 */
     }
     if (off == QN_CTRL) {
         return q->reg[QN_CTRL / 4];
