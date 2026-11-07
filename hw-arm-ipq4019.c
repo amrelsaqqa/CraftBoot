@@ -16,6 +16,7 @@
  *   0x01000000  TLMM            (stub, shadowed)
  *   0x01800000  GCC             (stub, shadowed)
  *   0x01940000  TCSR            (stub)
+ *   0x40000000  PCIe0 DBI/ELBI  (stub, 64 KiB; 0x40100000 config, 4 KiB)
  *   0x07700000  audio (ADSS)    (stub, 128 KiB)
  *   0x078af000  BLSP1 UART0     (TX only, -> -serial)
  *   0x078b0000  BLSP1 UART1     (TX only, -> -serial)
@@ -10300,6 +10301,23 @@ static void ipq4019_init(MachineState *machine)
      * trigger mask keeps poll loops happy.
      */
     add_stub_ex(sysmem, 0x08e00000, 0x40000, "qcrypto", 0x7ffffffeu);
+
+    /*
+     * PCIe0.  The board tree puts the DW core's DBI at 0x40000000, its ELBI
+     * (the same page, at 0x40000f20), the config space at 0x40100000 and the
+     * downstream BARs at 0x40200000/0x40300000.  MikroTik's netinstall kernel
+     * (Linux 5.6) probes pcie_qcom from its initramfs, and with the window
+     * unmapped the first register read in qcom_pcie_host_init() is a
+     * synchronous external abort -- "Internal error: : 8" in pci_host_init,
+     * then a panic, before the installer ever runs.
+     *
+     * Nothing is behind the window, so it answers as an unclocked block
+     * (reads 0): the core reports no link and dw_pcie_wait_for_link() times
+     * out, which the driver turns into a failed probe instead of a fault.  A
+     * real card in the slot is a later, separate piece of work.
+     */
+    add_stub_ex(sysmem, 0x40000000, 0x00010000, "pcie0-dbi", 0);
+    add_stub_ex(sysmem, 0x40100000, 0x00001000, "pcie0-config", 0);
 
     /*
      * qca-gcnt is the 32.768 kHz sleep counter.  Firmware delay loops use the
