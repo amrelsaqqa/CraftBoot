@@ -16,6 +16,7 @@
  *   0x01000000  TLMM            (stub, shadowed)
  *   0x01800000  GCC             (stub, shadowed)
  *   0x01940000  TCSR            (stub)
+ *   0x07700000  audio (ADSS)    (stub, 128 KiB)
  *   0x078af000  BLSP1 UART0     (TX only, -> -serial)
  *   0x078b0000  BLSP1 UART1     (TX only, -> -serial)
  *   0x07884000  BLSP1 BAM       (descriptor ring DMA into the QUP FIFOs)
@@ -10195,6 +10196,19 @@ static void ipq4019_init(MachineState *machine)
     add_stub(sysmem, 0x08af8800, 0x000800, "usb3-qscratch");
     add_stub(sysmem, 0x06000000, 0x0f8000, "usb2-dwc3");
     add_stub(sysmem, 0x060f8800, 0x000800, "usb2-qscratch");
+    /*
+     * The audio subsystem (ADSS): 0x07700000..0x0771ffff holds the audio
+     * global block, the four PCM mailboxes and the four stereo ports (the
+     * vendor binding calls the window 0x7700000 with ADSS_RANGE 0x20000).
+     * Nothing here is audio-aware, but the window has to answer: the
+     * PandoraBox bootloader that ships on the 708-class boards zeros a
+     * handful of ADSS registers (0x10c, 0x12c, 0x14c, ...) right after it
+     * works out the flash layout, and an unmapped store there is a data
+     * abort -- its handler loops on the fault forever, before the bootloader
+     * ever looks at a NAND device, so the board never reaches a kernel.
+     */
+    add_stub(sysmem, 0x07700000, 0x00020000, "adss");
+
     /*
      * WLAN register windows (the integrated 802.11ac radio and its CPU).
      * The radio itself is not emulated, but its register block has to answer:
