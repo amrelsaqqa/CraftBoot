@@ -3428,10 +3428,27 @@ static void qpic_bam_ce(IPQQpicBam *b, uint32_t ce_addr, uint32_t ce_size)
             continue;       /* not a NANDc register: the BAM is not ours */
         }
         off -= QN_CE_BASE;
-        if (c == 1) {       /* register -> memory (mask = upper address bits) */
-            uint64_t dst = (uint64_t)hi << 32 | data;
+        if (c == 1) {
+            /*
+             * Register -> memory.  The destination is `data` plus the *upper
+             * four bits* of the mask field (qcom_bam_dma.h, BAM v1.6+); taking
+             * the mask as a full 32-bit high word turns a destination of
+             * 0x8eaf408c into 0xffffffff8eaf408c when the driver fills the
+             * mask like a write command, and the store then goes nowhere --
+             * which is how an id read came back as the driver's 0xEE poison.
+             */
+            /*
+             * The destination is the 32-bit `data` field.  The mask field does
+             * not carry address bits here: MikroTik's driver fills it with
+             * 0xffffffff on read commands (a copy of its write mask) while the
+             * address it wants is a plain RAM pointer, so honouring the top
+             * nibble would send every register read into no-man's land.
+             */
+            uint64_t dst = (uint64_t)data;
             uint32_t v = qpic_reg_read(q, off);
 
+            qpic_log("qpic: ce read off=%#x dst=%08x%08x mask=%08x -> %08x\n",
+                     off + QN_CE_BASE, (uint32_t)(dst >> 32), data, hi, v);
             address_space_write(&address_space_memory, dst,
                                 MEMTXATTRS_UNSPECIFIED, &v, 4);
         } else {
@@ -10513,6 +10530,16 @@ static void ipq4019_init(MachineState *machine)
      */
     add_stub_ex(sysmem, 0x40000000, 0x00010000, "pcie0-dbi", 0);
     add_stub_ex(sysmem, 0x40100000, 0x00001000, "pcie0-config", 0);
+    /*
+     * The root complex's own outbound windows: IO at 0x40200000 (1 MiB) and
+     * MEM at 0x40300000 (13 MiB) in the board tree.  pcie_qcom writes the
+     * translation registers and then touches the window itself; with no
+     * device behind it a real board completes and the writes vanish, but an
+     * unmapped window is an external abort -- the installer's first PCIe
+     * panic was the DBI page, this is the next one, one window further in.
+     * Plain RAM makes an empty window harmless.
+     */
+    add_mem(sysmem, 0x40200000, 0x00e00000, "pcie0-window");
 
     /*
      * qca-gcnt is the 32.768 kHz sleep counter.  Firmware delay loops use the
