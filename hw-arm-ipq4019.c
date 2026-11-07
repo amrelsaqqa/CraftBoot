@@ -3445,7 +3445,7 @@ static void qpic_bam_run(IPQQpicBam *b, int n, uint32_t doorbell)
     qpic_bam_update_irq(b);
 }
 
-static uint64_t qpic_bam_read(void *opaque, hwaddr off, unsigned size)
+static uint64_t qpic_bam_read_raw(void *opaque, hwaddr off, unsigned size)
 {
     IPQQpicBam *b = opaque;
     int n = -1;
@@ -3544,7 +3544,32 @@ static void qpic_bam_write(void *opaque, hwaddr off, uint64_t val,
         return;
     }
     switch (off) {
-    case QB_CTRL:        b->ctrl = (uint32_t)val; break;
+    case QB_CTRL:
+        /*
+         * Bit 0 is the BAM's software reset: it clears the pipes and the
+         * global state, and it clears itself.  Storing it verbatim left pipe 1
+         * reading back ENABLE from the previous boot, and MikroTik's SPS layer
+         * refuses to connect a pipe that looks owned by someone else -- "BAM
+         * 0x07984000 pipe 1 sharing violation", a failed msm_nand_probe, and
+         * the installer saying "NAND is not detected" without ever touching
+         * the controller.
+         */
+        if (val & 1) {
+            int i;
+
+            for (i = 0; i < QB_PIPES; i++) {
+                memset(&b->pipe[i], 0, sizeof(b->pipe[i]));
+            }
+            b->desc_trshld = 0;
+            b->cfg_bits = 0x0fffffff;
+            b->irq_stts = 0;
+            b->irq_en = 0;
+            b->irq_srcs_msk = 0;
+            b->irq_srcs_msk_ee = 0;
+            qpic_bam_update_irq(b);
+        }
+        b->ctrl = (uint32_t)val & ~1u;          /* the reset bit self-clears */
+        break;
     case QB_DESC_TRSHLD: b->desc_trshld = (uint32_t)val; break;
     case QB_CNFG_BITS:   b->cfg_bits = (uint32_t)val; break;
     case QB_IRQ_CLR:
@@ -3565,6 +3590,19 @@ static void qpic_bam_write(void *opaque, hwaddr off, uint64_t val,
         break;
     default: break;
     }
+}
+
+/*
+ * Every BAM read is logged: the SPS layer decides whether a pipe may be
+ * connected from what it reads back here, and "pipe 1 sharing violation" with
+ * no trace of the reads is a decision you cannot argue with.
+ */
+static uint64_t qpic_bam_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint64_t v = qpic_bam_read_raw(opaque, off, size);
+
+    qpic_log("qpic-bam: read %#x -> %08x\n", (uint32_t)off, (uint32_t)v);
+    return v;
 }
 
 static const MemoryRegionOps qpic_bam_ops = {
