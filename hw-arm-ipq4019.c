@@ -3084,7 +3084,19 @@ static void qpic_exec(IPQQpic *q)
         if (!q->have_page || page != q->last_page) {
             q->last_page = page;
             q->have_page = true;
-            q->rd_pos = 0;
+            /*
+             * Where in the page the stream starts is the opcode and the column
+             * together: a normal read addresses the data area, a spare read
+             * addresses the spare area, whose column 0 is offset 2048 of the
+             * raw page.  RouterBOOT looks for its per-block headers that way
+             * (op=4, column 0, one page per block) and the vendor driver reads
+             * the ONFI/parameter bytes at a column; serving both from offset 0
+             * gave them page data instead of what they asked for, which is a
+             * silently wrong read, not a failed one.
+             */
+            q->rd_pos = (op == QN_OP_PAGE_READ_SPARE ? NAND_PAGE : 0) +
+                        MIN(q->reg[QN_ADDR0 / 4] & 0xffffu,
+                            (uint32_t)NAND_STRIDE - 1);
             if (page < q->die->pages) {
                 memcpy(q->buf, q->die->data + (size_t)page * NAND_STRIDE,
                        NAND_STRIDE);
