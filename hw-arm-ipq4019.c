@@ -215,6 +215,27 @@ static bool env_true(const char *name)
 }
 
 /*
+ * QPIC tracing.  Gated by QEMU_IPQ_QPIC_LOG alone: the messages used to go
+ * through qemu_log_mask(LOG_UNIMP), which needs `-d unimp` as well, so a run
+ * started from lan1-bridge.sh (which passes no -d) logged nothing even with
+ * the variable set.  Diagnostics that need a second, easy-to-forget flag are
+ * diagnostics that are not there when they are needed.
+ */
+static void qpic_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void qpic_log(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!env_true("QEMU_IPQ_QPIC_LOG")) {
+        return;
+    }
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+
+/*
  * The machine's devices, in two groups.
  *
  * IPQ4019State is the SoC: the controllers that exist on the die regardless of
@@ -3039,7 +3060,7 @@ static void qpic_exec(IPQQpic *q)
     }
 
     if (env_true("QEMU_IPQ_QPIC_LOG")) {
-        qemu_log_mask(LOG_UNIMP,
+        qpic_log(
                       "qpic: exec op=%u page=%u col=%u cmd=%08x addr0=%08x "
                       "addr1=%08x cfg0=%08x ecc=%08x loc=%08x in=%u\n",
                       op, page, q->reg[QN_ADDR0 / 4] & 0xffff, cmd,
@@ -3288,7 +3309,7 @@ static void qpic_bam_data_out(IPQQpic *q, uint32_t addr, uint32_t len)
 
         qpic_pull(q, chunk, take);
         if (env_true("QEMU_IPQ_QPIC_LOG")) {
-            qemu_log_mask(LOG_UNIMP,
+            qpic_log(
                           "qpic: out %08x +%u from page %u pos %u: "
                           "%02x %02x %02x %02x %02x %02x %02x %02x\n",
                           addr + done, take, q->last_page,
@@ -3339,7 +3360,7 @@ static void qpic_bam_ce(IPQQpicBam *b, uint32_t ce_addr, uint32_t ce_size)
         uint32_t off = ca & 0xffffffu;
 
         if (env_true("QEMU_IPQ_QPIC_LOG")) {
-            qemu_log_mask(LOG_UNIMP, "qpic: ce %s off=%#x data=%08x\n",
+            qpic_log("qpic: ce %s off=%#x data=%08x\n",
                           c == 1 ? "read" : "write", off, data);
         }
         /*
@@ -3390,14 +3411,14 @@ static void qpic_bam_run(IPQQpicBam *b, int n, uint32_t doorbell)
                     qpic_bam_ce(b, d[0], d[1] & 0xffff);
                 } else if (p->ctrl & QB_P_DIRECTION) {
                     if (env_true("QEMU_IPQ_QPIC_LOG")) {
-                        qemu_log_mask(LOG_UNIMP,
+                        qpic_log(
                                       "qpic: rx desc %08x len %u\n",
                                       d[0], d[1] & 0xffff);
                     }
                     qpic_bam_data_out(q, d[0], d[1] & 0xffff);
                 } else {
                     if (env_true("QEMU_IPQ_QPIC_LOG")) {
-                        qemu_log_mask(LOG_UNIMP,
+                        qpic_log(
                                       "qpic: tx desc %08x len %u\n",
                                       d[0], d[1] & 0xffff);
                     }
@@ -3465,7 +3486,7 @@ static void qpic_bam_write(void *opaque, hwaddr off, uint64_t val,
     uint32_t roff = 0;
 
     if (env_true("QEMU_IPQ_QPIC_LOG")) {
-        qemu_log_mask(LOG_UNIMP, "qpic-bam: write %#x <- %08x\n",
+        qpic_log("qpic-bam: write %#x <- %08x\n",
                       (uint32_t)off, (uint32_t)val);
     }
     if (off >= QB_PIPE_BASE) {
@@ -3740,7 +3761,7 @@ static void ipq_board_add_qpic_nand(MemoryRegion *sysmem)
             NAND_PAGE, NAND_OOB, d->pages / NAND_PPBLK,
             ipq_die_store_open(&d->store) ? " <- the store" : " (RAM only)");
     if (env_true("QEMU_IPQ_QPIC_LOG")) {
-        qemu_log_mask(LOG_UNIMP, "qpic: nandc at %#x, bam at %#x\n",
+        qpic_log("qpic: nandc at %#x, bam at %#x\n",
                       IPQ_QPIC_NANDC_BASE, IPQ_QPIC_BAM_BASE);
     }
 }
