@@ -209,6 +209,9 @@ static uint32_t env_u32(const char *name, uint32_t def)
     return strtoul(s, NULL, 0);
 }
 
+/* A GCC block reset pulse for the QPIC lands here (see stub_write). */
+static void ipq_qpic_bam_reset(void);
+
 static bool env_true(const char *name)
 {
     return env_u32(name, 0) != 0;
@@ -226,7 +229,8 @@ static void qpic_log(const char *fmt, ...)
 {
     va_list ap;
 
-    if (!env_true("QEMU_IPQ_QPIC_LOG")) {
+    if (!env_true("QEMU_IPQ_QPIC_LOG") &&
+        !env_true("QEMU_IPQ_QPIC_PGM")) {
         return;
     }
     va_start(ap, fmt);
@@ -379,6 +383,7 @@ typedef struct IPQBoardConfig {
     bool nor;                   /* is there a NOR die on chip select 0? */
     uint32_t nor_size;          /* die bytes, power of two */
     const char *nor_id;         /* RDID as hex, e.g. "ef4019" */
+    const char *nor_uid;        /* Unique-ID as hex, e.g. "0141ac3357ac0001" */
     const char *nor_file;       /* the die itself (persist file) */
     const char *nor_drive;      /* ... or a block backend holding it */
     const char *nor_image;      /* content for a die that is not programmed */
@@ -407,6 +412,16 @@ typedef struct IPQBoardConfig {
     /* the TLMM pins the board wires to the dies' chip selects */
     uint32_t nor_cs_gpio;
     uint32_t nand_cs_gpio;
+    /*
+     * A board whose mainline device tree selects the NOR from a plain GPIO
+     * instead of the QUP's own chip select.  The hAP ac3 is one: OpenWrt's
+     * qcom-ipq4019-mikrotik-hap-ac3.dts drives `cs-gpios = <&tlmm 12
+     * GPIO_ACTIVE_LOW>`, while the vendor tree (and RouterBOOT) use the QUP
+     * select and pin 54.  Both are real wiring on that board, so the machine
+     * listens on both and lets whichever guest is running pick one.  Zero
+     * means the board has no such second select.
+     */
+    uint32_t nor_cs_gpio_alt;
 
     /* the board's visible parts: lamps driven by pins, keys reading pins */
     const char *leds;
@@ -458,6 +473,7 @@ enum {
     IPQ_CFG_QPIC_NAND_FILE  = 1u << 24,
     IPQ_CFG_QPIC_NAND_DRIVE = 1u << 25,
     IPQ_CFG_QPIC_NAND_IMAGE = 1u << 26,
+    IPQ_CFG_NOR_UID         = 1u << 27,
 };
 
 typedef struct IPQBoardPreset {
@@ -529,6 +545,13 @@ static const IPQBoardPreset ipq_board_presets[] = {
         .nor_size = 16777216,
         .nor_id = "ef4018",
         .nor_cs_gpio = 54,
+        /*
+         * OpenWrt's device tree for this board selects the NOR from GPIO 12
+         * (cs-gpios = <&tlmm 12 GPIO_ACTIVE_LOW>) and muxes the pin as plain
+         * GPIO, because the QUP select on 54 is not wired to the die.  The
+         * vendor tree and RouterBOOT use the QUP select instead, hence both.
+         */
+        .nor_cs_gpio_alt = 12,
         .qpic_nand = true,
         .qpic_nand_size = NAND_BYTES_DEF,
         .qpic_nand_id = "c2f1801d",
@@ -637,6 +660,7 @@ static void ipq_board_config_resolve(MachineState *machine)
     if (ipq_cfg_set & IPQ_CFG_NOR)        { ipq_cfg.nor        = want.nor; }
     if (ipq_cfg_set & IPQ_CFG_NOR_SIZE)   { ipq_cfg.nor_size   = want.nor_size; }
     if (ipq_cfg_set & IPQ_CFG_NOR_ID)     { ipq_cfg.nor_id     = want.nor_id; }
+    if (ipq_cfg_set & IPQ_CFG_NOR_UID)    { ipq_cfg.nor_uid    = want.nor_uid; }
     if (ipq_cfg_set & IPQ_CFG_NOR_FILE)   { ipq_cfg.nor_file   = want.nor_file; }
     if (ipq_cfg_set & IPQ_CFG_NOR_DRIVE)  { ipq_cfg.nor_drive  = want.nor_drive; }
     if (ipq_cfg_set & IPQ_CFG_NOR_IMAGE)  { ipq_cfg.nor_image  = want.nor_image; }
@@ -689,6 +713,10 @@ static void ipq_board_config_resolve(MachineState *machine)
         ipq_cfg.nor_id = env;
         env_set |= IPQ_CFG_NOR_ID;
     }
+    if ((env = getenv("QEMU_IPQ_FLASH_UID")) && *env) {
+        ipq_cfg.nor_uid = env;
+        env_set |= IPQ_CFG_NOR_UID;
+    }
     if ((env = getenv("QEMU_IPQ_NAND_PERSIST")) && *env) {
         ipq_cfg.nand_file = env;
         ipq_cfg.nand = true;
@@ -734,6 +762,9 @@ static void ipq_board_config_resolve(MachineState *machine)
         }
         if (!ipq_cfg.nor_id) {
             ipq_cfg.nor_id = "ef4019";
+        }
+        if (!ipq_cfg.nor_uid) {
+            ipq_cfg.nor_uid = "0141ac3357ac0001";
         }
         if (!ipq_cfg.nor_cs_gpio) {
             ipq_cfg.nor_cs_gpio = 54;
@@ -836,8 +867,12 @@ static void ipq_board_config_resolve(MachineState *machine)
     fprintf(stderr, "ipq4019: board %s: nor ", ipq_cfg_board ? ipq_cfg_board
             : "default");
     if (ipq_cfg.nor) {
-        fprintf(stderr, "%u MiB cs gpio %u%s, ",
-                (unsigned)(ipq_cfg.nor_size / MiB), ipq_cfg.nor_cs_gpio,
+        fprintf(stderr, "%u MiB cs gpio %u", (unsigned)(ipq_cfg.nor_size / MiB),
+                ipq_cfg.nor_cs_gpio);
+        if (ipq_cfg.nor_cs_gpio_alt) {
+            fprintf(stderr, "/%u", ipq_cfg.nor_cs_gpio_alt);
+        }
+        fprintf(stderr, "%s, ",
                 (ipq_cfg.nor_file || ipq_cfg.nor_drive) ? " (store)" : "");
     } else {
         fprintf(stderr, "none, ");
@@ -961,14 +996,15 @@ static uint32_t stub_def_read(const IPQStub *s)
 
 static const char *trace_pc(void)
 {
-    static char buf[32];
+    static char buf[48];
     CPUState *cs = current_cpu;
 
     if (!cs) {
         return "";
     }
-    snprintf(buf, sizeof(buf), " pc=%08x",
-             (uint32_t)ARM_CPU(cs)->env.regs[15]);
+    snprintf(buf, sizeof(buf), " pc=%08x lr=%08x",
+             (uint32_t)ARM_CPU(cs)->env.regs[15],
+             (uint32_t)ARM_CPU(cs)->env.regs[14]);
     return buf;
 }
 
@@ -1613,7 +1649,7 @@ struct IPQQupl {
     int nand_read;          /* stream the NAND page cache (READ FROM CACHE) */
     int read_data;          /* stream data out of the flash */
     uint32_t rx_off;        /* next flash offset of the data stream */
-    uint8_t rx_buf[8];      /* short replies: JEDEC id, status */
+    uint8_t rx_buf[16];     /* short replies: JEDEC id, unique id, status */
     int rx_len;
     int rx_pos;
     int rx_wrap;            /* the reply repeats instead of ending (RDID) */
@@ -1661,6 +1697,8 @@ struct IPQQupl {
 static uint32_t ipq_flash_die_size = IPQ_FLASH_DEFAULT;
 static uint8_t ipq_flash_jedec[4] = { 0xef, 0x40, 0x19, 0x00 };
 static int ipq_flash_jedec_len = 3;
+static uint8_t ipq_flash_uid[8];
+static int ipq_flash_uid_len = 8;
 
 /*
  * QEMU_IPQ_DIE_LOG=1: a one-line summary per chip-select transaction, on
@@ -2867,7 +2905,7 @@ static bool ipq_nand_store_loaded;
 #define QN_OP_RESET_DEVICE      0xd
 
 #define QN_CMD_OP_MASK          0x0fu       /* bits 4/5 are PAGE_ACC/LAST_PAGE */
-#define QN_CFG0_CW_PER_PAGE     GENMASK(8, 6)
+#define QN_CFG0_CW_PER_PAGE     0x1c0u      /* bits 8:6, steps - 1 */
 
 /* BAM registers (v1.7 layout) */
 #define QB_CTRL             0x00000
@@ -2922,19 +2960,55 @@ typedef struct IPQParNand {
     IPQDieStore store;          /* qpic-nand-file= / -drive= */
 } IPQParNand;
 
+/*
+ * The controller works a codeword at a time: one ECC step is 512 bytes of
+ * page data, and a step takes QPIC_CW_SIZE bytes of the raw page once its
+ * parity and spare bytes are counted in (2112 / 4 = 528 here).  The buffer at
+ * FLASH_BUF_ACC holds exactly one such window: what a read location asks for
+ * lands at its own offset inside the window, and a program consumes the same
+ * window, so the two paths stay symmetric.
+ */
+#define QPIC_ECC_STEP   512u
+#define QPIC_CW_STEPS   (NAND_PAGE / QPIC_ECC_STEP)
+#define QPIC_CW_SIZE    (NAND_STRIDE / QPIC_CW_STEPS)
+#define QPIC_RD_MAX     4096u       /* page + spare, with room to spare */
+
 struct IPQQpic {
     MemoryRegion mr;
     IPQParNand *die;
 
     uint32_t reg[IPQ_QPIC_NANDC_SIZE / 4];
 
-    uint8_t buf[NAND_STRIDE];   /* the controller's page buffer */
-    uint32_t in_len;            /* program bytes the data pipe delivered */
-    uint32_t wr_col;            /* column the pending program starts at */
-    uint32_t rd_pos;            /* read stream cursor inside buf */
-    uint32_t last_page;         /* page the stream belongs to */
-    bool have_page;
-    bool program_pending;
+    uint8_t buf[NAND_STRIDE];   /* one codeword window, at BUF_ACC offset 0 */
+    bool loc_last;              /* the EXEC uses the LAST_CW read locations */
+
+    uint8_t tx_stage[QPIC_RD_MAX];  /* program bytes the data pipe delivered */
+    uint32_t tx_len;
+    uint32_t txn_wr;            /* codeword the next program EXEC lands on */
+
+    uint8_t rd_stream[QPIC_RD_MAX]; /* bytes a read produced, not yet delivered */
+    uint32_t rd_len;
+    uint32_t rd_page;           /* page rd_stream is collecting */
+    uint32_t txn_rd;            /* codeword the next read EXEC lands on */
+
+    /*
+     * A read puts its window into rd_stream and the BAM hands it to the rx
+     * descriptors the data pipe queued; the two pipes can be rung in either
+     * order (Linux queues the descriptors first, RouterBOOT runs the command
+     * pipe first), so both ends just fill and drain the same FIFO.
+     *
+     * The page is read one codeword per EXEC, so the windows are appended to
+     * the same stream and a reader that drains less than a whole window (the
+     * booter takes the 64-byte EC header in 16-byte transfers) still gets the
+     * page's bytes in order.  The stream is dropped when an EXEC addresses the
+     * first codeword, or a different page: that is where a page read starts.
+     */
+    uint32_t rx_addr[16];
+    uint32_t rx_len[16];
+    uint32_t rx_done[16];
+    uint32_t rx_n;
+
+    uint32_t last_page;         /* page the window belongs to (logging) */
 };
 
 static bool ipq_qpic_store_loaded;
@@ -2989,65 +3063,196 @@ static void qpic_die_program(IPQParNand *d, uint32_t page, uint32_t col,
      * "program" opcode with a different address.
      */
     for (i = 0; i < len && col + i < NAND_STRIDE; i++) {
-        d->data[off + col + i] &= buf[i];
+        uint32_t at = col + i;
+
+        /*
+         * The bad-block marker is the one part of the spare area a codeword
+         * program never touches: the QPIC's BAD BLOCK BYTE (0x1d1, the last
+         * codeword's byte 465, which is spare byte 1) is excluded from ECC
+         * programming, and for a 2048+64 part the marker lives at spare
+         * bytes 0..1.  What a codeword program carries for that area is the
+         * driver's ECC placeholder -- the part gets computed parity there
+         * instead -- and storing those placeholders verbatim zeroed the
+         * marker, so every programmed block read back as bad: yaffs could
+         * not remount its own writes ("block %d is bad"), and RouterBOOT
+         * could not read a boot partition that was written as yaffs.
+         * Spare-only programs (the ones that do move the marker when a block
+         * is retired) still program it.
+         */
+        if (col < NAND_PAGE && at >= NAND_PAGE && at <= NAND_PAGE + 1) {
+            continue;
+        }
+        d->data[off + at] &= buf[i];
     }
     qpic_die_persist(d, d->data + off, off, NAND_STRIDE);
 }
 
 /* ---- the controller --------------------------------------------------- */
 
-/*
- * What one EXEC exports to the data pipe.
- *
- * A page read is issued once per codeword -- the driver rewrites CMD and EXEC
- * for each step of the same page -- so the controller keeps one cursor over
- * the raw page (data and spare in die order) and each EXEC pulls from where
- * the previous one stopped.  That is the observable behaviour of the
- * read-location registers for the one-location-per-step sequence both
- * RouterBOOT and the mainline driver produce, without inventing a codeword
- * layout the register set does not carry.
- */
-static uint32_t qpic_pull(IPQQpic *q, uint8_t *dst, uint32_t len)
+static void qpic_log_stream(IPQQpic *q, const char *what, uint32_t addr,
+                            uint32_t off, const uint8_t *p, uint32_t len)
 {
-    uint32_t n = 0;
-
-    while (n < len) {
-        uint32_t take;
-
-        if (q->rd_pos >= NAND_STRIDE) {
-            q->rd_pos = 0;
-        }
-        take = MIN(len - n, (uint32_t)NAND_STRIDE - q->rd_pos);
-        memcpy(dst + n, q->buf + q->rd_pos, take);
-        q->rd_pos += take;
-        n += take;
-    }
-    return n;
-}
-
-static void qpic_push(IPQQpic *q, const uint8_t *src, uint32_t len)
-{
-    while (len && q->in_len < NAND_STRIDE) {
-        uint32_t take = MIN(len, (uint32_t)NAND_STRIDE - q->in_len);
-
-        memcpy(q->buf + q->in_len, src, take);
-        q->in_len += take;
-        src += take;
-        len -= take;
-    }
-}
-
-static void qpic_commit_program(IPQQpic *q)
-{
-    if (!q->program_pending) {
+    if (!env_true("QEMU_IPQ_QPIC_LOG")) {
         return;
     }
-    q->program_pending = false;
-    qpic_die_program(q->die, q->last_page, q->wr_col, q->buf, q->in_len);
-    q->in_len = 0;
-    ipq_die_store_sync(&q->die->store);
-    q->have_page = false;
-    q->last_page = UINT32_MAX;
+    qpic_log("qpic: %s %08x +%u from page %u cw off %u: "
+             "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+             what, addr, len, q->last_page, off,
+             p[0], len > 1 ? p[1] : 0, len > 2 ? p[2] : 0,
+             len > 3 ? p[3] : 0, len > 4 ? p[4] : 0,
+             len > 5 ? p[5] : 0, len > 6 ? p[6] : 0,
+             len > 7 ? p[7] : 0);
+}
+
+/* How many codewords the CFG0 register says the page is split into. */
+static uint32_t qpic_cw_steps(IPQQpic *q)
+{
+    return ((q->reg[QN_DEV0_CFG0 / 4] & QN_CFG0_CW_PER_PAGE) >> 6) + 1;
+}
+
+/*
+ * The stride between two codewords is the CFG0 "user data" size, not the
+ * page's raw stride: with ECC on, MikroTik's driver frames a codeword as 516
+ * bytes (500 data + 16 spare on the last step) and its chunks tile the flat
+ * 2048-byte page exactly; with ECC off the frame is the whole 528.  Sizing
+ * the frame from the page stride instead put every chunk 16 bytes further
+ * than the driver sent it, which scrambled the page: yaffs' write verify
+ * ("write required 321 attempts", "disk is too small") and RouterBOOT's read
+ * of an installer-written kernel both failed on it.
+ */
+static uint32_t qpic_cw_size(IPQQpic *q)
+{
+    uint32_t ud = (q->reg[QN_DEV0_CFG0 / 4] >> 9) & 0x3ff;
+
+    return ud ? ud : QPIC_CW_SIZE;
+}
+
+/*
+ * One read EXEC fills the window for the codeword it addresses.
+ *
+ * The read-location registers are the whole description of that window: the
+ * driver sets them before each EXEC and the controller presents, at
+ * FLASH_BUF_ACC + offset, the bytes that live at that offset inside the
+ * codeword.  Walking the locations in order also gives the byte stream the
+ * data pipe will drain (data first, then the spare bytes), which is what the
+ * queued rx descriptors expect.
+ *
+ * A codeword's place in the page is its column when the command carries one
+ * (raw reads and the last-codeword helpers address it that way) and otherwise
+ * the running step index, because the ECC path leaves the column at 0 and
+ * lets the controller advance by itself.
+ *
+ * The column is an absolute byte offset into the raw page, not a step number:
+ * the bad-block helpers read the last codeword with column 528 * (steps - 1)
+ * while CFG0 still describes a single step, so deriving the codeword from the
+ * step counter put the window at offset 0 and made every programmed block look
+ * bad (its data byte landed where the BBM byte is looked for).
+ */
+static void qpic_read_window(IPQQpic *q, uint32_t page, uint32_t op,
+                             uint32_t col, uint32_t cw)
+{
+    uint32_t base = col ? col : cw * qpic_cw_size(q);
+    uint32_t regs = q->loc_last ? QN_RD_LOC_LAST0 : QN_RD_LOC0;
+    const uint8_t *die = page < q->die->pages ?
+                         q->die->data + (size_t)page * NAND_STRIDE : NULL;
+    int i;
+
+    /*
+     * A page read walks the codewords one EXEC at a time and the data pipe
+     * may drain each window in pieces, so the windows belong to one stream
+     * that only restarts where a page read starts.
+     */
+    if (cw == 0 || page != q->rd_page) {
+        q->rd_len = 0;
+        q->rd_page = page;
+    }
+
+    for (i = 0; i < 4; i++) {
+        uint32_t v = q->reg[regs / 4 + i];
+        uint32_t off = v & 0x3ff;
+        uint32_t len = (v >> 16) & 0x3ff;
+        uint32_t k;
+
+        if (env_true("QEMU_IPQ_QPIC_LOG")) {
+            qpic_log("qpic:   loc%d v=%08x off=%u len=%u base=%u rd=%u\n",
+                     i, v, off, len, base, q->rd_len);
+        }
+        for (k = 0; k < len && off + k < NAND_STRIDE; k++) {
+            uint32_t d = base + off + k;
+            uint8_t b = (die && d < NAND_STRIDE) ? die[d] : 0xff;
+
+            q->buf[off + k] = b;
+            if (q->rd_len < QPIC_RD_MAX) {
+                q->rd_stream[q->rd_len++] = b;
+            }
+        }
+        if (v & (1u << 31)) {
+            break;              /* this location ends the window */
+        }
+    }
+    if (env_true("QEMU_IPQ_QPIC_LOG")) {
+        uint32_t n = q->rd_len;
+        qpic_log("qpic: win page=%u base=%u regs=%08x %08x %08x %08x die=%d "
+                 "got=%02x %02x %02x %02x die8=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                 page, base, q->reg[regs / 4], q->reg[regs / 4 + 1],
+                 q->reg[regs / 4 + 2], q->reg[regs / 4 + 3],
+                 die != NULL,
+                 n > 3 ? q->rd_stream[n - 4] : 0xff,
+                 n > 2 ? q->rd_stream[n - 3] : 0xff,
+                 n > 1 ? q->rd_stream[n - 2] : 0xff,
+                 n > 0 ? q->rd_stream[n - 1] : 0xff,
+                 die && base + 0 < NAND_STRIDE ? die[base + 0] : 0xff,
+                 die && base + 1 < NAND_STRIDE ? die[base + 1] : 0xff,
+                 die && base + 2 < NAND_STRIDE ? die[base + 2] : 0xff,
+                 die && base + 3 < NAND_STRIDE ? die[base + 3] : 0xff,
+                 die && base + 4 < NAND_STRIDE ? die[base + 4] : 0xff,
+                 die && base + 5 < NAND_STRIDE ? die[base + 5] : 0xff,
+                 die && base + 6 < NAND_STRIDE ? die[base + 6] : 0xff,
+                 die && base + 7 < NAND_STRIDE ? die[base + 7] : 0xff);
+        if (col == 1584 && die) {
+            qpic_log("qpic: bbm page=%u byte=%02x bblk=%u\n",
+                     page, die[NAND_PAGE], page / NAND_PPBLK);
+        }
+    }
+}
+
+/*
+ * How many bytes one program EXEC takes out of the data pipe.
+ *
+ * Linux queues the whole page before the first EXEC (516, 516, 516, then the
+ * last codeword's 500 data bytes plus its 27 spare bytes), while MikroTik's
+ * older driver fed one 528-byte codeword per EXEC.  Both are the CFG0/ECC
+ * description of a step, so the size comes from those registers rather than
+ * from how the driver happened to split its transfers.
+ */
+static uint32_t qpic_program_size(IPQQpic *q, uint32_t cw)
+{
+    uint32_t cfg0 = q->reg[QN_DEV0_CFG0 / 4];
+    uint32_t ecc = q->reg[QN_DEV0_ECC_CFG / 4];
+    uint32_t steps = qpic_cw_steps(q);
+    uint32_t ud = (cfg0 >> 9) & 0x3ff;
+    uint32_t n = ud ? ud : QPIC_CW_SIZE;
+
+    if (ecc & 1) {
+        return n;               /* ECC off: the step is the raw codeword */
+    }
+    if (cw != steps - 1) {
+        return n;               /* 516: 512 data bytes + 4 spare bytes */
+    }
+    if (ud == 512) {
+        /*
+         * Boot-partition layout (qcom,boot-partitions): the last step keeps
+         * its full 512 data bytes and carries a whole codeword of spare.
+         */
+        return QPIC_CW_SIZE;
+    }
+    /*
+     * Last step of a normal page: 500 data bytes (the twelve spare bytes of
+     * the earlier steps were already protected with their data) followed by
+     * the sixteen free spare bytes plus this step's parity and spare.
+     */
+    return (QPIC_ECC_STEP - ((steps - 1) << 2)) +
+           (steps << 2) + ((ecc >> 8) & 0x1f) + ((cfg0 >> 23) & 0xf);
 }
 
 static void qpic_exec(IPQQpic *q)
@@ -3056,37 +3261,29 @@ static void qpic_exec(IPQQpic *q)
     uint32_t op = cmd & QN_CMD_OP_MASK;
     uint32_t page = ((q->reg[QN_ADDR1 / 4] & 0xff) << 16) |
                     ((q->reg[QN_ADDR0 / 4] >> 16) & 0xffff);
+    uint32_t col = q->reg[QN_ADDR0 / 4] & 0xffff;
+    uint32_t steps = qpic_cw_steps(q);
     /*
      * The erase command is the odd one out: it carries the row in ADDR0[15:0]
      * (ADDR1[7:0] for the high bits) instead of ADDR0[31:16].  Reading it like
      * a page command made every erase land on page 0, so the blocks being
      * formatted were never erased and the filesystem could not be mounted.
      */
-    uint32_t row_erase = (q->reg[QN_ADDR0 / 4] & 0xffff) |
-                         ((q->reg[QN_ADDR1 / 4] & 0xff) << 16);
-
-    /*
-     * The command pipe and the data pipe are independent: EXEC can arrive
-     * before the page bytes do.  A program that was left pending is committed
-     * by whichever command comes next -- normally the status poll -- and by
-     * the time it is committed the data long since landed.
-     */
-    if (q->program_pending && q->in_len) {
-        qpic_commit_program(q);
-    }
+    uint32_t row_erase = col | ((q->reg[QN_ADDR1 / 4] & 0xff) << 16);
 
     if (env_true("QEMU_IPQ_QPIC_LOG")) {
         qpic_log(
                       "qpic: exec op=%u page=%u col=%u cmd=%08x addr0=%08x "
                       "addr1=%08x cfg0=%08x ecc=%08x loc=%08x in=%u\n",
-                      op, page, q->reg[QN_ADDR0 / 4] & 0xffff, cmd,
+                      op, page, col, cmd,
                       q->reg[QN_ADDR0 / 4], q->reg[QN_ADDR1 / 4],
                       q->reg[QN_DEV0_CFG0 / 4], q->reg[QN_DEV0_ECC_CFG / 4],
-                      q->reg[QN_RD_LOC0 / 4], q->in_len);
+                      q->reg[QN_RD_LOC0 / 4], q->tx_len);
     }
 
     switch (op) {
     case QN_OP_RESET_DEVICE:
+        q->txn_rd = q->txn_wr = 0;
         break;
 
     case QN_OP_FETCH_ID:
@@ -3103,68 +3300,69 @@ static void qpic_exec(IPQQpic *q)
 
     case QN_OP_BLOCK_ERASE:
         qpic_die_erase(q->die, row_erase);
-        /*
-         * The page buffer holds what the last read put there; the array has
-         * just changed underneath it, so the next read of the same page has to
-         * fetch again.  Without this a read-after-erase (RouterBOOT verifies
-         * its own writes that way) would answer with the erased page's previous
-         * contents.
-         */
-        q->have_page = false;
-        q->last_page = UINT32_MAX;
+        q->txn_rd = q->txn_wr = 0;
         break;
 
     case QN_OP_PAGE_READ:
     case QN_OP_PAGE_READ_ECC:
     case QN_OP_PAGE_READ_SPARE:
-    case QN_OP_ONFI_READ:
-        if (!q->have_page || page != q->last_page) {
-            q->last_page = page;
-            q->have_page = true;
-            /*
-             * Where in the page the stream starts is the opcode and the column
-             * together: a normal read addresses the data area, a spare read
-             * addresses the spare area, whose column 0 is offset 2048 of the
-             * raw page.  RouterBOOT looks for its per-block headers that way
-             * (op=4, column 0, one page per block) and the vendor driver reads
-             * the ONFI/parameter bytes at a column; serving both from offset 0
-             * gave them page data instead of what they asked for, which is a
-             * silently wrong read, not a failed one.
-             */
-            q->rd_pos = (op == QN_OP_PAGE_READ_SPARE ? NAND_PAGE : 0) +
-                        MIN(q->reg[QN_ADDR0 / 4] & 0xffffu,
-                            (uint32_t)NAND_STRIDE - 1);
-            if (page < q->die->pages) {
-                memcpy(q->buf, q->die->data + (size_t)page * NAND_STRIDE,
-                       NAND_STRIDE);
-            } else {
-                memset(q->buf, 0xff, NAND_STRIDE);
+    case QN_OP_ONFI_READ: {
+        uint32_t cw;
+
+        if (col) {
+            cw = MIN(col / QPIC_CW_SIZE, steps - 1);
+        } else {
+            if (q->txn_rd >= steps) {
+                q->txn_rd = 0;
             }
+            cw = q->txn_rd;
         }
-        /* A read that follows a program of the same page commits it first. */
-        qpic_commit_program(q);
+        q->last_page = page;
+        qpic_read_window(q, page, op, col, cw);
+        if (env_true("QEMU_IPQ_QPIC_LOG")) {
+            qpic_log("qpic: rd window page=%u cw=%u col=%u len=%u loc=%08x\n",
+                     page, cw, col, q->rd_len, q->reg[QN_RD_LOC0 / 4]);
+        }
+        q->txn_rd = cw + 1;
         break;
+    }
 
     case QN_OP_PROGRAM_PAGE:
     case QN_OP_PROGRAM_PAGE_ECC:
-    case QN_OP_PROGRAM_SPARE:
-        q->last_page = page;
-        q->wr_col = q->reg[QN_ADDR0 / 4] & 0xffff;
-        if (q->in_len) {
-            qpic_die_program(q->die, page, q->wr_col, q->buf, q->in_len);
-            q->in_len = 0;
+    case QN_OP_PROGRAM_SPARE: {
+        uint32_t cw = col ? MIN(col / QPIC_CW_SIZE, steps - 1) :
+                            MIN(q->txn_wr, steps - 1);
+        /* Same rule as the read side: a column is an absolute byte offset. */
+        uint32_t at = col ? col : cw * qpic_cw_size(q);
+        uint32_t n = MIN(q->tx_len, qpic_program_size(q, cw));
+
+        /*
+         * Programming a NAND only clears bits, and the page keeps whatever
+         * was never written, so the die ANDs the step in place.  The bytes
+         * land where the read path will look for them: at the codeword's own
+         * window, which is also the byte order the driver queued them in.
+         */
+        if (n) {
+            if (env_true("QEMU_IPQ_QPIC_LOG") ||
+                (env_true("QEMU_IPQ_QPIC_PGM") && cw == 0)) {
+                qpic_log("qpic: prog page=%u cw=%u at=%u n=%u tx=%02x %02x %02x %02x "
+                         "%02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                         page, cw, at, n,
+                         q->tx_stage[0], q->tx_stage[1], q->tx_stage[2],
+                         q->tx_stage[3], q->tx_stage[4], q->tx_stage[5],
+                         q->tx_stage[6], q->tx_stage[7], q->tx_stage[8],
+                         q->tx_stage[9], q->tx_stage[10], q->tx_stage[11],
+                         q->tx_stage[12]);
+            }
+            qpic_die_program(q->die, page, at, q->tx_stage, n);
+            q->tx_len -= n;
+            memmove(q->tx_stage, q->tx_stage + n, q->tx_len);
             ipq_die_store_sync(&q->die->store);
-            q->have_page = false;
-            q->last_page = UINT32_MAX;
-        } else {
-            /*
-             * The engine and the data channel are independent: the command
-             * pipe can reach EXEC before the data has landed.  Remember the
-             * program and let the data commit it when it arrives.
-             */
-            q->program_pending = true;
         }
+        q->last_page = page;
+        q->txn_wr = cw + 1;
         break;
+    }
 
     default:
         break;
@@ -3181,8 +3379,15 @@ static uint32_t qpic_reg_read(IPQQpic *q, uint32_t off)
          * FS_READY_BSY_N is "ready" when set: the driver writes it back to
          * clear the status and then polls until it reappears, so a device
          * that is never busy returns it every time.
+         *
+         * Bit 23 is the WP# pin, and it is active low: MikroTik's erase path
+         * caches this word and, when the bit is clear, refuses the erase with
+         * "msm_nand_erase: Device is write protected" before touching the
+         * part.  The die here is writable, so the pin is deasserted and the
+         * bit reads back set.  (Bits 4, 8 and 16 are the DEV/OP/MPU error
+         * flags the same code checks, and they stay clear.)
          */
-        return 0x20;
+        return 0x20u | (1u << 23);
     }
     if (off == QN_BUFFER_STATUS) {
         return 0;                               /* no ECC errors */
@@ -3210,6 +3415,31 @@ static void qpic_reg_write(IPQQpic *q, uint32_t off, uint32_t val)
         return;
     }
     q->reg[off / 4] = val;
+
+    /*
+     * A fresh address starts a fresh transaction: the ECC path writes the
+     * page address once and then steps through the codewords with the column
+     * left at zero, so the step counter is what says which codeword an EXEC
+     * means.  Raw reads and the last-codeword helpers put the codeword in the
+     * column instead, which qpic_exec prefers when it is set.
+     */
+    if (off == QN_ADDR0) {
+        q->txn_rd = 0;
+        q->txn_wr = 0;
+    }
+    /*
+     * The read locations come in two banks and the one written last is the
+     * one this EXEC uses: the first three steps use READ_LOCATION_0..3 and the
+     * last step uses READ_LOCATION_LAST_CW_0..3 (qpic v2), whichever step it
+     * is.  Tracking the bank keeps the model from having to guess from the
+     * column, which the ECC path never sets.
+     */
+    if (off >= QN_RD_LOC0 && off < QN_RD_LOC0 + 16) {
+        q->loc_last = false;
+    }
+    if (off >= QN_RD_LOC_LAST0 && off < QN_RD_LOC_LAST0 + 16) {
+        q->loc_last = true;
+    }
 
     if (off == QN_EXEC && (val & 1)) {
         qpic_exec(q);
@@ -3272,6 +3502,8 @@ typedef struct IPQQpicBam {
     uint32_t ctrl, desc_trshld, cfg_bits;
     uint32_t irq_stts, irq_en;
     uint32_t irq_srcs_msk, irq_srcs_msk_ee;
+    uint32_t irq_observed;      /* sources the CPU last saw in BAM_IRQ_SRCS */
+    unsigned irq_line;          /* this model's current output level */
     IPQQpicBamPipe pipe[QB_PIPES];
     uint32_t ext[IPQ_QPIC_BAM_EXT / 4];    /* pipe-attribute page and up */
 } IPQQpicBam;
@@ -3306,18 +3538,71 @@ static uint32_t qpic_bam_irq_pending(IPQQpicBam *b)
  */
 static void qpic_bam_update_irq(IPQQpicBam *b)
 {
-    /*
-     * Off by default.  A level line whose source the consumer does not clear
-     * is worse than no line at all: MikroTik's netinstall kernel enabled the
-     * pipe source and then never acknowledged it, and the asserted line turned
-     * a failed probe into "soft lockup - CPU#0 stuck for 22s".  The BAM's
-     * status registers are all here, so QEMU_IPQ_QPIC_IRQ=1 is the way to try
-     * a driver that really wants the interrupt; until one is shown to work,
-     * the default is the polling behaviour every bootloader in this tree uses.
-     */
-    if (b->irq && env_true("QEMU_IPQ_QPIC_IRQ")) {
-        qemu_set_irq(b->irq, qpic_bam_irq_pending(b) != 0);
+    uint32_t pending = qpic_bam_irq_pending(b);
+    uint32_t fresh;
+
+    if (!b->irq || !env_u32("QEMU_IPQ_QPIC_IRQ", 1)) {
+        return;
     }
+    if (!pending) {
+        /*
+         * Every source acknowledged: re-arm the edge for the next transfer.
+         */
+        b->irq_observed = 0;
+        if (b->irq_line) {
+            b->irq_line = 0;
+            qemu_set_irq(b->irq, 0);
+        }
+        return;
+    }
+    /*
+     * The line asserts when a pipe reports an enabled source the CPU has not
+     * observed in BAM_IRQ_SRCS_EE yet, and drops when the CPU reads that
+     * register -- an edge, not a held level.  A held level cannot cross the
+     * RouterBOOT handover: its final read-ahead command batches complete
+     * after its last wait_pipe(), so the command pipe keeps PRCSD/TRNSFR_END
+     * latched with nobody left to acknowledge it (the booter waits on the
+     * data pipe and jumps), and the kernel's SPS handler exits without
+     * clearing sources of pipes it does not own.  A held level would re-fire
+     * the SPI forever from that leftover -- the soft lockup the moment the
+     * kernel enables the IRQ -- while an edge dies after one IRQ.  Only the
+     * edge semantics are consistent with the same booter and kernel binaries
+     * running on the silicon, where RouterOS boots from NAND.
+     */
+    fresh = pending & ~b->irq_observed;
+    if (fresh && !b->irq_line) {
+        b->irq_line = 1;
+        qemu_set_irq(b->irq, 1);
+    }
+}
+
+static unsigned qpgm_logs;
+
+/*
+ * The booter's exit path pulses the QPIC's block reset in the GCC before it
+ * jumps to the kernel -- its last NAND command stays unacknowledged when a
+ * part with no kernel made it time out, and the next guest's SPS layer
+ * refuses to enable a BAM that still shows a pending source.  The clock
+ * controller is a stub, so this is where that pulse has to land.
+ */
+static void ipq_qpic_bam_reset(void)
+{
+    IPQQpicBam *b = ipq_qpic_bam;
+    int i;
+
+    if (!b) {
+        return;
+    }
+    for (i = 0; i < QB_PIPES; i++) {
+        memset(&b->pipe[i], 0, sizeof(b->pipe[i]));
+    }
+    b->desc_trshld = 0;
+    b->cfg_bits = 0x0fffffff;
+    b->irq_stts = 0;
+    b->irq_en = 0;
+    b->irq_srcs_msk = 0;
+    b->irq_srcs_msk_ee = 0;
+    qpic_bam_update_irq(b);
 }
 
 static void qpic_bam_data_in(IPQQpic *q, uint32_t addr, uint32_t len)
@@ -3330,34 +3615,73 @@ static void qpic_bam_data_in(IPQQpic *q, uint32_t addr, uint32_t len)
 
         address_space_read(&address_space_memory, addr + done,
                            MEMTXATTRS_UNSPECIFIED, chunk, take);
-        qpic_push(q, chunk, take);
+        if (env_true("QEMU_IPQ_QPIC_PGM") && qpgm_logs < 400) {
+            qpgm_logs++;
+            qpic_log("qpic: datain addr=%08x len=%u stage=%u tx=%02x %02x "
+                     "%02x %02x %02x %02x %02x %02x\n",
+                     addr + done, take, q->tx_len,
+                     chunk[0], chunk[1], chunk[2], chunk[3],
+                     chunk[4], chunk[5], chunk[6], chunk[7]);
+        }
+        qpic_log_stream(q, "in", addr + done, q->tx_len, chunk, take);
+        /*
+         * The bytes stay staged until the command pipe reaches the program
+         * EXEC they belong to, because the whole page arrives before the
+         * first codeword is programmed.
+         */
+        if (q->tx_len + take <= QPIC_RD_MAX) {
+            memcpy(q->tx_stage + q->tx_len, chunk, take);
+            q->tx_len += take;
+        }
         done += take;
     }
 }
 
-static void qpic_bam_data_out(IPQQpic *q, uint32_t addr, uint32_t len)
+/*
+ * Drain the descriptors the data pipe queued for a read.
+ *
+ * They are served from rd_stream, which the command pipe filled one codeword
+ * at a time, so the guest sees the die's contents and not whatever the
+ * controller's window happened to hold when the data pipe was rung.
+ *
+ * A descriptor whose length runs past the bytes produced so far simply waits:
+ * the transfer is completed by the next read (or by this same pass, when the
+ * command pipe ran after the data pipe).
+ */
+static void qpic_bam_data_out(IPQQpic *q)
 {
-    uint8_t chunk[512];
-    uint32_t done = 0;
+    uint32_t pos = 0;
 
-    while (done < len) {
-        uint32_t take = MIN(len - done, (uint32_t)sizeof(chunk));
+    while (q->rx_n && pos < q->rd_len) {
+        uint32_t addr = q->rx_addr[0];
+        uint32_t len = q->rx_len[0];
+        uint32_t done = q->rx_done[0];
+        uint8_t chunk[512];
+        uint32_t take = MIN(MIN(len - done, (uint32_t)sizeof(chunk)),
+                            q->rd_len - pos);
+        uint32_t k;
 
-        qpic_pull(q, chunk, take);
-        if (env_true("QEMU_IPQ_QPIC_LOG")) {
-            qpic_log(
-                          "qpic: out %08x +%u from page %u pos %u: "
-                          "%02x %02x %02x %02x %02x %02x %02x %02x\n",
-                          addr + done, take, q->last_page,
-                          q->rd_pos - take,
-                          chunk[0], take > 1 ? chunk[1] : 0,
-                          take > 2 ? chunk[2] : 0, take > 3 ? chunk[3] : 0,
-                          take > 4 ? chunk[4] : 0, take > 5 ? chunk[5] : 0,
-                          take > 6 ? chunk[6] : 0, take > 7 ? chunk[7] : 0);
+        for (k = 0; k < take; k++) {
+            chunk[k] = q->rd_stream[pos + k];
         }
+        qpic_log_stream(q, "out", addr + done, pos, chunk, take);
         address_space_write(&address_space_memory, addr + done,
                             MEMTXATTRS_UNSPECIFIED, chunk, take);
-        done += take;
+        pos += take;
+        q->rx_done[0] = done + take;
+        if (q->rx_done[0] == len) {
+            memmove(&q->rx_addr[0], &q->rx_addr[1],
+                    (q->rx_n - 1) * sizeof(q->rx_addr[0]));
+            memmove(&q->rx_len[0], &q->rx_len[1],
+                    (q->rx_n - 1) * sizeof(q->rx_len[0]));
+            memmove(&q->rx_done[0], &q->rx_done[1],
+                    (q->rx_n - 1) * sizeof(q->rx_done[0]));
+            q->rx_n--;
+        }
+    }
+    if (pos) {
+        memmove(q->rd_stream, q->rd_stream + pos, q->rd_len - pos);
+        q->rd_len -= pos;
     }
 }
 
@@ -3481,12 +3805,43 @@ static void qpic_bam_run(IPQQpicBam *b, int n, uint32_t doorbell)
         if (p->cons >= slots) {
             p->cons = 0;
         }
+        if (env_true("QEMU_IPQ_QPIC_LOG")) {
+            uint32_t i = p->cons, k;
+
+            qpic_log("qpic: ring pipe=%d cons=%u tail=%u\n",
+                     n, p->cons, tail);
+            for (k = 0; k < 8 && i != tail; k++, i = (i + 1) % slots) {
+                uint32_t e[2];
+
+                address_space_read(&address_space_memory,
+                                   p->desc_fifo + i * 8,
+                                   MEMTXATTRS_UNSPECIFIED, e, sizeof(e));
+                qpic_log("qpic:   slot %u: %08x %08x\n", i, e[0], e[1]);
+            }
+        }
+        /*
+         * The window produced by the command pipe stays in rd_stream until a
+         * queued rx descriptor collects it: the pipes can be rung in either
+         * order, and a transfer may run across several EXECs.
+         */
+        /*
+         * The two pipes can be rung in either order.  Linux queues the rx
+         * descriptors first and lets the command pipe run the read; RouterBOOT
+         * runs the command pipe first and only then hands over the rx
+         * descriptors.  Both are served here: whichever half arrives second
+         * completes the transfer.
+         */
         while (p->cons != tail && guard++ < 4096) {
             uint32_t d[2];
 
             address_space_read(&address_space_memory,
                                p->desc_fifo + p->cons * 8,
                                MEMTXATTRS_UNSPECIFIED, d, sizeof(d));
+            if (env_true("QEMU_IPQ_QPIC_LOG")) {
+                qpic_log("qpic: desc pipe=%d cons=%u tail=%u db=%#x "
+                         "addr=%08x w1=%08x\n",
+                         n, p->cons, tail, doorbell, d[0], d[1]);
+            }
             if (d[1] & 0xffff) {
                 if (n == QB_PIPE_CMD) {
                     qpic_bam_ce(b, d[0], d[1] & 0xffff);
@@ -3496,7 +3851,12 @@ static void qpic_bam_run(IPQQpicBam *b, int n, uint32_t doorbell)
                                       "qpic: rx desc %08x len %u\n",
                                       d[0], d[1] & 0xffff);
                     }
-                    qpic_bam_data_out(q, d[0], d[1] & 0xffff);
+                    if (q->rx_n < ARRAY_SIZE(q->rx_addr)) {
+                        q->rx_addr[q->rx_n] = d[0];
+                        q->rx_len[q->rx_n] = d[1] & 0xffff;
+                        q->rx_done[q->rx_n] = 0;
+                        q->rx_n++;
+                    }
                 } else {
                     if (env_true("QEMU_IPQ_QPIC_LOG")) {
                         qpic_log(
@@ -3508,10 +3868,28 @@ static void qpic_bam_run(IPQQpicBam *b, int n, uint32_t doorbell)
             }
             p->cons = (p->cons + 1) % slots;
         }
+        /*
+         * A command pass may have produced a window while descriptors were
+         * already queued, and a data pass may have queued descriptors for a
+         * window that was produced earlier.  Both end here.
+         */
+        qpic_bam_data_out(q);
     }
-    p->irq_stts |= QB_P_IRQ_PRCSD | QB_P_IRQ_TRNSFR_END;
-    p->irq_stts &= ~QB_P_IRQ_OUT_DESC;
-    qpic_bam_update_irq(b);
+    /*
+     * A doorbell only completes something if this pass retired a descriptor.
+     * The driver's last ring of a transfer can be a bare flush -- RouterBOOT
+     * times out on a part with no kernel and rings once more, and the
+     * installer's flash tool ends its command list the same way.  Latching
+     * PRCSD for those left a source nobody acknowledges, and the next kernel
+     * waited for BAM_IRQ_SRCS_EE to reach zero forever (soft lockup inside
+     * msm_nand_bam_init); skipping the latch made RouterBOOT's own wait loop
+     * miss completions and hang the other way.
+     */
+    if (guard) {
+        p->irq_stts |= QB_P_IRQ_PRCSD | QB_P_IRQ_TRNSFR_END;
+        p->irq_stts &= ~QB_P_IRQ_OUT_DESC;
+        qpic_bam_update_irq(b);
+    }
 }
 
 static uint64_t qpic_bam_read_raw(void *opaque, hwaddr off, unsigned size)
@@ -3548,13 +3926,55 @@ static uint64_t qpic_bam_read_raw(void *opaque, hwaddr off, unsigned size)
 
         return idx < ARRAY_SIZE(b->ext) ? b->ext[idx] : 0;
     }
+    if (off == QB_IRQ_SRCS_EE && env_true("QEMU_IPQ_BAM_DBG")) {
+        static unsigned n;
+        n++;
+        if (n < 12 || (n % 500000) == 0) {
+            int i;
+            fprintf(stderr, "bam: srcs=%08x", qpic_bam_irq_srcs(b));
+            for (i = 0; i < QB_PIPES; i++) {
+                fprintf(stderr, " p%d{ctrl=%08x sts=%08x en=%08x cons=%u evnt=%08x}",
+                        i, b->pipe[i].ctrl, b->pipe[i].irq_stts,
+                        b->pipe[i].irq_en, b->pipe[i].cons,
+                        b->pipe[i].evnt_reg);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    if (off == QB_IRQ_SRCS_EE || off == QB_IRQ_SRCS) {
+        /*
+         * The CPU observing the sources is what retires the line's edge (see
+         * qpic_bam_update_irq): the sources stay latched, but the SPI drops
+         * so a leftover no driver owns cannot re-fire it.
+         */
+        b->irq_observed = qpic_bam_irq_pending(b);
+        if (b->irq_line) {
+            b->irq_line = 0;
+            if (env_u32("QEMU_IPQ_QPIC_IRQ", 1)) {
+                qemu_set_irq(b->irq, 0);
+            }
+        }
+    }
+    if (env_true("QEMU_IPQ_QPIC_LOG") && off == QB_IRQ_SRCS_EE) {
+        qpic_log("qpic-bam: read %#x -> %08x%s\n", (uint32_t)off,
+                 qpic_bam_irq_srcs(b),
+                 env_u32("QEMU_IPQ_QPIC_LOG", 0) > 1 ? trace_pc() : "");
+    }
     switch (off) {
     case QB_CTRL:        return b->ctrl;
     case QB_DESC_TRSHLD: return b->desc_trshld;
     case QB_CNFG_BITS:   return b->cfg_bits;
     case QB_IRQ_STTS:    return b->irq_stts;
     case QB_IRQ_EN:      return b->irq_en;
-    case QB_REVISION:    return 0x00010007u;    /* v1.7 */
+    case QB_REVISION:
+        /*
+         * {major:8 at 23:16, minor:8 at 15:12, num_ees:4 at 11:8, step:8}.
+         * The EE count is not decoration: Linux's bam_init() range-checks the
+         * node's qcom,ee against it and fails the probe with -EINVAL when it
+         * reads zero, so the QPIC's BAM has to report the same four EEs the
+         * BLSP1 one does (bam_seed_id()).
+         */
+        return 0x00010407u;                     /* v1.0, 4 EEs, step 7 */
     case QB_NUM_PIPES:   return QB_PIPES;
     case QB_IRQ_SRCS:    return qpic_bam_irq_srcs(b);
     case QB_IRQ_SRCS_MSK:return b->irq_srcs_msk;
@@ -3572,8 +3992,9 @@ static void qpic_bam_write(void *opaque, hwaddr off, uint64_t val,
     uint32_t roff = 0;
 
     if (env_true("QEMU_IPQ_QPIC_LOG")) {
-        qpic_log("qpic-bam: write %#x <- %08x\n",
-                      (uint32_t)off, (uint32_t)val);
+        qpic_log("qpic-bam: write %#x <- %08x%s\n",
+                      (uint32_t)off, (uint32_t)val,
+                      env_u32("QEMU_IPQ_QPIC_LOG", 0) > 1 ? trace_pc() : "");
     }
     if (off >= QB_PIPE_BASE) {
         uint32_t rel = off - QB_PIPE_BASE;
@@ -3747,11 +4168,10 @@ static void ipq_die_program_image(uint8_t *data, uint32_t bytes,
 /*
  * The controller resets with the machine; the die does not, because the die is
  * the part and the part is the store.  What has to go is everything the
- * previous boot left *inside the controller*: a program left pending must not
- * be committed by the next boot's first command (that would put the old page
- * buffer into the die at a page nobody asked for), and the read cursor has to
- * start over, or the first page read of the new boot would continue the old
- * one instead of starting at page 0.
+ * previous boot left *inside the controller*: staged program bytes and a
+ * queued read must not be carried into the next boot's first command, and the
+ * step counters have to start over, or the first page access of the new boot
+ * would continue the old one instead of starting at its first codeword.
  */
 static void qpic_dev_reset(void)
 {
@@ -3764,12 +4184,14 @@ static void qpic_dev_reset(void)
     }
     memset(q->reg, 0, sizeof(q->reg));
     memset(q->buf, 0xff, sizeof(q->buf));
-    q->in_len = 0;
-    q->wr_col = 0;
-    q->rd_pos = 0;
+    q->tx_len = 0;
+    q->txn_wr = 0;
+    q->rd_len = 0;
+    q->rd_page = UINT32_MAX;
+    q->txn_rd = 0;
+    q->rx_n = 0;
+    q->loc_last = false;
     q->last_page = UINT32_MAX;
-    q->have_page = false;
-    q->program_pending = false;
 
     if (!b) {
         return;
@@ -3781,6 +4203,8 @@ static void qpic_dev_reset(void)
     b->irq_en = 0;
     b->irq_srcs_msk = 0;
     b->irq_srcs_msk_ee = 0;
+    b->irq_observed = 0;
+    b->irq_line = 0;
     for (i = 0; i < QB_PIPES; i++) {
         memset(&b->pipe[i], 0, sizeof(b->pipe[i]));
     }
@@ -3930,6 +4354,10 @@ static void ipq_board_add_nor(MemoryRegion *sysmem)
                                               ipq_flash_jedec,
                                               sizeof(ipq_flash_jedec),
                                               "nor-id");
+    ipq_flash_uid_len = ipq_parse_hex_bytes(ipq_cfg.nor_uid,
+                                            ipq_flash_uid,
+                                            sizeof(ipq_flash_uid),
+                                            "nor-uid");
 
     /* Unwritten flash reads 0xff, not 0x00. */
     memset(flash->data, 0xff, flash->size);
@@ -4125,8 +4553,19 @@ static void qup_spi_opcode(IPQQupl *q, uint8_t op)
         q->rx_len = ipq_flash_jedec_len;
         q->rx_wrap = 1;
         break;
-    case 0x4b:                          /* Read Unique ID: 8 bytes */
-        q->rx_len = 8;
+    case 0x4b:                          /* Read Unique ID */
+        /*
+         * Winbond's format, the way MikroTik's flash_get_uid() reads it: the
+         * command clocks four bytes out (the opcode plus three dummies) and
+         * then reads nine in, skipping the first (the fourth dummy) and
+         * taking the next eight as the id.  Without it the module falls back
+         * to get_random_bytes, and the software id changes on every boot.
+         * The id is the part's identity: stable, board-selectable.
+         */
+        q->dummy_left = 3;
+        q->rx_buf[0] = 0x00;
+        memcpy(q->rx_buf + 1, ipq_flash_uid, ipq_flash_uid_len);
+        q->rx_len = 1 + ipq_flash_uid_len;
         break;
     case 0x05:                          /* RDSR1 */
         /*
@@ -4894,7 +5333,8 @@ static int ipq_tlmm_out_level(IPQTLMM *t, unsigned pin)
  */
 static void ipq_cs_line(void *opaque, int level)
 {
-    unsigned which = (unsigned)(uintptr_t)opaque;
+    unsigned which = (unsigned)(uintptr_t)opaque & 0xff;
+    unsigned pin = (unsigned)(uintptr_t)opaque >> 8;
     IPQQupl *q = ipq->qup_spi;
     bool asserted = level == 0;
 
@@ -4902,9 +5342,7 @@ static void ipq_cs_line(void *opaque, int level)
         return;
     }
     if (die_dbg_on()) {
-        die_dbg_log("die: cs%u %s %s\n",
-                    which == NAND_CS_NAND ? ipq_cfg.nand_cs_gpio
-                                          : ipq_cfg.nor_cs_gpio,
+        die_dbg_log("die: cs%u %s %s\n", pin,
                     asserted ? "assert" : "release",
                     which == NAND_CS_NAND ? "nand" : "nor");
     }
@@ -6674,6 +7112,7 @@ struct IPQEdma {
     qemu_irq irq_tx[IPQ_EDMA_QUEUES];
     qemu_irq irq_rx[IPQ_EDMA_QUEUES];
     int tx_level[IPQ_EDMA_QUEUES];
+    int rx_level[IPQ_EDMA_QUEUES];
 
     /* Host backend and the switch port it is wired to. */
     NetClientState *nc;
@@ -6688,6 +7127,17 @@ struct IPQEdma {
     uint64_t tx_drop_nolink;        /* netdev client down / detached */
     uint64_t rx_host;               /* frames taken from the netdev */
     uint64_t rx_dropped;
+    /*
+     * Receive buffers the driver has published and the engine has not
+     * consumed yet.  It cannot be derived from the index register: prod and
+     * cons are both modulo the ring, so once the engine catches up with a
+     * driver that stopped publishing (RouterBOOT hands over to Linux and its
+     * ring goes quiet), `(prod - cons) & (ring - 1)` reads as "almost empty"
+     * and the engine would keep writing frames into buffers that are no
+     * longer part of any ring -- that is live kernel memory, and it wedged
+     * the guest inside msm_nand probe.  Counting publications keeps the
+     * engine stopped at zero instead.
+     */
 };
 
 
@@ -6709,6 +7159,12 @@ static void edma_update_irqs(IPQEdma *e)
             qemu_set_irq(e->irq_tx[q], tx);
         }
         if (e->irq_rx[q]) {
+            if (rx != e->rx_level[q]) {
+                e->rx_level[q] = rx;
+                EDMA_DBG("rx irq q=%u %d (isr=%08x mask=%08x)\n", q, rx,
+                         e->regs[EDMA_REG_RX_ISR / 4],
+                         e->regs[EDMA_REG_RX_INT_MASK_Q(q) / 4]);
+            }
             qemu_set_irq(e->irq_rx[q], rx);
         }
     }
@@ -7085,6 +7541,13 @@ static unsigned edma_rx_free(IPQEdma *e, unsigned q, unsigned *prod_out,
     if (base_out) {
         *base_out = base;
     }
+    /*
+     * Both index halves are ring-slot indices that wrap at the ring size
+     * (the driver publishes (head + RING - 1) % RING and reads the engine's
+     * consumer back the same way), so the room is the live modular
+     * difference.  A changed RFD_BASE_Q starts a fresh ring, which is what
+     * keeps a dirty RouterBOOT handover from poisoning this arithmetic.
+     */
     return (prod - cons) & (ring - 1);
 }
 
@@ -7121,6 +7584,8 @@ static void edma_rx_deliver(IPQEdma *e, const uint8_t *frame, size_t len)
         return;
     }
     free = edma_rx_free(e, q, &prod, &cons, &ring, &base);
+    EDMA_DBG("rx_ring prod=%u cons=%u ring=%u base=%08x free=%u len=%zu\n",
+             prod, cons, ring, base, free, len);
     nbuf = edma_rx_bufs_needed(len);
     if (!base || free < nbuf) {
         e->rx_dropped++;
@@ -7141,6 +7606,10 @@ static void edma_rx_deliver(IPQEdma *e, const uint8_t *frame, size_t len)
         if (!addr) {
             e->rx_dropped++;
             return;
+        }
+        if (!i) {
+            EDMA_DBG("rx slot=%u addr=%08x nbuf=%u len=%zu\n",
+                     slot, addr, nbuf, len);
         }
         if (i == 0) {
             uint16_t rrd[EDMA_RRD_SIZE / 2] = { 0 };
@@ -7362,6 +7831,11 @@ static uint64_t edma_read(void *opaque, hwaddr off, unsigned size)
             return e->tx_byte[q];
         }
     }
+    if (off == EDMA_REG_RFD_IDX_Q(0) &&
+        env_u32("QEMU_IPQ_EDMA_LOG", 0) > 1) {
+        fprintf(stderr, "edma: rfd_idx q=0 read -> %08x\n",
+                e->regs[off / 4]);
+    }
     return e->regs[off / 4];
 }
 
@@ -7398,6 +7872,8 @@ static void edma_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
              * engine's consumer to 0 and make it overwrite buffers the driver
              * had not taken yet.
              */
+            EDMA_DBG("rfd_idx q=%u write val=%08x old=%08x\n",
+                     q, (uint32_t)val, e->regs[off / 4]);
             e->regs[off / 4] = (e->regs[off / 4] & ~EDMA_RFD_PROD_MASK) |
                                ((uint32_t)val & EDMA_RFD_PROD_MASK);
             /*
@@ -7438,7 +7914,32 @@ static void edma_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         return;
     }
 
+    for (q = 0; q < IPQ_EDMA_QUEUES; q++) {
+        if (off == EDMA_REG_RFD_BASE_Q(q) &&
+            (uint32_t)val != e->regs[off / 4]) {
+            /*
+             * A new ring base means a new ring: the driver is (re)building
+             * it, so the engine's consumer index restarts at slot 0.
+             * RouterBOOT hands over with its own ring armed; without this
+             * the first Linux publication would be measured against the
+             * booter's producer index.  Only the consumer half may be
+             * cleared: the OpenWrt ipqess driver publishes its buffers
+             * (RFD_IDX writes) *before* setting the base, so zeroing the
+             * producer half would forget buffers the driver will never
+             * publish again, and the receive path would sit dead.
+             */
+            e->regs[EDMA_REG_RFD_IDX_Q(q) / 4] &= EDMA_RFD_PROD_MASK;
+            EDMA_DBG("rfd_base q=%u new=%08x ring reset\n", q,
+                     (uint32_t)val);
+        }
+    }
+
     e->regs[off / 4] = (uint32_t)val;
+    if (off == EDMA_REG_RX_DESC0 || off == EDMA_REG_RFD_BASE_Q(0) ||
+        off == EDMA_REG_RFD_IDX_Q(0)) {
+        EDMA_DBG("reg write off=%03x val=%08x\n", (unsigned)off,
+                 (uint32_t)val);
+    }
     if (off >= EDMA_REG_RX_INT_MASK_Q(0) && off <= EDMA_REG_TX_INT_MASK_Q(15)) {
         EDMA_DBG("mask write off=%03x val=%08x\n", (unsigned)off,
                  (uint32_t)val);
@@ -10190,11 +10691,23 @@ static void ipq4019_init(MachineState *machine)
      */
     if (ipq_cfg.nor) {
         ipq_tlmm_connect(ipq->tlmm, ipq_cfg.nor_cs_gpio, ipq_cs_line,
-                         (void *)(uintptr_t)NAND_CS_NOR);
+                         (void *)(uintptr_t)(NAND_CS_NOR |
+                                             (ipq_cfg.nor_cs_gpio << 8)));
+        /*
+         * A board that also wires the NOR select to a plain GPIO (the hAP
+         * ac3, see nor_cs_gpio_alt): the same die, a second way to reach it.
+         */
+        if (ipq_cfg.nor_cs_gpio_alt &&
+            ipq_cfg.nor_cs_gpio_alt != ipq_cfg.nor_cs_gpio) {
+            ipq_tlmm_connect(ipq->tlmm, ipq_cfg.nor_cs_gpio_alt, ipq_cs_line,
+                             (void *)(uintptr_t)(NAND_CS_NOR |
+                                             (ipq_cfg.nor_cs_gpio_alt << 8)));
+        }
     }
     if (ipq_cfg.nand) {
         ipq_tlmm_connect(ipq->tlmm, ipq_cfg.nand_cs_gpio, ipq_cs_line,
-                         (void *)(uintptr_t)NAND_CS_NAND);
+                         (void *)(uintptr_t)(NAND_CS_NAND |
+                                             (ipq_cfg.nand_cs_gpio << 8)));
     }
     /* The board's face.  Pins are claimed in order, so a mistake is refused
      * here instead of at the first press. */
@@ -10994,6 +11507,7 @@ static void ipq4019_machine_add_props(MachineClass *mc)
         { "nor",        offsetof(IPQBoardConfig, nor),        IPQ_CFG_NOR, IPQ_PROP_BOOL },
         { "nor-size",   offsetof(IPQBoardConfig, nor_size),   IPQ_CFG_NOR_SIZE, IPQ_PROP_SIZE },
         { "nor-id",     offsetof(IPQBoardConfig, nor_id),     IPQ_CFG_NOR_ID, IPQ_PROP_STR },
+        { "nor-uid",    offsetof(IPQBoardConfig, nor_uid),    IPQ_CFG_NOR_UID, IPQ_PROP_STR },
         { "nor-file",   offsetof(IPQBoardConfig, nor_file),   IPQ_CFG_NOR_FILE, IPQ_PROP_STR },
         { "nor-drive",  offsetof(IPQBoardConfig, nor_drive),  IPQ_CFG_NOR_DRIVE, IPQ_PROP_STR },
         { "nand",       offsetof(IPQBoardConfig, nand),       IPQ_CFG_NAND, IPQ_PROP_BOOL },
@@ -11028,6 +11542,7 @@ static void ipq4019_machine_add_props(MachineClass *mc)
         "attach the SPI NOR die on chip select 0 (on/off)",
         "NOR die size in bytes (power of two, 1M..64M)",
         "NOR RDID as hex, e.g. ef4019",
+        "NOR Unique-ID as hex, 8 bytes, e.g. 0141ac3357ac0001",
         "file that is the NOR part (survives a power cut)",
         "block backend id that is the NOR part, e.g. from -drive if=none",
         "attach the SPI NAND die on chip select 1 (on/off)",
