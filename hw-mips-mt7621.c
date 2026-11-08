@@ -267,6 +267,8 @@ struct MT7621State {
     /* NAND flash contents and the current PIO transfer */
     uint8_t *nand;
     uint64_t nand_size;
+    uint32_t nand_stride;       /* bytes per page in the dump (2048/2112) */
+    uint32_t nand_pages;        /* pages in the dump */
     uint8_t nfi_fifo[MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE];
     uint32_t nfi_fifo_len;
     uint32_t nfi_fifo_pos;
@@ -1204,14 +1206,14 @@ static void mt7621_nfi_page_read(MT7621State *s)
     mt7621_nfi_addr_col(s);
     mt7621_nfi_addr_row(s);
 
-    off = (uint64_t)s->nfi_row * MT7621_NAND_PAGE_SIZE;
+    off = (uint64_t)s->nfi_row * s->nand_stride;
     if (s->nand && off < s->nand_size) {
         uint64_t n = s->nand_size - off;
 
-        if (n > MT7621_NAND_PAGE_SIZE) {
-            n = MT7621_NAND_PAGE_SIZE;
+        if (n > s->nand_stride) {
+            n = s->nand_stride;
         }
-        memcpy(buf, s->nand + off, n);
+        memcpy(buf, s->nand + off, n);     /* data + spare when present */
     }
 
     s->nfi_served = 0;
@@ -1399,11 +1401,11 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
         break;
     case 0x10:                          /* program confirm */
         if (s->nfi_writing && s->nand) {
-            uint64_t off = mt7621_nfi_addr_row(s) * MT7621_NAND_PAGE_SIZE;
+            uint64_t off = mt7621_nfi_addr_row(s) * s->nand_stride;
             uint32_t n = s->nfi_wbuf_len;
 
-            if (n > MT7621_NAND_PAGE_SIZE) {
-                n = MT7621_NAND_PAGE_SIZE;
+            if (n > s->nand_stride) {
+                n = s->nand_stride;
             }
             if (off + n <= s->nand_size) {
                 memcpy(s->nand + off, s->nfi_wbuf, n);
@@ -1420,8 +1422,9 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
         if (s->nand) {
             uint64_t row = mt7621_nfi_addr_row(s);
             uint64_t blk_start = (row / MT7621_NAND_PAGES_BLK) *
-                                 MT7621_NAND_PAGES_BLK * MT7621_NAND_PAGE_SIZE;
-            uint64_t blk_size = (uint64_t)MT7621_NAND_PAGES_BLK * MT7621_NAND_PAGE_SIZE;
+                                 MT7621_NAND_PAGES_BLK * s->nand_stride;
+            uint64_t blk_size = (uint64_t)MT7621_NAND_PAGES_BLK *
+                                s->nand_stride;
 
             if (blk_start + blk_size <= s->nand_size) {
                 memset(s->nand + blk_start, 0xff, blk_size);
@@ -1683,6 +1686,33 @@ static void mt7621_nand_load(MT7621State *s, const char *filename)
         }
     }
     close(fd);
+
+    /*
+     * Two dump layouts are common:
+     *   main area only : pages of 2048 bytes  (e.g. 128 MiB for 128 MiB
+     *                    of flash, 65536 pages)
+     *   full die dump  : pages of 2048 + 64 spare (132 MiB for the same
+     *                    flash); "mtdall" style dumps look like this
+     * Pick the one that gives a power-of-two page count, which real NAND
+     * always has.
+     */
+    if (s->nand_size) {
+        uint64_t pages = s->nand_size / (MT7621_NAND_PAGE_SIZE +
+                                         MT7621_NAND_OOB_SIZE);
+
+        if (s->nand_size % (MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE)
+            == 0 && pages && !(pages & (pages - 1))) {
+            s->nand_stride = MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE;
+        } else {
+            s->nand_stride = MT7621_NAND_PAGE_SIZE;
+        }
+        s->nand_pages = s->nand_size / s->nand_stride;
+        if (s->nand_stride != MT7621_NAND_PAGE_SIZE) {
+            printf("mt7621: NAND dump includes the spare area "
+                   "(%u-byte pages, %u pages)\n",
+                   s->nand_stride, s->nand_pages);
+        }
+    }
 }
 
 /*
@@ -2012,6 +2042,40 @@ static void mt7621_nand_attach(MT7621State *s)
     s->nand_blk = blk;
 }
 
+/*
+ * Read bytes of the flash's *logical* address space (the concatenation of
+ * the main areas).  Dumps that include the spare area store 2112 bytes per
+ * page, so a linear read would pick up 64 bytes of OOB every 2048 bytes and
+ * corrupt anything larger than one page -- which is what a uImage payload
+ * is.
+ */
+static ssize_t mt7621_flash_pread(MT7621State *s, int fd, uint64_t off,
+                                  void *buf, size_t len)
+{
+    uint8_t *dst = buf;
+    size_t done = 0;
+
+    while (done < len) {
+        uint64_t foff = off + done;
+        size_t take = len - done;
+
+        if (s->nand_stride != MT7621_NAND_PAGE_SIZE) {
+            uint64_t page = foff / MT7621_NAND_PAGE_SIZE;
+            uint64_t inpage = foff % MT7621_NAND_PAGE_SIZE;
+
+            if (take > MT7621_NAND_PAGE_SIZE - inpage) {
+                take = MT7621_NAND_PAGE_SIZE - inpage;
+            }
+            foff = page * s->nand_stride + inpage;
+        }
+        if (pread(fd, dst + done, take, foff) != (ssize_t)take) {
+            return -1;
+        }
+        done += take;
+    }
+    return len;
+}
+
 static void mt7621_load_image(MT7621State *s, const char *filename)
 {
     uint8_t hdr[64];
@@ -2028,6 +2092,9 @@ static void mt7621_load_image(MT7621State *s, const char *filename)
 
     total = lseek(fd, 0, SEEK_END);
     lseek(fd, 0, SEEK_SET);
+    if (s->nand_stride != MT7621_NAND_PAGE_SIZE) {
+        total = (total / s->nand_stride) * MT7621_NAND_PAGE_SIZE;
+    }
 
     if (pread(fd, hdr, sizeof(hdr), 0) != sizeof(hdr)) {
         error_report("mt7621: %s: short read", filename);
@@ -2100,7 +2167,7 @@ static void mt7621_load_image(MT7621State *s, const char *filename)
     buf = g_malloc(MIN(size, 1 * MiB));
     while (size) {
         size_t chunk = MIN(size, 1 * MiB);
-        ssize_t n = pread(fd, buf, chunk, off);
+        ssize_t n = mt7621_flash_pread(s, fd, off, buf, chunk);
 
         if (n != chunk) {
             error_report("mt7621: %s: short read at 0x%" PRIx64,
