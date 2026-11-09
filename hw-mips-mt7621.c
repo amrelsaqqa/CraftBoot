@@ -35,6 +35,8 @@
 #include "system/memory.h"
 #include "system/system.h"
 #include "qemu/log.h"
+#include "exec/icache-shadow.h"
+#include "hw/timer/mips_gictimer.h"
 #include "qemu/timer.h"
 #include "system/reset.h"
 #include "system/runstate.h"
@@ -1578,6 +1580,10 @@ static void mt7621_wdt_arm(MT7621State *s)
         ns = strtoull(getenv("MT7621_WDT_TEST_MS"), NULL, 0) * 1000000LL;
     }
     timer_mod(s->wdt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
+    if (getenv("MT7621_WDTLOG")) {
+        fprintf(stderr, "wdt: arm ctl=%08x load=%08x prescale=%u ns=%lld\n",
+                ctl, load, prescale, (long long)ns);
+    }
 }
 
 static void mt7621_wdt_expire(void *opaque)
@@ -1614,6 +1620,11 @@ static void mt7621_wdt_write(void *opaque, hwaddr addr, uint64_t val,
     if (mt7621_trace) {
         qemu_log_mask(LOG_UNIMP, "mt7621: wdt write %03x <- %08x\n",
                       (unsigned)off, (uint32_t)val);
+    }
+    if (getenv("MT7621_WDTLOG")) {
+        fprintf(stderr, "wdt: write %03x <- %08x (pc=%08x)\n",
+                (unsigned)off, (uint32_t)val,
+                s->cpu ? (uint32_t)s->cpu->env.active_tc.PC : 0);
     }
     s->sysctl_regs[(MT7621_WDT_OFF + off) / 4] = val;
 
@@ -3069,7 +3080,14 @@ static void mt7621_sysctl_defaults(MT7621State *s)
      * Bits above it: DRAM type and xtal mode.
      */
     s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000180 | s->chip_mode;
-    s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x40000000; /* CPU_CLK_SEL = 1 */
+    /*
+     * CPLL clock config.  RouterBOOT programs 0x40800000 on the RB750Gr3,
+     * which is how Linux ends up reporting the 875 MHz CPU clock (and the
+     * 1.75 GHz GIC counter derived from it); the cold-reset value 0x40000000
+     * makes it report 25 MHz instead, which then disagrees with the emulated
+     * timers by a factor of 70.
+     */
+    s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x40800000; /* 880 MHz PLL */
     s->sysctl_regs[SYS_CUR_CLK_STS / 4]  = 0x00000101; /* /1 * 1 */
     /*
      * 0x3fc is polled for bit 10 before Breed's DDR3 init: it reports the
@@ -3584,6 +3602,37 @@ static void mt7621_machine_init(MachineState *machine)
                                   s->cfg1_cache_fields;
     }
     qemu_register_reset(mt7621_reset, s);
+
+    /*
+     * The GIC shared counter runs off the CPU clock on this SoC.  RouterBOOT
+     * reports the real rate (875 MHz on the RB750Gr3) and OpenWrt programs its
+     * clock events against it, so the model has to tick at the same rate or
+     * every guest timeout is off by the ratio.
+     */
+    if (getenv("MT7621_GIC_FREQ")) {
+        mips_gictimer_set_freq(strtoul(getenv("MT7621_GIC_FREQ"), NULL, 0));
+    } else {
+        /*
+         * The real SoC's GIC shared counter is fed from the CPU clock: the
+         * RB750Gr3 reports a 875 MHz CPU and OpenWrt programs its clockevents
+         * for a 1.75 GHz counter, so model that rate for the whole machine
+         * instead of the 25 MHz reference the old hardcoded constant used.
+         */
+        mips_gictimer_set_freq(1750 * 1000 * 1000);
+    }
+
+    /*
+     * MIPS kseg0/kseg1 is executed with the I-cache enabled and the kernel
+     * never invalidates it around the compressed-loader hand-over (see the
+     * "FIXME: should we flush cache here?" in arch/mips/boot/compressed/
+     * decompress.c).  Give instruction fetch the same view: snapshots of the
+     * code pages, dropped by `cache`/`synci`.
+     */
+    if (!getenv("MT7621_NO_ICACHE")) {
+        /* kseg0/kseg1 only: userland and RouterOS' TLB-mapped kseg2 stay
+         * with plain TCG behaviour. */
+        icache_shadow_enable(0x80000000ULL, 0xa0000000ULL);
+    }
 
     s->poweroff_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                      mt7621_poweroff_poll, s);
