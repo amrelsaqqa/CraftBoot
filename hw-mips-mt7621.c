@@ -1380,6 +1380,9 @@ static void mt7621_wdt_expire(void *opaque)
 
     warn_report("mt7621: watchdog expired, resetting the machine");
     s->wdt_rst_cause = true;
+    if (getenv("MT7621_NO_RESET")) {
+        return;
+    }
     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
 }
 
@@ -2191,6 +2194,11 @@ static void mt7621_rstctl_write(void *opaque, hwaddr addr, uint64_t val,
                     fprintf(stderr, "  stack[%2d] %08x\n", i, v);
                 }
             }
+        }
+        if (getenv("MT7621_NO_RESET")) {
+            /* keep the machine frozen so the ring buffer can be read */
+            fprintf(stderr, "mt7621: guest requested a reset, holding\n");
+            return;
         }
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
