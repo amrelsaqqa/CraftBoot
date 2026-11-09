@@ -130,6 +130,29 @@ typedef enum MT7621Board {
 #define ETH_IAC_ADDR_SHIFT      20
 #define ETH_IAC_REG_SHIFT       25
 
+/*
+ * PDMA ring block at 0x1e100800 (MediaTek SDK layout, also what RouterBOOT
+ * programs):
+ *   0x0800 TX base ptr   0x0804 TX max cnt   0x0808 TX ctx idx  0x080c TX dtx idx
+ *   0x0900 RX base ptr   0x0904 RX max cnt   0x0908 RX crx idx  0x090c RX drx idx
+ *   0x0a04 PDMA global config (TX_EN bit0, RX_EN bit2)
+ * Linux only uses the receive half here and transmits through QDMA (0x1a00),
+ * but the bootloader queues its DHCP frames on this TX ring.
+ */
+#define ETH_PTX_BASE_PTR0       0x0800
+#define ETH_PTX_MAX_CNT0        0x0804
+#define ETH_PTX_CTX_IDX0        0x0808
+#define ETH_PTX_DTX_IDX0        0x080c
+#define ETH_PDMA_GLO_CFG        0x0a04
+
+/* PDMA TX descriptor (16 bytes): {SDP0, len/LS0/DDONE, SDP1, fport/...} */
+#define PTX_DDONE               (1u << 31)
+#define PTX_LS0                 (1u << 30)
+#define PTX_SDL0(w)             (((w) >> 16) & 0x3fff)
+#define PTX_LS1                 (1u << 14)
+#define PTX_SDL1(w)             ((w) & 0x3fff)
+#define PTX_FPORT(w)            (((w) >> 25) & 0x7)
+
 /* DMA engines (MT7621: PDMA receive rings, QDMA transmit) */
 #define ETH_PRX_BASE_PTR0       0x0900
 #define ETH_PRX_MAX_CNT0        0x0904
@@ -254,6 +277,7 @@ struct MT7621State {
     MemReentrancyGuard nic_guard;
     qemu_irq eth_irq;
     uint32_t rx_drx_idx;
+    uint32_t ptx_idx;           /* PDMA transmit ring consumer index */
     int64_t phy_link_ns;        /* when the tapped PHY reports link up */
     uint16_t phy_regs[32][32];  /* MDIO register file per address */
 
@@ -468,6 +492,7 @@ static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
  */
 static void mt7621_eth_update_irq(MT7621State *s);
 static void mt7621_eth_tx(MT7621State *s, uint32_t ctx);
+static void mt7621_eth_pdma_tx(MT7621State *s);
 
 /*
  * MT7530 behind the MDIO bus: Linux talks to it through PHY address 0x1f
@@ -572,6 +597,15 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
         s->eth_regs[off >> 2] = val;
         return;
     }
+    if (off == ETH_PTX_BASE_PTR0 || off == ETH_PTX_MAX_CNT0 ||
+        off == ETH_PTX_CTX_IDX0 || off == ETH_PDMA_GLO_CFG) {
+        s->eth_regs[off >> 2] = val;
+        if (off == ETH_PTX_BASE_PTR0) {
+            s->ptx_idx = 0;
+        }
+        mt7621_eth_pdma_tx(s);
+        return;
+    }
     if (off == ETH_QTX_DTX_PTR) {
         /*
          * The driver points this at the start of a freshly allocated ring
@@ -607,9 +641,32 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
         return;
     }
     if (off == ETH_PRX_BASE_PTR0) {
-        /* new RX ring: the DMA restarts at descriptor 0 */
+        /*
+         * Only the base pointer changes here.  RouterBOOT rewrites it for
+         * every descriptor it hands back, so resetting the DMA index would
+         * make the engine restart at descriptor 0 each time and drop frames
+         * into descriptors the bootloader still owns.
+         */
         s->eth_regs[off >> 2] = val;
-        s->rx_drx_idx = 0;
+        return;
+    }
+    if (off == ETH_PDMA_GLO_CFG) {
+        uint32_t old = s->eth_regs[off >> 2];
+
+        s->eth_regs[off >> 2] = val;
+        /* RX DMA (re)start: the engine begins at descriptor 0 again */
+        if ((val & 0x4) && !(old & 0x4)) {
+            s->rx_drx_idx = 0;
+            s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = 0;
+        }
+        return;
+    }
+    if (off == 0x0a08) {                /* PDMA_RST_IDX */
+        s->eth_regs[off >> 2] = val;
+        if (val & (1u << 16)) {         /* RST_DRX_IDX0 */
+            s->rx_drx_idx = 0;
+            s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = 0;
+        }
         return;
     }
     if (off == ETH_PRX_MAX_CNT0) {
@@ -677,6 +734,105 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
     s->eth_regs[off >> 2] = val;
 }
 
+/*
+ * PDMA transmit ring (0x1e100800).  RouterBOOT drives this one, Linux uses
+ * QDMA instead, so both paths have to work.  Descriptors are handed to the
+ * engine with DDONE clear and a length in SDL0; the engine clears it and
+ * sets DDONE when the frame is gone.
+ */
+static void mt7621_eth_pdma_tx(MT7621State *s)
+{
+    uint32_t base = s->eth_regs[ETH_PTX_BASE_PTR0 / 4];
+    uint32_t cnt = s->eth_regs[ETH_PTX_MAX_CNT0 / 4];
+    uint32_t ctx = s->eth_regs[ETH_PTX_CTX_IDX0 / 4];
+    uint32_t idx = s->ptx_idx;
+    uint8_t frame[2048];
+    size_t flen = 0;
+    unsigned fport = 0;
+    int guard = 0;
+
+    if (!base || !cnt || cnt > 0x1000) {
+        s->ptx_idx = ctx;
+        return;
+    }
+    if (idx >= cnt) {
+        idx = 0;
+    }
+    if (ctx >= cnt) {
+        ctx = 0;
+    }
+
+    while (idx != ctx && guard++ <= (int)cnt) {
+        uint32_t p = base + idx * 16;
+        uint32_t addr0 = address_space_ldl_le(&address_space_memory, p,
+                                              MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t info2 = address_space_ldl_le(&address_space_memory, p + 4,
+                                              MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t addr1 = address_space_ldl_le(&address_space_memory, p + 8,
+                                              MEMTXATTRS_UNSPECIFIED, NULL);
+        uint32_t info4 = address_space_ldl_le(&address_space_memory, p + 12,
+                                              MEMTXATTRS_UNSPECIFIED, NULL);
+        unsigned len0 = PTX_SDL0(info2);
+        unsigned len1 = (info2 & PTX_LS1) ? PTX_SDL1(info2) : 0;
+        bool last = !!(info2 & PTX_LS0);
+
+        if (info2 & PTX_DDONE) {
+            /* descriptor not handed to the DMA: nothing else to do */
+            break;
+        }
+        if (flen == 0) {
+            fport = PTX_FPORT(info4);
+        }
+        if (addr0 && len0 && flen + len0 <= sizeof(frame)) {
+            address_space_read(&address_space_memory, addr0,
+                               MEMTXATTRS_UNSPECIFIED, frame + flen, len0);
+            flen += len0;
+        }
+        if (addr1 && len1 && flen + len1 <= sizeof(frame)) {
+            address_space_read(&address_space_memory, addr1,
+                               MEMTXATTRS_UNSPECIFIED, frame + flen, len1);
+            flen += len1;
+        }
+
+        if (last && flen >= 14) {
+            bool forward = true;
+
+            /*
+             * Same special-tag rule as the QDMA path: the switch tag lives
+             * at offset 12, tag type in byte 12 and the port bitmap in 13.
+             */
+            if (flen > 18 && (frame[12] & 0xfe) <= 2 && !(frame[13] & 0xc0)) {
+                forward = !!(frame[13] & (1u << s->eth_port));
+                if (forward) {
+                    memmove(frame + 12, frame + 16, flen - 16);
+                    flen -= 4;
+                }
+            }
+            if (getenv("MT7621_ETHLOG")) {
+                fprintf(stderr, "eth: ptx idx=%u fport=%u tag=%02x%02x "
+                        "len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x fwd=%d\n",
+                        idx, fport, frame[12], frame[13], flen, frame[0],
+                        frame[1], frame[2], frame[3], frame[4], frame[5],
+                        forward);
+            }
+            if (forward && s->nic) {
+                qemu_send_packet(qemu_get_queue(s->nic), frame, flen);
+            }
+            flen = 0;
+        }
+
+        address_space_stl_le(&address_space_memory, p + 4,
+                             info2 | PTX_DDONE, MEMTXATTRS_UNSPECIFIED, NULL);
+        idx = (idx + 1) % cnt;
+    }
+
+    s->ptx_idx = idx;
+    s->eth_regs[ETH_PTX_DTX_IDX0 / 4] = idx;
+    if (getenv("MT7621_ETHLOG")) {
+        fprintf(stderr, "eth: ptx done idx=%u ctx=%u\n", idx, ctx);
+    }
+}
+
 static void mt7621_eth_update_irq(MT7621State *s)
 {
     uint32_t pdma = s->eth_regs[ETH_PDMA_INT_STATUS / 4] &
@@ -692,10 +848,11 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
 {
     uint32_t base = s->eth_regs[ETH_PRX_BASE_PTR0 / 4];
     uint32_t cnt = s->eth_regs[ETH_PRX_MAX_CNT0 / 4];
-    uint32_t idx = s->rx_drx_idx;
+    uint32_t idx = s->eth_regs[ETH_PRX_DRX_IDX0 / 4];
     uint32_t desc, rxd1, rxd2, cap, crx;
     uint8_t tagged[1600];
     size_t flen;
+    unsigned rx_off;
     bool took_bql = !bql_locked();
     static int dbg;
 
@@ -711,15 +868,25 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     }
 
     /*
-     * Sanity guard against a desynchronised ring: never reuse the
-     * descriptor the driver has just handed back.
+     * The engine writes the descriptor DRX_IDX points at and then advances
+     * it.  A descriptor the software has not consumed yet still carries the
+     * DDONE flag, which is the only reliable "ring full" test: RouterBOOT
+     * keeps CRX_IDX at the index it just freed, so comparing the two
+     * indices (as the Linux driver's convention suggests) drops every frame
+     * after the first one.
      */
     crx = s->eth_regs[ETH_PRX_CRX_IDX0 / 4];
-    if (idx == crx) {
-        if (getenv("MT7621_ETHLOG")) {
-            fprintf(stderr, "eth: rx drop ring-full idx=%u crx=%u\n", idx, crx);
+    {
+        uint32_t busy = address_space_ldl_le(&address_space_memory,
+                                             base + idx * 16 + 4,
+                                             MEMTXATTRS_UNSPECIFIED, NULL);
+        if (busy & RX_DMA_DONE) {
+            if (getenv("MT7621_ETHLOG")) {
+                fprintf(stderr, "eth: rx drop ring-full idx=%u crx=%u\n",
+                        idx, crx);
+            }
+            return;
         }
-        return;
     }
 
     if (took_bql) {
@@ -745,21 +912,32 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     }
 
     /*
-     * Insert the MTK DSA tag after the source MAC, exactly like the switch
-     * does for a frame arriving on a user port.  mtk_tag_rcv() takes the
-     * port number from the second byte and hands the frame to that slave.
+     * Linux drives the port as a DSA master: the switch inserts its special
+     * tag after the source MAC and the engine starts the frame two bytes
+     * into the buffer (RX_2B_OFFSET).  RouterBOOT configures the switch
+     * without the tag and with RX_2B_OFFSET clear, so honour that bit
+     * instead of always building a tagged frame.
      */
-    if (len + 4 > sizeof(tagged)) {
-        len = sizeof(tagged) - 4;
+    if (s->eth_regs[ETH_PDMA_GLO_CFG / 4] & (1u << 31)) {
+        if (len + 4 > sizeof(tagged)) {
+            len = sizeof(tagged) - 4;
+        }
+        memcpy(tagged, buf, 12);
+        tagged[12] = 0x00;                /* untagged special tag */
+        tagged[13] = s->eth_port & 0x3f;  /* source port */
+        tagged[14] = 0x00;
+        tagged[15] = 0x00;
+        memcpy(tagged + 16, buf + 12, len - 12);
+        flen = len + 4;
+        rx_off = 2;
+    } else {
+        flen = len;
+        if (flen > sizeof(tagged)) {
+            flen = sizeof(tagged);
+        }
+        memcpy(tagged, buf, flen);
+        rx_off = 0;
     }
-    memcpy(tagged, buf, 12);
-    tagged[12] = 0x00;                    /* untagged special tag */
-    tagged[13] = s->eth_port & 0x3f;      /* source port */
-
-    tagged[14] = 0x00;
-    tagged[15] = 0x00;
-    memcpy(tagged + 16, buf + 12, len - 12);
-    flen = len + 4;
 
     if (flen > cap) {
         flen = cap;                        /* stay inside the driver buffer */
@@ -769,7 +947,7 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
      * bytes into the descriptor buffer; the driver's skb_reserve() accounts
      * for that offset.
      */
-    address_space_write(&address_space_memory, rxd1 + 2,
+    address_space_write(&address_space_memory, rxd1 + rx_off,
                         MEMTXATTRS_UNSPECIFIED, tagged, flen);
 
     /* rxd2's DONE bit is the release flag, so write it last. */
@@ -783,7 +961,7 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
                          MEMTXATTRS_UNSPECIFIED, NULL);
 
     s->rx_drx_idx = (idx + 1) % cnt;
-    s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = idx;
+    s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = s->rx_drx_idx;
     s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_RX_DONE;
 
     dbg++;
@@ -1175,6 +1353,13 @@ static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
                     mt7621_eth_tx_csum(frame, flen);
                 }
 
+                if (!forward && getenv("MT7621_ETHLOG") && flen > 18) {
+                    fprintf(stderr, "eth: tx drop fport=%u tag=%02x%02x "
+                            "len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                            frame_fport, frame[12], frame[13], flen,
+                            frame[0], frame[1], frame[2], frame[3],
+                            frame[4], frame[5]);
+                }
                 if (forward && getenv("MT7621_ETHLOG") && sent < 8) {
                     fprintf(stderr, "eth: txf dst=%02x:%02x:%02x:%02x:%02x:%02x "
                             "src=%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x "
