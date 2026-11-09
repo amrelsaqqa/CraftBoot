@@ -3609,30 +3609,42 @@ static void mt7621_machine_init(MachineState *machine)
      * clock events against it, so the model has to tick at the same rate or
      * every guest timeout is off by the ratio.
      */
+    /*
+     * The compressed-kernel loader sits at its load address and is then
+     * overwritten by its own decompression output; on real MIPS it survives
+     * only because its instructions are still in the I-cache (the kernel even
+     * says "FIXME: should we flush cache here?").  Shadow the megabyte the
+     * RB750Gr3 netboot images load into (0x80b81000 / 0x80b91000) so that
+     * instruction fetch keeps seeing the loader, and leave every other address
+     * - including the whole NAND/RouterOS boot - on plain TCG semantics.
+     */
+    if (!getenv("MT7621_NO_ICACHE") && s->board == MT7621_BOARD_RB750GR3) {
+        uint64_t lo = 0x80b00000ULL, hi = 0x80c00000ULL;
+        const char *rng = getenv("MT7621_ICACHE_RANGE");
+
+        if (rng) {
+            unsigned long long rlo = 0, rsize = 0;
+
+            if (sscanf(rng, "%lli+%lli", &rlo, &rsize) == 2 && rsize) {
+                lo = rlo;
+                hi = rlo + rsize;
+            }
+        }
+        icache_shadow_enable(lo, hi);
+    }
+
     if (getenv("MT7621_GIC_FREQ")) {
         mips_gictimer_set_freq(strtoul(getenv("MT7621_GIC_FREQ"), NULL, 0));
     } else {
         /*
-         * The real SoC's GIC shared counter is fed from the CPU clock: the
-         * RB750Gr3 reports a 875 MHz CPU and OpenWrt programs its clockevents
-         * for a 1.75 GHz counter, so model that rate for the whole machine
-         * instead of the 25 MHz reference the old hardcoded constant used.
+         * Run the GIC shared counter at the real device's CPU clock (875 MHz,
+         * the rate RouterBOOT reports and OpenWrt programs its clockevents
+         * against) for the whole machine, instead of the 25 MHz reference the
+         * old hardcoded constant used.
          */
-        mips_gictimer_set_freq(1750 * 1000 * 1000);
+        mips_gictimer_set_freq(875 * 1000 * 1000);
     }
 
-    /*
-     * MIPS kseg0/kseg1 is executed with the I-cache enabled and the kernel
-     * never invalidates it around the compressed-loader hand-over (see the
-     * "FIXME: should we flush cache here?" in arch/mips/boot/compressed/
-     * decompress.c).  Give instruction fetch the same view: snapshots of the
-     * code pages, dropped by `cache`/`synci`.
-     */
-    if (!getenv("MT7621_NO_ICACHE")) {
-        /* kseg0/kseg1 only: userland and RouterOS' TLB-mapped kseg2 stay
-         * with plain TCG behaviour. */
-        icache_shadow_enable(0x80000000ULL, 0xa0000000ULL);
-    }
 
     s->poweroff_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                      mt7621_poweroff_poll, s);
