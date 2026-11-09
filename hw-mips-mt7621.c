@@ -365,6 +365,7 @@ struct MT7621State {
     bool elf_kernel;            /* -kernel is an ELF to load, not a dump */
     uint32_t elf_argc;
     uint32_t elf_argv;
+    bool entry_logged;
 
     /*
      * SPI controller at 0x1e000b00.  The MT7621 maps the NOR chip into a
@@ -3114,6 +3115,49 @@ static void mt7621_poweroff_poll(void *opaque)
     CPUMIPSState *env = &s->cpu->env;
     bool parked = cs->halted && !(env->CP0_Status & (1 << CP0St_IE));
 
+    /*
+     * Bring-up: report the CP0/TLB state the guest starts the kernel with.
+     * The netboot path hands over from a bootloader that has been running for
+     * seconds, so the state it leaves behind matters.
+     */
+    if (getenv("MT7621_ENTRYLOG") && !s->entry_logged && s->cpu) {
+        uint32_t pc = env->active_tc.PC;
+
+        if (pc >= 0x80b80000 && pc < 0x81100000) {
+            int i;
+
+            s->entry_logged = true;
+            if (getenv("MT7621_ENTRY_FIX")) {
+                int t;
+
+                env->CP0_Status &= ~(1 << CP0St_ERL);
+                env->CP0_Config0 = (env->CP0_Config0 & ~7u) | 2;
+                for (t = 0; t < MIPS_TLB_MAX; t++) {
+                    env->tlb->mmu.r4k.tlb[t].VPN = 0;
+                    env->tlb->mmu.r4k.tlb[t].PageMask = 0;
+                    env->tlb->mmu.r4k.tlb[t].PFN[0] = 0;
+                    env->tlb->mmu.r4k.tlb[t].PFN[1] = 0;
+                }
+                fprintf(stderr, "entry: normalised status=%08x config0=%08x\n",
+                        env->CP0_Status, (uint32_t)env->CP0_Config0);
+            }
+            fprintf(stderr, "entry: pc=%08x status=%08x cause=%08x wired=%u "
+                    "entryhi=%08x index=%u config0=%08x config1=%08x\n",
+                    pc, env->CP0_Status, env->CP0_Cause, env->CP0_Wired,
+                    (uint32_t)env->CP0_EntryHi, (uint32_t)env->CP0_Index,
+                    (uint32_t)env->CP0_Config0, (uint32_t)env->CP0_Config1);
+            for (i = 0; i < 8; i++) {
+                fprintf(stderr, "  tlb[%d] vpn=%08x mask=%08x asid=%02x "
+                        "g=%d pfn0=%08x pfn1=%08x\n", i,
+                        env->tlb->mmu.r4k.tlb[i].VPN,
+                        env->tlb->mmu.r4k.tlb[i].PageMask,
+                        env->tlb->mmu.r4k.tlb[i].ASID,
+                        env->tlb->mmu.r4k.tlb[i].G,
+                        (uint32_t)env->tlb->mmu.r4k.tlb[i].PFN[0],
+                        (uint32_t)env->tlb->mmu.r4k.tlb[i].PFN[1]);
+            }
+        }
+    }
     if (!s->halt_seen_running) {
         if (!cs->halted) {
             s->halt_seen_running = true;
@@ -3127,7 +3171,8 @@ static void mt7621_poweroff_poll(void *opaque)
     }
 
     timer_mod(s->poweroff_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+              (getenv("MT7621_ENTRYLOG") ? 5 : 250));
 }
 
 /*
@@ -3496,7 +3541,8 @@ static void mt7621_machine_init(MachineState *machine)
     s->poweroff_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                      mt7621_poweroff_poll, s);
     timer_mod(s->poweroff_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+              (getenv("MT7621_ENTRYLOG") ? 5 : 250));
 
     if (getenv("MT7621_CMDLINE")) {
         s->cmdline_extra = g_strdup(getenv("MT7621_CMDLINE"));
