@@ -366,6 +366,10 @@ struct MT7621State {
     uint32_t elf_argc;
     uint32_t elf_argv;
     bool entry_logged;
+    bool rom_logged;
+#define PC_HIST 256
+    uint32_t pc_hist[PC_HIST];
+    unsigned pc_hist_idx;
 
     /*
      * SPI controller at 0x1e000b00.  The MT7621 maps the NOR chip into a
@@ -2879,6 +2883,11 @@ static void mt7621_load_image(MT7621State *s, const char *filename)
                                 seg, filesz);
             if (memsz > filesz) {
                 uint8_t *z = g_malloc0(memsz - filesz);
+
+                if (getenv("MT7621_ELF_DIRTYBSS")) {
+                    /* mimic a bootloader that does not zero memsz-filesz */
+                    memset(z, 0xa5, memsz - filesz);
+                }
                 address_space_write(&address_space_memory,
                                     (paddr & 0x1fffffff) + filesz,
                                     MEMTXATTRS_UNSPECIFIED, z,
@@ -3120,6 +3129,26 @@ static void mt7621_poweroff_poll(void *opaque)
      * The netboot path hands over from a bootloader that has been running for
      * seconds, so the state it leaves behind matters.
      */
+    if (getenv("MT7621_ENTRYLOG") && s->cpu) {
+        uint32_t hpc = env->active_tc.PC;
+
+        s->pc_hist[s->pc_hist_idx++ % PC_HIST] = hpc;
+        if (!s->rom_logged && hpc >= 0xbfc00000 && hpc < 0xbfc01000) {
+            int k;
+
+            s->rom_logged = true;
+            fprintf(stderr, "rom reached: pc=%08x status=%08x cause=%08x "
+                    "last pcs:", hpc, env->CP0_Status, env->CP0_Cause);
+            for (k = 0; k < PC_HIST; k++) {
+                uint32_t v = s->pc_hist[(s->pc_hist_idx + k) % PC_HIST];
+
+                if (v) {
+                    fprintf(stderr, " %08x", v);
+                }
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     if (getenv("MT7621_ENTRYLOG") && !s->entry_logged && s->cpu) {
         uint32_t pc = env->active_tc.PC;
 
@@ -3172,7 +3201,7 @@ static void mt7621_poweroff_poll(void *opaque)
 
     timer_mod(s->poweroff_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              (getenv("MT7621_ENTRYLOG") ? 5 : 250));
+              (getenv("MT7621_ENTRYLOG") ? 1 : 250));
 }
 
 /*
@@ -3403,6 +3432,20 @@ static void mt7621_reset(void *opaque)
     /* Malta does the same when a -kernel image is supplied. */
     env->CP0_Status &= ~(1 << 2); /* CP0St_ERL */
     env->active_tc.PC = s->entry;
+    if (getenv("MT7621_ENTRY_DIRTY") && s->elf_kernel) {
+        /* reproduce the CP0/TLB state RouterBOOT leaves at the hand-over */
+        int t;
+
+        env->CP0_Status |= (1 << CP0St_ERL) | (1 << 10);
+        env->CP0_Config0 = 0x80000485;
+        env->CP0_EntryHi = 0x800fc000;
+        for (t = 0; t < 8; t++) {
+            env->tlb->mmu.r4k.tlb[t].VPN = 0x800fc000 - t * 0x4000;
+            env->tlb->mmu.r4k.tlb[t].PageMask = 0;
+            env->tlb->mmu.r4k.tlb[t].PFN[0] = 0;
+            env->tlb->mmu.r4k.tlb[t].PFN[1] = 0;
+        }
+    }
     if (s->elf_kernel) {
         env->active_tc.gpr[4] = s->elf_argc;
         env->active_tc.gpr[5] = s->elf_argv;
@@ -3542,7 +3585,7 @@ static void mt7621_machine_init(MachineState *machine)
                                      mt7621_poweroff_poll, s);
     timer_mod(s->poweroff_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              (getenv("MT7621_ENTRYLOG") ? 5 : 250));
+              (getenv("MT7621_ENTRYLOG") ? 1 : 250));
 
     if (getenv("MT7621_CMDLINE")) {
         s->cmdline_extra = g_strdup(getenv("MT7621_CMDLINE"));
