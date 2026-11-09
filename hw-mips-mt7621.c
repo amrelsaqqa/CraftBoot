@@ -362,6 +362,7 @@ struct MT7621State {
     uint64_t flash_size;
     MemoryRegion flash_mr;
     bool spi_nor;
+    bool elf_kernel;            /* -kernel is an ELF to load, not a dump */
 
     /*
      * SPI controller at 0x1e000b00.  The MT7621 maps the NOR chip into a
@@ -2349,7 +2350,7 @@ static void mt7621_nand_load(MT7621State *s, const char *filename)
             s->nand_stride = MT7621_NAND_PAGE_SIZE;
         }
         s->nand_pages = s->nand_size / s->nand_stride;
-        if (s->nand_stride != MT7621_NAND_PAGE_SIZE) {
+        if (s->nand_stride && s->nand_stride != MT7621_NAND_PAGE_SIZE) {
             printf("mt7621: NAND dump includes the spare area "
                    "(%u-byte pages, %u pages)\n",
                    s->nand_stride, s->nand_pages);
@@ -2727,7 +2728,7 @@ static ssize_t mt7621_flash_pread(MT7621State *s, int fd, uint64_t off,
         uint64_t foff = off + done;
         size_t take = len - done;
 
-        if (s->nand_stride != MT7621_NAND_PAGE_SIZE) {
+        if (s->nand_stride && s->nand_stride != MT7621_NAND_PAGE_SIZE) {
             uint64_t page = foff / MT7621_NAND_PAGE_SIZE;
             uint64_t inpage = foff % MT7621_NAND_PAGE_SIZE;
 
@@ -2811,13 +2812,83 @@ static void mt7621_load_image(MT7621State *s, const char *filename)
 
     total = lseek(fd, 0, SEEK_END);
     lseek(fd, 0, SEEK_SET);
-    if (s->nand_stride != MT7621_NAND_PAGE_SIZE) {
+    if (s->nand_stride && s->nand_stride != MT7621_NAND_PAGE_SIZE) {
         total = (total / s->nand_stride) * MT7621_NAND_PAGE_SIZE;
     }
 
     if (pread(fd, hdr, sizeof(hdr), 0) != sizeof(hdr)) {
         error_report("mt7621: %s: short read", filename);
         exit(1);
+    }
+
+    if (ldl_be_p(hdr) == 0x7f454c46) {
+        /*
+         * ELF image: exactly what RouterBOOT hands over on a netboot.  Load
+         * each PT_LOAD segment at its physical address and start at e_entry,
+         * which is how the bootloader transfers control.
+         */
+        uint8_t eh[52];
+        uint32_t phoff, phentsize, phnum, elf_entry;
+        uint32_t i;
+
+        s->elf_kernel = true;
+
+        if (pread(fd, eh, sizeof(eh), 16) != sizeof(eh)) {
+            error_report("mt7621: %s: short ELF header", filename);
+            exit(1);
+        }
+        elf_entry = ldl_le_p(eh + 8);
+        phoff     = ldl_le_p(eh + 12);
+        phentsize = lduw_le_p(eh + 26);
+        phnum     = lduw_le_p(eh + 28);
+
+        if (!s->entry) {
+            s->entry = elf_entry;
+        }
+        for (i = 0; i < phnum; i++) {
+            uint8_t ph[32];
+            uint32_t type, p_off, paddr, filesz, memsz;
+            uint8_t *seg;
+
+            if (pread(fd, ph, sizeof(ph), phoff + i * phentsize) != sizeof(ph)) {
+                break;
+            }
+            type   = ldl_le_p(ph);
+            p_off  = ldl_le_p(ph + 4);
+            paddr  = ldl_le_p(ph + 12);
+            filesz = ldl_le_p(ph + 16);
+            memsz  = ldl_le_p(ph + 20);
+            if (type != 1) {            /* PT_LOAD */
+                continue;
+            }
+            if ((paddr & 0x1fffffff) + memsz > s->ram.size) {
+                error_report("mt7621: %s: segment 0x%x+0x%x does not fit",
+                             filename, paddr, memsz);
+                exit(1);
+            }
+            seg = g_malloc0(filesz ? filesz : 1);
+            if (filesz && pread(fd, seg, filesz, p_off) != filesz) {
+                error_report("mt7621: %s: short segment read", filename);
+                exit(1);
+            }
+            address_space_write(&address_space_memory,
+                                paddr & 0x1fffffff, MEMTXATTRS_UNSPECIFIED,
+                                seg, filesz);
+            if (memsz > filesz) {
+                uint8_t *z = g_malloc0(memsz - filesz);
+                address_space_write(&address_space_memory,
+                                    (paddr & 0x1fffffff) + filesz,
+                                    MEMTXATTRS_UNSPECIFIED, z,
+                                    memsz - filesz);
+                g_free(z);
+            }
+            g_free(seg);
+            printf("mt7621: ELF segment 0x%08x-0x%08x loaded at 0x%08x\n",
+                   p_off, p_off + filesz, paddr);
+        }
+        printf("mt7621: ELF entry 0x%08x\n", s->entry);
+        close(fd);
+        return;
     }
 
     if (s->uimage || ldl_be_p(hdr) == 0x27051956) {
@@ -3254,7 +3325,7 @@ static void mt7621_reset(void *opaque)
      * Linux scribbled over the RAM the bootloader lived in, so the BootROM
      * has to load it again before the CPU is released.
      */
-    if (s->image_file && !s->spi_nor) {
+    if (s->image_file && (!s->spi_nor || s->elf_kernel)) {
         mt7621_load_image(s, s->image_file);
     }
 
@@ -3590,8 +3661,24 @@ static void mt7621_machine_init(MachineState *machine)
 
     /* Boot image */
     if (machine->kernel_filename) {
+        uint8_t magic[4] = { 0 };
+        int mfd = open(machine->kernel_filename, O_RDONLY | O_BINARY);
+
         s->image_file = g_strdup(machine->kernel_filename);
-        if (s->board == MT7621_BOARD_RB750GR3) {
+        if (mfd >= 0) {
+            if (read(mfd, magic, 4) != 4) {
+                magic[0] = 0;
+            }
+            close(mfd);
+        }
+        /*
+         * A raw ELF here is a kernel (e.g. an OpenWrt initramfs image), not a
+         * flash dump: load it like a bootloader would and run it.  Handy for
+         * separating machine-model problems from bootloader ones.
+         */
+        if (ldl_be_p(magic) == 0x7f454c46) {
+            mt7621_load_image(s, machine->kernel_filename);
+        } else if (s->board == MT7621_BOARD_RB750GR3) {
             mt7621_nor_load(s, machine->kernel_filename);
         } else {
             mt7621_nand_load(s, machine->kernel_filename);
