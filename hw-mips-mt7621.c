@@ -363,6 +363,8 @@ struct MT7621State {
     MemoryRegion flash_mr;
     bool spi_nor;
     bool elf_kernel;            /* -kernel is an ELF to load, not a dump */
+    uint32_t elf_argc;
+    uint32_t elf_argv;
 
     /*
      * SPI controller at 0x1e000b00.  The MT7621 maps the NOR chip into a
@@ -2886,6 +2888,30 @@ static void mt7621_load_image(MT7621State *s, const char *filename)
             printf("mt7621: ELF segment 0x%08x-0x%08x loaded at 0x%08x\n",
                    p_off, p_off + filesz, paddr);
         }
+        /*
+         * Bring-up hook: reproduce the argc/argv hand-over RouterBOOT uses,
+         * so the netboot path can be compared against the direct one.
+         */
+        if (getenv("MT7621_ELF_ARGS")) {
+            gchar **tok = g_strsplit(getenv("MT7621_ELF_ARGS"), " ", 0);
+            uint32_t strp = 0x01800000, argvp = 0x01801000;
+            uint32_t ptrs[64];
+            int n = 0, ti;
+
+            for (ti = 0; tok[ti] && n < 64; ti++) {
+                size_t l = strlen(tok[ti]) + 1;
+                address_space_write(&address_space_memory, strp,
+                                    MEMTXATTRS_UNSPECIFIED, tok[ti], l);
+                ptrs[n++] = 0xa0000000 | strp;
+                strp += (l + 3) & ~3;
+            }
+            address_space_write(&address_space_memory, argvp,
+                                MEMTXATTRS_UNSPECIFIED, ptrs, n * 4);
+            s->elf_argc = n;
+            s->elf_argv = 0xa0000000 | argvp;
+            printf("mt7621: ELF args argc=%d argv=%08x\n", n, s->elf_argv);
+            g_strfreev(tok);
+        }
         printf("mt7621: ELF entry 0x%08x\n", s->entry);
         close(fd);
         return;
@@ -3332,6 +3358,12 @@ static void mt7621_reset(void *opaque)
     /* Malta does the same when a -kernel image is supplied. */
     env->CP0_Status &= ~(1 << 2); /* CP0St_ERL */
     env->active_tc.PC = s->entry;
+    if (s->elf_kernel) {
+        env->active_tc.gpr[4] = s->elf_argc;
+        env->active_tc.gpr[5] = s->elf_argv;
+        env->active_tc.gpr[6] = 0;
+        env->active_tc.gpr[7] = 0;
+    }
 
     /*
      * The MT7621 BootROM hands over with the 50 kHz systick already running
