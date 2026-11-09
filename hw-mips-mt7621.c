@@ -3138,7 +3138,11 @@ static void mt7621_poweroff_poll(void *opaque)
 
             s->rom_logged = true;
             fprintf(stderr, "rom reached: pc=%08x status=%08x cause=%08x "
-                    "last pcs:", hpc, env->CP0_Status, env->CP0_Cause);
+                    "badvaddr=%08x epc=%08x errpc=%08x\n",
+                    hpc, env->CP0_Status, env->CP0_Cause,
+                    (uint32_t)env->CP0_BadVAddr, (uint32_t)env->CP0_EPC,
+                    (uint32_t)env->CP0_ErrorEPC);
+            fprintf(stderr, "pcs:");
             for (k = 0; k < PC_HIST; k++) {
                 uint32_t v = s->pc_hist[(s->pc_hist_idx + k) % PC_HIST];
 
