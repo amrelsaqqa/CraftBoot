@@ -305,6 +305,22 @@ struct MT7621State {
     QEMUTimer *poweroff_timer;  /* detects a parked CPU (poweroff/halt) */
     unsigned halt_ticks;
     bool halt_seen_running;
+
+    /*
+     * Kernel command line injection for bring-up.  RouterBOOT assembles its
+     * command line in a scratch buffer and hands the pointer to the kernel;
+     * MT7621_CMDLINE appends options to that buffer before the kernel gets
+     * to parse it (see mt7621_cmdline_poll()).
+     */
+    QEMUTimer *cmdline_timer;
+    char *cmdline_extra;
+    uint32_t cmdline_cursor;
+    uint32_t cmdline_phys;      /* discovered buffer address, 0 = unknown */
+    unsigned cmdline_ticks;
+    bool cmdline_kernel_seen;
+    unsigned cmdline_patches;
+    int64_t cmdline_deadline_ns;
+
     QEMUTimer *systick_timer;
     QEMUTimer *systick_pulse_off;
     qemu_irq systick_irq;
@@ -1638,6 +1654,26 @@ static void mt7621_spi_exec(MT7621State *s)
     if (cmd_len > 4) {
         cmd_len = 4;
     }
+    if (getenv("MT7621_SPISTAT")) {
+        static unsigned long long tx;
+        static uint32_t low, high;
+        uint32_t a = ((opcode >> 24) << 16) | ((opcode >> 8) & 0xffff);
+
+        tx++;
+        if (cmd_len >= 4 && (opcode & 0xff) == 0x03) {
+            if (!low || a < low) {
+                low = a;
+            }
+            if (a > high) {
+                high = a;
+            }
+        }
+        if (!(tx % 50000)) {
+            fprintf(stderr, "spi: %llu tx, last op=%08x addr=%06x, "
+                    "read window %06x..%06x\n",
+                    tx, opcode, a, low, high);
+        }
+    }
     if (cmd_len + mosi_len > sizeof(mosi)) {
         mosi_len = sizeof(mosi) - cmd_len;
     }
@@ -2785,6 +2821,146 @@ static void mt7621_poweroff_poll(void *opaque)
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
 }
 
+/*
+ * Kernel command line injection for bring-up.
+ *
+ * RouterBOOT assembles the kernel command line in a scratch buffer inside
+ * its own RAM image and hands a pointer to the kernel, so there is nothing
+ * to patch in the flash image.  The buffer only exists for the instant
+ * between "loading kernel... OK" and the jump, and its physical address
+ * moves with the bootloader build, so sweep the bootloader's RAM window and
+ * append the extra options in place.
+ *
+ * The anchor also appears inside the printk ring buffer (as part of the
+ * "Kernel command line: ..." line), so a NUL immediately before it is
+ * required to stay on RouterBOOT's copy.
+ */
+#define MT7621_CMDLINE_BASE         0x01100000
+#define MT7621_CMDLINE_SIZE         0x00400000
+#define MT7621_CMDLINE_PAGE         0x1000
+#define MT7621_CMDLINE_PAGES_TICK   16
+#define MT7621_CMDLINE_LIFETIME_NS  (60 * 1000000000LL)
+
+static bool mt7621_cmdline_patch(MT7621State *s, uint32_t phys)
+{
+    char buf[1024];
+    char tmp[1024];
+    size_t len, extra = strlen(s->cmdline_extra);
+    size_t i;
+
+    if (address_space_read(&address_space_memory, phys,
+                           MEMTXATTRS_UNSPECIFIED, buf, sizeof(buf))) {
+        return false;
+    }
+    buf[sizeof(buf) - 1] = 0;
+    len = strnlen(buf, sizeof(buf) - 1);
+    if (strstr(buf, s->cmdline_extra)) {
+        return true;
+    }
+    if (len + extra + 3 > sizeof(buf)) {
+        return false;
+    }
+    /* Only extend into padding; the buffer may be followed by live data. */
+    for (i = len; i <= len + extra + 1; i++) {
+        if (buf[i] != 0) {
+            return false;
+        }
+    }
+    snprintf(tmp, sizeof(tmp), "%s %s", buf, s->cmdline_extra);
+    if (address_space_write(&address_space_memory, phys,
+                            MEMTXATTRS_UNSPECIFIED, tmp, strlen(tmp) + 1)) {
+        return false;
+    }
+    s->cmdline_patches++;
+    if (s->cmdline_patches <= 10) {
+        fprintf(stderr, "mt7621: cmdline #%u at tick %u: '%s'\n",
+                s->cmdline_patches, s->cmdline_ticks, tmp);
+    }
+    return true;
+}
+
+static void mt7621_cmdline_poll(void *opaque)
+{
+    MT7621State *s = opaque;
+    static const char anchor[] = "root=/dev/ram0 bootimage=1";
+    uint8_t page[MT7621_CMDLINE_PAGE + 64];
+    int n;
+
+    s->cmdline_ticks++;
+
+    if (s->cpu && !s->cmdline_kernel_seen) {
+        uint32_t pc = s->cpu->env.active_tc.PC;
+
+        if (pc >= 0x80100000 && pc < 0x81000000) {
+            s->cmdline_kernel_seen = true;
+            if (getenv("MT7621_TRACE")) {
+                fprintf(stderr, "mt7621: kernel PC %08x at tick %u "
+                        "(patches %u)\n", pc, s->cmdline_ticks,
+                        s->cmdline_patches);
+            }
+        }
+    }
+
+    if (getenv("MT7621_TRACE") && !(s->cmdline_ticks % 10000)) {
+        fprintf(stderr, "mt7621: cmdline poll #%u phys=%08x patches=%u\n",
+                s->cmdline_ticks, s->cmdline_phys, s->cmdline_patches);
+    }
+
+    if (s->cmdline_phys) {
+        /*
+         * Once the buffer address is known, watch it closely: RouterBOOT
+         * writes the string and jumps within a millisecond or so, and the
+         * kernel parses it almost immediately after entry.
+         */
+        int r = address_space_read(&address_space_memory, s->cmdline_phys,
+                                   MEMTXATTRS_UNSPECIFIED, page, 1024);
+        if (getenv("MT7621_TRACE") && page[0] &&
+            !(s->cmdline_ticks % 20000)) {
+            fprintf(stderr, "mt7621: cmdline peek #%u r=%d '%c%c%c%c%c%c'\n",
+                    s->cmdline_ticks, r, page[0], page[1], page[2],
+                    page[3], page[4], page[5]);
+        }
+        if (!memcmp(page, anchor, sizeof(anchor) - 1)) {
+            mt7621_cmdline_patch(s, s->cmdline_phys);
+        }
+    } else {
+        /* Address unknown: sweep the bootloader's RAM window. */
+        for (n = 0; n < MT7621_CMDLINE_PAGES_TICK; n++) {
+            uint32_t off = s->cmdline_cursor;
+            uint32_t phys = MT7621_CMDLINE_BASE + off;
+            uint8_t *hit;
+
+            if (address_space_read(&address_space_memory, phys,
+                                   MEMTXATTRS_UNSPECIFIED, page,
+                                   sizeof(page))) {
+                break;
+            }
+            s->cmdline_cursor += MT7621_CMDLINE_PAGE;
+            if (s->cmdline_cursor + sizeof(page) >= MT7621_CMDLINE_SIZE) {
+                s->cmdline_cursor = 0;
+            }
+
+            hit = memmem(page, MT7621_CMDLINE_PAGE, anchor,
+                         sizeof(anchor) - 1);
+            if (!hit || hit == page || hit[-1] != 0) {
+                continue;
+            }
+            s->cmdline_phys = phys + (hit - page);
+            if (getenv("MT7621_TRACE")) {
+                fprintf(stderr, "mt7621: cmdline buffer at phys %08x\n",
+                        s->cmdline_phys);
+            }
+            mt7621_cmdline_patch(s, s->cmdline_phys);
+            break;
+        }
+    }
+
+    if (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->cmdline_deadline_ns) {
+        timer_mod(s->cmdline_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (s->cmdline_phys ? 100000 : 2000000));
+    }
+}
+
 static void mt7621_phy_defaults(MT7621State *s)
 {
     unsigned p, r;
@@ -3001,6 +3177,27 @@ static void mt7621_machine_init(MachineState *machine)
                                      mt7621_poweroff_poll, s);
     timer_mod(s->poweroff_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 250);
+
+    if (getenv("MT7621_CMDLINE")) {
+        s->cmdline_extra = g_strdup(getenv("MT7621_CMDLINE"));
+        /*
+         * RouterBOOT keeps the assembled command line in a scratch buffer
+         * inside its RAM image.  Its address is build specific; the RB750Gr3
+         * booter 3.35 uses this one.  Without a seed the poller falls back
+         * to sweeping the whole bootloader window.
+         */
+        if (getenv("MT7621_CMDLINE_PHYS")) {
+            s->cmdline_phys = strtoul(getenv("MT7621_CMDLINE_PHYS"), NULL, 0);
+        } else if (s->board == MT7621_BOARD_RB750GR3) {
+            s->cmdline_phys = 0x01200c80;
+        }
+        s->cmdline_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                        mt7621_cmdline_poll, s);
+        s->cmdline_deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                 MT7621_CMDLINE_LIFETIME_NS;
+        timer_mod(s->cmdline_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000000LL);
+    }
 
     /* DDR */
     memory_region_init_ram(&s->ram, NULL, "mt7621.ddr", ram_size,
