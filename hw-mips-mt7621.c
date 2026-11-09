@@ -544,12 +544,25 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
      * once, before phylink programmed the advertisement, and it then
      * short-circuits every later poll, leaving the port at a stale speed.
      */
-    up = phy && phy == s->eth_port;
+    /*
+     * RouterBOOT 7.x checks the cable on a PHY that does not necessarily
+     * match the port we bridge, and spins on MTK_PHY_IAC until it sees
+     * link.  MT7621_ETH_ANYLINK reports link on every PHY, which is what
+     * the tap actually represents while we model a single backend.
+     */
+    up = phy && (phy == s->eth_port || getenv("MT7621_ETH_ANYLINK"));
     if (up) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
         if (!s->phy_link_ns) {
-            s->phy_link_ns = now + 2500 * 1000 * 1000LL;
+            /*
+             * Short, not instant: Linux's phylink programs the
+             * advertisement and resolves the link on its first status read,
+             * but RouterBOOT checks "is there a cable" only ~2 s into the
+             * boot, before its DHCP phase, so the delay has to be well
+             * below that.
+             */
+            s->phy_link_ns = now + 300 * 1000 * 1000LL;
         }
         up = now >= s->phy_link_ns;
     }
@@ -2767,7 +2780,13 @@ static void mt7621_nor_load(MT7621State *s, const char *filename)
     window = MIN((uint64_t)sz, (uint64_t)MT7621_SPI_WINDOW);
     memory_region_init_ram_ptr(&s->flash_mr, NULL, "mt7621.spi-nor",
                                window, s->flash);
-    memory_region_set_readonly(&s->flash_mr, true);
+    /*
+     * Writable: RouterBOOT does not program settings through the SPI
+     * controller at all, it stores them into the memory mapped window
+     * ("writing settings to flash.."), which the SoC turns into a flash
+     * program cycle.  Keeping the window read-only silently dropped every
+     * setting the booter ever saved.
+     */
     memory_region_add_subregion(get_system_memory(), MT7621_SPI_FLASH_BASE,
                                 &s->flash_mr);
 
@@ -3189,6 +3208,11 @@ static void mt7621_reset(void *opaque)
 {
     MT7621State *s = opaque;
     CPUMIPSState *env = &s->cpu->env;
+
+    if (getenv("MT7621_RSTLOG")) {
+        fprintf(stderr, "mt7621: machine reset, cpu pc=%08x ra=%08x\n",
+                env->active_tc.PC, env->active_tc.gpr[31]);
+    }
 
     if (s->wdt_timer) {
         timer_del(s->wdt_timer);
