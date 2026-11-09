@@ -45,12 +45,25 @@
 #define TYPE_MT7621_MACHINE MACHINE_TYPE_NAME("mt7621")
 OBJECT_DECLARE_SIMPLE_TYPE(MT7621State, MT7621_MACHINE)
 
+typedef enum MT7621Board {
+    MT7621_BOARD_AUTO = 0,
+    MT7621_BOARD_LG_GAPM7200,     /* 256 MiB DDR, parallel NAND */
+    MT7621_BOARD_RB750GR3,        /* 256 MiB DDR, 16 MiB SPI NOR */
+} MT7621Board;
+
 /* SoC memory map */
 #define MT7621_RAM_BASE         0x00000000
 #define MT7621_PERIPH_BASE      0x1e000000
 #define MT7621_PERIPH_SIZE      0x00100000
 
 #define MT7621_SYSCTL_OFF       0x00000000
+/*
+ * SPI NOR is memory-mapped by the BootROM at 0x1fc00000.  The MPU decodes
+ * a 4 MiB window there, which is all the boot chain needs: RouterBOOT's
+ * second stage lives at flash offset 0x10000.
+ */
+#define MT7621_SPI_FLASH_BASE   0x1fc00000
+#define MT7621_SPI_WINDOW       0x00400000
 #define MT7621_SYSTICK_OFF      0x00000500
 #define MT7621_UART0_OFF        0x00000c00
 #define MT7621_NFI_OFF          0x00003000
@@ -256,6 +269,7 @@ struct MT7621State {
     bool qtx_en;                /* QDMA TX DMA enable */
     MemoryRegion cm;
     MemoryRegion eth;
+    MemoryRegion fe_sram;       /* 0x1e108000: FE/PSE SRAM used before DDR */
     MemoryRegion ram_alias[8];
     int ram_alias_count;
 
@@ -298,11 +312,42 @@ struct MT7621State {
     uint32_t systick_base_count;
     bool systick_pending;
 
+    /* board preset */
+    char *board_name;
+    MT7621Board board;
+    uint32_t chip_mode;         /* SYSCFG0[3:0] boot flash select */
+
+    /* SPI NOR image mapped at 0x1fc00000 */
+    uint8_t *flash;
+    uint64_t flash_size;
+    MemoryRegion flash_mr;
+    bool spi_nor;
+
+    /*
+     * SPI controller at 0x1e000b00.  The MT7621 maps the NOR chip into a
+     * 4 MiB window at 0x1fc00000 and also exposes the controller's PIO
+     * FIFO; RouterBOOT and Linux both use the latter to read the rest of
+     * the chip.
+     */
+    MemoryRegion spi;
+    uint32_t spi_regs[0x100 / 4];
+    uint8_t spi_rx[32];
+    bool spi_read_mode;
+    uint32_t spi_addr;
+
     /* boot image */
     uint32_t load_addr;
     uint32_t entry;
     bool uimage;
     char *image_file;           /* boot image, reloaded on reset */
+
+    /*
+     * Bring-up knob: L1 cache geometry reported in Config1 bits 15:0
+     * (IS/IL/IA/DS/DL/DA).  Linux picks its cache flush strategy from
+     * these fields, so a value that lies about the geometry can make the
+     * guest call a flush routine pointer that was never installed.
+     */
+    uint32_t cfg1_cache_fields;
 };
 
 static bool mt7621_trace;
@@ -332,10 +377,20 @@ static uint32_t mt7621_gpio_inputs(uint32_t *regs)
 static uint64_t mt7621_reg_read(void *opaque, hwaddr addr, unsigned size)
 {
     uint32_t *regs = opaque;
-    uint32_t val = regs[(addr & 0xfff) >> 2];
+    uint32_t off = addr & 0xfff;
+    uint32_t val = regs[off >> 2];
 
-    if ((addr & 0xfff) == SYS_GPIO_DATA) {
+    if (off == SYS_GPIO_DATA) {
         val = mt7621_gpio_inputs(regs);
+    }
+
+    /*
+     * The block is 32-bit oriented, but the SoC happily answers byte and
+     * halfword loads (MikroTik's 3.3.5 kernel reads the chip revision with
+     * an lhu).  Shifting here keeps those from turning into a bus error.
+     */
+    if (size < 4) {
+        val >>= 8 * (off & 3);
     }
 
     if (mt7621_trace) {
@@ -349,13 +404,24 @@ static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
     uint32_t *regs = opaque;
+    uint32_t off = addr & 0xfff;
 
     if (mt7621_trace) {
         qemu_log_mask(LOG_UNIMP, "mt7621: reg write %08" HWADDR_PRIx
                       " <- %08" PRIx64 "\n", addr, val);
     }
 
-    switch (addr & 0xfff) {
+    if (size < 4) {
+        /* Merge the written lane into the current register value. */
+        unsigned shift = 8 * (off & 3);
+        uint32_t mask = (size == 2 ? 0xffffu : 0xffu) << shift;
+
+        val = (regs[off >> 2] & ~mask) | (((uint32_t)val << shift) & mask);
+        regs[off >> 2] = val;
+        return;
+    }
+
+    switch (off) {
     case SYS_GPIO_DATA:
     {
         /* Only pins configured as outputs latch a value. */
@@ -375,7 +441,7 @@ static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     }
 
-    regs[(addr & 0xfff) >> 2] = val;
+    regs[off >> 2] = val;
 }
 
 /*
@@ -1347,6 +1413,345 @@ static const MemoryRegionOps mt7621_wdt_ops = {
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+/*
+ * SPI NOR controller (0x1e000b00).  Register layout, per the Linux and
+ * U-Boot drivers:
+ *
+ *   0x00 TRANS    bit 8 start, bit 16 busy, [3:0] command bytes,
+ *                 bit 6 = capture a 4-byte RX word (RouterBOOT style)
+ *   0x04 OPCODE   up to 4 command bytes, big-endian
+ *   0x08 DATA0..  FIFO, little-endian bytes
+ *   0x28 MASTER   clock select / more-buffer mode
+ *   0x2c MOREBUF  command/MISO/MOSI bit counts (Linux style)
+ *   0x38 POLAR    chip select (written 0 to deassert)
+ *   0x3c SPACE    dummy clocks
+ *
+ * The flash itself is a Winbond W25Q128FV (EF 40 18), matching the ID in
+ * the board's hard configuration.
+ */
+#define MT7621_SPI_OFF          0x00000b00
+#define SPI_TRANS               0x00
+#define SPI_OPCODE              0x04
+#define SPI_DATA0               0x08
+#define SPI_MASTER              0x28
+#define SPI_MOREBUF             0x2c
+#define SPI_POLAR               0x38
+#define SPI_SPACE               0x3c
+
+#define SPI_TRANS_START         (1u << 8)
+#define SPI_TRANS_BUSY          (1u << 16)
+#define SPI_TRANS_RXWORD        (1u << 6)
+
+static const uint8_t mt7621_spi_id[3] = { 0xef, 0x40, 0x18 };
+
+static uint8_t mt7621_flash_read_byte(MT7621State *s, uint32_t addr)
+{
+    if (s->flash && addr < s->flash_size) {
+        return s->flash[addr];
+    }
+    return 0xff;
+}
+
+static void mt7621_flash_write_bytes(MT7621State *s, uint32_t addr,
+                                     const uint8_t *buf, int len)
+{
+    int i;
+
+    if (!s->flash) {
+        return;
+    }
+    for (i = 0; i < len; i++) {
+        if (addr + i < s->flash_size) {
+            s->flash[addr + i] &= buf[i];   /* NOR can only clear bits */
+        }
+    }
+}
+
+static void mt7621_flash_erase(MT7621State *s, uint32_t addr, uint32_t len)
+{
+    uint32_t start = addr & ~(len - 1);
+
+    if (s->flash && start + len <= s->flash_size) {
+        memset(s->flash + start, 0xff, len);
+    }
+}
+
+/*
+ * Clock the given MOSI bytes through the flash and fill miso_out with what
+ * the chip returns.  bytes_out is advanced only for the RX phase (bytes
+ * after cmd_len), which is what the controller captures into the FIFO.
+ */
+static void mt7621_spi_flash_run(MT7621State *s, const uint8_t *mosi,
+                                 int n, int cmd_len, uint8_t *miso, int rx_len)
+{
+    int i;
+    int pos = 0;
+    int rx_pos = cmd_len;
+    uint32_t args[8];
+    int nargs = 0;
+
+    memset(miso, 0xff, rx_len);
+
+    if (getenv("MT7621_SPILOG")) {
+        fprintf(stderr, "spi: op %02x n=%d cmd=%d rx=%d bytes=",
+                n > 0 ? mosi[0] : -1, n, cmd_len, rx_len);
+        for (i = 0; i < n; i++) {
+            fprintf(stderr, "%02x", mosi[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (n <= 0) {
+        /* A read-only transaction continuing a READ command. */
+        if (s->spi_read_mode) {
+            for (i = 0; i < rx_len; i++) {
+                miso[i] = mt7621_flash_read_byte(s, s->spi_addr++);
+            }
+        }
+        return;
+    }
+
+    /* The opcode is the first byte; the rest is address / data. */
+    for (i = 1; i < n && nargs < (int)ARRAY_SIZE(args); i++) {
+        args[nargs++] = mosi[i];
+    }
+
+    switch (mosi[0]) {
+    case 0x9f:                          /* RDID */
+        s->spi_read_mode = false;
+        for (i = 0; i < rx_len; i++) {
+            miso[i] = i < 3 ? mt7621_spi_id[i] : 0xff;
+        }
+        break;
+    case 0x90:                          /* manufacturer + device ID */
+        s->spi_read_mode = false;
+        for (i = 0; i < rx_len; i++) {
+            miso[i] = i == 0 ? 0xef : (i == 1 ? 0x17 : 0x00);
+        }
+        break;
+    case 0x05:                          /* RDSR */
+    case 0x35:                          /* RDSR2 */
+        s->spi_read_mode = false;
+        for (i = 0; i < rx_len; i++) {
+            miso[i] = 0x00;             /* not busy, no protection */
+        }
+        break;
+    case 0x03:                          /* READ */
+    case 0x0b: {                        /* FAST READ */
+        uint32_t addr = 0;
+
+        for (i = 0; i < 3 && i < nargs; i++) {
+            addr = (addr << 8) | args[i];
+        }
+        s->spi_addr = addr;
+        s->spi_read_mode = true;
+        rx_pos = mosi[0] == 0x0b ? 5 : 4;
+        for (i = 0; i < rx_len; i++) {
+            miso[i] = mt7621_flash_read_byte(s, s->spi_addr++);
+        }
+        break;
+    }
+    case 0x02:                          /* page program */
+    case 0x01:                          /* write status */
+    case 0x06:                          /* write enable */
+    case 0x04:                          /* write disable */
+    case 0x20:                          /* sector erase 4K */
+    case 0x52:                          /* block erase 32K */
+    case 0xd8:                          /* block erase 64K */
+    case 0x60:                          /* chip erase */
+    case 0xc7: {
+        uint32_t addr = 0;
+
+        for (i = 0; i < 3 && i < nargs; i++) {
+            addr = (addr << 8) | args[i];
+        }
+        switch (mosi[0]) {
+        case 0x02:
+            mt7621_flash_write_bytes(s, addr, mosi + 4, n - 4);
+            break;
+        case 0x20:
+            mt7621_flash_erase(s, addr, 4096);
+            break;
+        case 0x52:
+            mt7621_flash_erase(s, addr, 32768);
+            break;
+        case 0xd8:
+            mt7621_flash_erase(s, addr, 65536);
+            break;
+        case 0x60:
+        case 0xc7:
+            if (s->flash) {
+                memset(s->flash, 0xff, s->flash_size);
+            }
+            break;
+        default:
+            break;
+        }
+        s->spi_read_mode = false;
+        break;
+    }
+    default:
+        s->spi_read_mode = false;
+        break;
+    }
+
+    /* RX bytes were already produced above for the read commands; for the
+     * others, RX captures 0xff. */
+    (void)pos;
+    (void)rx_pos;
+}
+
+static void mt7621_spi_exec(MT7621State *s)
+{
+    uint32_t trans = s->spi_regs[SPI_TRANS / 4];
+    uint32_t morebuf = s->spi_regs[SPI_MOREBUF / 4];
+    uint32_t opcode = s->spi_regs[SPI_OPCODE / 4];
+    uint8_t mosi[80];
+    uint8_t miso[32];
+    unsigned cmd_len, mosi_len, rx_len;
+    uint32_t cmd_bits = (morebuf >> 24) & 0x3f;
+    uint32_t miso_bits = (morebuf >> 12) & 0x1ff;
+    uint32_t mosi_bits = morebuf & 0x1ff;
+    int i;
+
+    if (morebuf) {
+        cmd_len = cmd_bits / 8;
+        mosi_len = mosi_bits / 8;
+        rx_len = miso_bits / 8;
+    } else {
+        /*
+         * Legacy (non MOREBUF) mode: TRANS holds the MOSI byte count in
+         * bits 3:0 and the MISO byte count in bits 7:4.  RouterBOOT drives
+         * the block this way and packs the command word as
+         *
+         *      opcode            in bits  7:0
+         *      address byte 23:16 in bits 31:24
+         *      address byte 15:8  in bits 23:16
+         *      address byte  7:0  in bits 15:8
+         *
+         * so the wire order is opcode first, then the address MSB first.
+         */
+        cmd_len = trans & 0xf;
+        mosi_len = 0;
+        rx_len = (trans >> 4) & 0xf;
+    }
+    if (cmd_len > 4) {
+        cmd_len = 4;
+    }
+    if (cmd_len + mosi_len > sizeof(mosi)) {
+        mosi_len = sizeof(mosi) - cmd_len;
+    }
+    if (rx_len > sizeof(s->spi_rx)) {
+        rx_len = sizeof(s->spi_rx);
+    }
+
+    if (getenv("MT7621_SPILOG")) {
+        fprintf(stderr, "spi: exec trans=%08x more=%08x op=%08x "
+                "cmd_len=%u mosi_len=%u rx_len=%u\n",
+                trans, morebuf, opcode, cmd_len, mosi_len, rx_len);
+    }
+
+    if (morebuf) {
+        for (i = 0; i < (int)cmd_len; i++) {
+            mosi[i] = (opcode >> (8 * (cmd_len - 1 - i))) & 0xff;
+        }
+    } else {
+        static const int rot[4] = { 0, 24, 16, 8 };
+        for (i = 0; i < (int)cmd_len; i++) {
+            mosi[i] = (opcode >> rot[i]) & 0xff;
+        }
+    }
+    for (i = 0; i < (int)mosi_len; i++) {
+        mosi[cmd_len + i] = ((const uint8_t *)&s->spi_regs[SPI_DATA0 / 4])[i];
+    }
+
+    if (mt7621_trace) {
+        QEMU_BUILD_BUG_ON(0);
+    }
+
+    memset(miso, 0xff, sizeof(miso));
+    if (cmd_len == 0 && rx_len == 0 && mosi_len == 0) {
+        /* nothing to do */
+    } else if (cmd_len == 0) {
+        if (s->spi_read_mode) {
+            for (i = 0; i < (int)rx_len; i++) {
+                miso[i] = mt7621_flash_read_byte(s, s->spi_addr++);
+            }
+        }
+    } else {
+        mt7621_spi_flash_run(s, mosi, cmd_len + mosi_len, cmd_len,
+                             miso, rx_len);
+    }
+
+    for (i = 0; i < (int)rx_len; i++) {
+        ((uint8_t *)&s->spi_regs[SPI_DATA0 / 4])[i] = miso[i];
+    }
+
+    trans &= ~(SPI_TRANS_START | SPI_TRANS_BUSY);
+    s->spi_regs[SPI_TRANS / 4] = trans;
+}
+
+static uint64_t mt7621_spi_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MT7621State *s = opaque;
+    uint32_t off = addr & 0xff;
+    uint32_t val;
+
+    if (off >= 0x04 && off < 0x24) {
+        /* FIFO: expose the individual bytes written by the driver. */
+        val = ((const uint32_t *)s->spi_regs)[off / 4];
+    } else {
+        val = s->spi_regs[off / 4];
+    }
+    if (mt7621_trace) {
+        qemu_log_mask(LOG_UNIMP, "mt7621: spi read  %03x -> %08x\n",
+                      (unsigned)off, val);
+    }
+    return val;
+}
+
+static void mt7621_spi_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    MT7621State *s = opaque;
+    uint32_t off = addr & 0xff;
+
+    if (mt7621_trace) {
+        qemu_log_mask(LOG_UNIMP, "mt7621: spi write %03x <- %08x\n",
+                      (unsigned)off, (uint32_t)val);
+    }
+    if (getenv("MT7621_SPILOG") &&
+        (off <= SPI_DATA0 + 0x18 || off == SPI_MASTER ||
+         off == SPI_MOREBUF || off == SPI_POLAR)) {
+        fprintf(stderr, "spi: reg %03x <- %08x\n",
+                (unsigned)off, (uint32_t)val);
+    }
+    if (off < 0x04) {
+        s->spi_regs[off / 4] = val;
+        if (val & SPI_TRANS_START) {
+            mt7621_spi_exec(s);
+        }
+        return;
+    }
+    if (off >= 0x04 && off < 0x24) {
+        ((uint32_t *)s->spi_regs)[off / 4] = val;
+        return;
+    }
+    s->spi_regs[off / 4] = val;
+    if (off == SPI_POLAR && val == 0) {
+        /* Chip select deasserted: the next read starts a new command. */
+        s->spi_read_mode = false;
+    }
+}
+
+static const MemoryRegionOps mt7621_spi_ops = {
+    .read = mt7621_spi_read,
+    .write = mt7621_spi_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
 {
     /*
@@ -1730,6 +2135,27 @@ static void mt7621_rstctl_write(void *opaque, hwaddr addr, uint64_t val,
     s->sysctl_regs[SYS_RSTCTL / 4] = val;
 
     if ((val & 1) && !(old & 1)) {
+        if (getenv("MT7621_RSTLOG") && s->cpu) {
+            CPUMIPSState *env = &s->cpu->env;
+            uint32_t sp = env->active_tc.gpr[29];
+            uint32_t pc = env->active_tc.PC;
+            uint32_t ra = env->active_tc.gpr[31];
+            int i;
+
+            fprintf(stderr, "restart: pc=%08x ra=%08x sp=%08x\n",
+                    pc, ra, sp);
+            for (i = 0; i < 64; i++) {
+                uint32_t v;
+                if (address_space_rw(&address_space_memory,
+                                     sp + i * 4, MEMTXATTRS_UNSPECIFIED,
+                                     (uint8_t *)&v, 4, false)) {
+                    break;
+                }
+                if (v >= 0x80000000 && v < 0x82000000) {
+                    fprintf(stderr, "  stack[%2d] %08x\n", i, v);
+                }
+            }
+        }
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
 }
@@ -1753,8 +2179,8 @@ static const MemoryRegionOps mt7621_reg_ops = {
     .read = mt7621_reg_read,
     .write = mt7621_reg_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
-    .impl = { .min_access_size = 4, .max_access_size = 4 },
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
 /*
@@ -2076,6 +2502,51 @@ static ssize_t mt7621_flash_pread(MT7621State *s, int fd, uint64_t off,
     return len;
 }
 
+/*
+ * SPI NOR boards boot from a memory-mapped flash: the BootROM maps the
+ * first 4 MiB at 0x1fc00000 and enters at 0xbfc00000.  There is no RAM
+ * load and no uImage header; RouterBOOT's own stage-1 header jumps into
+ * its second stage at flash offset 0x10000.
+ */
+static void mt7621_nor_load(MT7621State *s, const char *filename)
+{
+    int fd;
+    off_t sz;
+    uint64_t window;
+
+    fd = open(filename, O_RDONLY | O_BINARY);
+    if (fd < 0) {
+        error_report("mt7621: cannot open %s: %s", filename, strerror(errno));
+        exit(1);
+    }
+    sz = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    if (sz <= 0) {
+        error_report("mt7621: %s: empty flash image", filename);
+        exit(1);
+    }
+
+    s->flash = g_malloc0(sz);
+    if (pread(fd, s->flash, sz, 0) != sz) {
+        error_report("mt7621: %s: short read", filename);
+        exit(1);
+    }
+    close(fd);
+    s->flash_size = sz;
+    s->spi_nor = true;
+
+    window = MIN((uint64_t)sz, (uint64_t)MT7621_SPI_WINDOW);
+    memory_region_init_ram_ptr(&s->flash_mr, NULL, "mt7621.spi-nor",
+                               window, s->flash);
+    memory_region_set_readonly(&s->flash_mr, true);
+    memory_region_add_subregion(get_system_memory(), MT7621_SPI_FLASH_BASE,
+                                &s->flash_mr);
+
+    s->entry = MT7621_SPI_FLASH_BASE | 0xa0000000;   /* KSEG1 0xbfc00000 */
+    printf("mt7621: SPI NOR %0.1f MiB mapped at 0x%08x, entry 0x%08x\n",
+           (double)sz / (1024 * 1024), MT7621_SPI_FLASH_BASE, s->entry);
+}
+
 static void mt7621_load_image(MT7621State *s, const char *filename)
 {
     uint8_t hdr[64];
@@ -2242,7 +2713,7 @@ static void mt7621_sysctl_defaults(MT7621State *s)
      * up; 0 means "no NAND" and makes board_init skip the NFI entirely.
      * Bits above it: DRAM type and xtal mode.
      */
-    s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000180 | MT7621_CHIP_MODE;
+    s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000180 | s->chip_mode;
     s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x40000000; /* CPU_CLK_SEL = 1 */
     s->sysctl_regs[SYS_CUR_CLK_STS / 4]  = 0x00000101; /* /1 * 1 */
     /*
@@ -2354,9 +2825,17 @@ static void mt7621_reset(void *opaque)
         timer_del(s->wdt_timer);
     }
 
+    if (s->cfg1_cache_fields) {
+        env->CP0_Config1 = (env->CP0_Config1 & ~0xffffu) |
+                           s->cfg1_cache_fields;
+    }
+
     /* Everything the guest programmed is gone after a real reset. */
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
     memset(s->nfi_regs, 0, sizeof(s->nfi_regs));
+    memset(s->spi_regs, 0, sizeof(s->spi_regs));
+    s->spi_read_mode = false;
+    s->spi_addr = 0;
     s->qtx_dtx = 0;
     s->qtx_base = 0;
     s->qtx_en = false;
@@ -2382,7 +2861,7 @@ static void mt7621_reset(void *opaque)
      * Linux scribbled over the RAM the bootloader lived in, so the BootROM
      * has to load it again before the CPU is released.
      */
-    if (s->image_file) {
+    if (s->image_file && !s->spi_nor) {
         mt7621_load_image(s, s->image_file);
     }
 
@@ -2409,6 +2888,80 @@ static void mt7621_reset(void *opaque)
 
 }
 
+static MT7621Board mt7621_probe_board(const char *filename)
+{
+    uint8_t hdr[16];
+    int fd;
+    ssize_t n;
+    uint32_t w;
+
+    fd = open(filename, O_RDONLY | O_BINARY);
+    if (fd < 0) {
+        return MT7621_BOARD_LG_GAPM7200;
+    }
+    n = pread(fd, hdr, sizeof(hdr), 0);
+    close(fd);
+    if (n < 8) {
+        return MT7621_BOARD_LG_GAPM7200;
+    }
+    /* uImage: the parallel-NAND layout used by Breed / OpenWrt. */
+    if (ldl_be_p(hdr) == 0x27051956) {
+        return MT7621_BOARD_LG_GAPM7200;
+    }
+    /*
+     * RouterBOOT starts with "b 0x28" (beq zero,zero,+9) followed by a
+     * zero delay slot and its stage header.  That header is only used by
+     * SPI NOR boards, so treat it as the MikroTik preset.
+     */
+    w = ldl_le_p(hdr);
+    if ((w >> 26) == 0x04 && (w & 0x03ffffff) == 9 &&
+        ldl_le_p(hdr + 4) == 0) {
+        return MT7621_BOARD_RB750GR3;
+    }
+    return MT7621_BOARD_LG_GAPM7200;
+}
+
+static void mt7621_apply_board(MT7621State *s, const char *filename)
+{
+    s->board = MT7621_BOARD_AUTO;
+    if (s->board_name) {
+        if (!strcmp(s->board_name, "lg-gapm7200") ||
+            !strcmp(s->board_name, "gapm7200") ||
+            !strcmp(s->board_name, "lg")) {
+            s->board = MT7621_BOARD_LG_GAPM7200;
+        } else if (!strcmp(s->board_name, "rb750gr3") ||
+                   !strcmp(s->board_name, "mikrotik-rb750gr3") ||
+                   !strcmp(s->board_name, "mikrotik")) {
+            s->board = MT7621_BOARD_RB750GR3;
+        } else {
+            error_report("mt7621: unknown board '%s' (use lg-gapm7200 or "
+                         "rb750gr3)", s->board_name);
+            exit(1);
+        }
+    }
+    if (s->board == MT7621_BOARD_AUTO) {
+        s->board = mt7621_probe_board(filename);
+    }
+
+    if (s->board == MT7621_BOARD_RB750GR3) {
+        s->chip_mode = 2;       /* SYSCFG0: boot from SPI 3-byte address */
+    } else {
+        s->chip_mode = MT7621_CHIP_MODE;    /* parallel NAND */
+    }
+
+    /*
+     * RouterOS 3.3.5 derives its cache flush strategy from Config1.  The
+     * 1004Kc model's default geometry makes flush_icache_range take the
+     * "range larger than the cache" path, which calls a r4k_blast_*()
+     * pointer that this firmware never installs, so the kernel jumps to
+     * 0 during cache init.  These fields (4-way, 32-byte lines, 256
+     * sets) keep it on the per-line path.
+     */
+    if (s->board == MT7621_BOARD_RB750GR3) {
+        s->cfg1_cache_fields = 0xd2d2;
+    }
+}
+
 static void mt7621_machine_init(MachineState *machine)
 {
     MT7621State *s = MT7621_MACHINE(machine);
@@ -2418,6 +2971,9 @@ static void mt7621_machine_init(MachineState *machine)
     int i;
 
     mt7621_trace = getenv("MT7621_TRACE") != NULL;
+    s->board = MT7621_BOARD_LG_GAPM7200;
+    s->chip_mode = MT7621_CHIP_MODE;
+    mt7621_apply_board(s, machine->kernel_filename);
 
     if (ram_size > 512 * MiB) {
         error_report("mt7621: at most 512 MiB of RAM is supported");
@@ -2431,6 +2987,14 @@ static void mt7621_machine_init(MachineState *machine)
     s->cpu = mips_cpu_create_with_clock(machine->cpu_type, s->cpuclk, false);
     cpu_mips_irq_init_cpu(s->cpu);
     cpu_mips_clock_init(s->cpu);
+
+    if (getenv("MT7621_CFG1")) {
+        s->cfg1_cache_fields = strtoul(getenv("MT7621_CFG1"), NULL, 0) & 0xffff;
+    }
+    if (s->cfg1_cache_fields) {
+        s->cpu->env.CP0_Config1 = (s->cpu->env.CP0_Config1 & ~0xffffu) |
+                                  s->cfg1_cache_fields;
+    }
     qemu_register_reset(mt7621_reset, s);
 
     s->poweroff_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
@@ -2472,6 +3036,16 @@ static void mt7621_machine_init(MachineState *machine)
     memory_region_add_subregion(sysmem, 0x1e100000, &s->eth);
 
     /*
+     * The frame engine contains 24 KiB of SRAM at 0x1e108000.  The MT7621
+     * BootROM and the pre-DDR boot stages use it as stack and scratch
+     * space; RouterBOOT's DDR init even keeps its function table there.
+     * It must be real memory, not part of the register file.
+     */
+    memory_region_init_ram(&s->fe_sram, NULL, "mt7621.fe-sram",
+                           0x00008000, &error_fatal);
+    memory_region_add_subregion(sysmem, 0x1e108000, &s->fe_sram);
+
+    /*
      * The SoC interrupt controller is a MIPS GIC at 0x1fbc0000 (not the
      * RT305x-style INTC of older Ralink parts).  Directing a shared
      * interrupt to CPU line 0 gives Cause IP2, which is the line both
@@ -2500,7 +3074,9 @@ static void mt7621_machine_init(MachineState *machine)
      */
     {
         const char *p = getenv("MT7621_ETH_PORT");
-        s->eth_port = p ? (unsigned)atoi(p) : 4;   /* lan1 */
+        unsigned def_port = s->board == MT7621_BOARD_RB750GR3 ? 4 : 4;
+
+        s->eth_port = p ? (unsigned)atoi(p) : def_port;
     }
     s->eth_irq = qdev_get_gpio_in(s->gic, 3);
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
@@ -2542,6 +3118,9 @@ static void mt7621_machine_init(MachineState *machine)
     memory_region_init_io(&s->wdt, NULL, &mt7621_wdt_ops, s,
                           "mt7621.wdt", MT7621_WDT_SIZE);
     memory_region_add_subregion(&s->sysctl, MT7621_WDT_OFF, &s->wdt);
+    memory_region_init_io(&s->spi, NULL, &mt7621_spi_ops, s,
+                          "mt7621.spi", 0x100);
+    memory_region_add_subregion(&s->sysctl, MT7621_SPI_OFF, &s->spi);
     memory_region_add_subregion(&s->periph, MT7621_SYSCTL_OFF, &s->sysctl);
 
     /* systick: compare interrupt routed through the GIC */
@@ -2598,9 +3177,13 @@ static void mt7621_machine_init(MachineState *machine)
     /* Boot image */
     if (machine->kernel_filename) {
         s->image_file = g_strdup(machine->kernel_filename);
-        mt7621_nand_load(s, machine->kernel_filename);
-        mt7621_nand_attach(s);
-        mt7621_load_image(s, machine->kernel_filename);
+        if (s->board == MT7621_BOARD_RB750GR3) {
+            mt7621_nor_load(s, machine->kernel_filename);
+        } else {
+            mt7621_nand_load(s, machine->kernel_filename);
+            mt7621_nand_attach(s);
+            mt7621_load_image(s, machine->kernel_filename);
+        }
     } else {
         error_report("mt7621: no boot image (-kernel) supplied");
         exit(1);
@@ -2608,9 +3191,22 @@ static void mt7621_machine_init(MachineState *machine)
 }
 
 
+static void mt7621_set_board(Object *obj, const char *value,
+                             Error **errp)
+{
+    MT7621State *s = MT7621_MACHINE(obj);
+
+    g_free(s->board_name);
+    s->board_name = g_strdup(value);
+}
+
 static void mt7621_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
+    object_class_property_add_str(oc, "board", NULL, mt7621_set_board);
+    object_class_property_set_description(oc, "board",
+        "board preset: lg-gapm7200 (parallel NAND) or rb750gr3 (SPI NOR)");
 
     mc->desc = "MediaTek MT7621 (MIPS 1004Kc)";
     mc->init = mt7621_machine_init;
