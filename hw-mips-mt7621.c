@@ -178,7 +178,7 @@ typedef enum MT7621Board {
 #define ETH_QDMA_INT_STATUS     0x1a18
 #define ETH_QDMA_INT_MASK       0x1a1c
 
-#define PDMA_RX_DONE            (1u << 30)
+#define PDMA_RX_DONE            (1u << 16)
 /*
  * The Linux raeth driver masks 0x0003000f in PDMA_INT_MASK: TX done for the
  * four queues in bits 0..3 and RX done for the two RX rings in bits 16..17.
@@ -187,10 +187,15 @@ typedef enum MT7621Board {
  */
 #define PDMA_TX_DONE0           (1u << 0)
 /*
- * Note: bit 16 (RX_DONE_INT0) is deliberately left alone.  The driver polls
- * its RX index, and raising the interrupt so early makes net_rx_action()
- * run before the switch driver has registered its NAPI instances, so
- * n->poll is NULL and the kernel faults with epc=0.
+ * RX_DONE_INT0 is bit 16 of PDMA_INT_STATUS, and the driver does enable it
+ * (its mask is 0x0003000f: TX done for four queues in bits 0..3, RX done for
+ * the two RX rings in bits 16..17).  The old model raised bit 30 instead,
+ * which is outside every mask the driver programs, so Linux was never told
+ * that a frame had landed: it kept posting RX descriptors but never ran its
+ * NAPI poll on its own and CRX_IDX0 stayed at the value written during probe
+ * (0xff) while DRX_IDX0 walked the ring.  Raising it only when the mask bit
+ * is set keeps it away from RouterBOOT, whose TFTP state machine polls
+ * PDMA_INT_STATUS and wedges on unexpected bits.
  */
 #define QDMA_TX_DONE            (1u << 28)
 /*
@@ -308,7 +313,7 @@ struct MT7621State {
     MemReentrancyGuard nic_guard;
     qemu_irq eth_irq;
     uint32_t rx_drx_idx;
-    uint32_t ptx_idx;           /* PDMA transmit ring consumer index */
+    uint32_t ptx_idx[4];        /* PDMA transmit ring consumer index */
     int64_t phy_link_ns;        /* when the tapped PHY reports link up */
     uint16_t phy_regs[32][32];  /* MDIO register file per address */
 
@@ -358,6 +363,7 @@ struct MT7621State {
 
     /* systick state: count = base + elapsed, anchored at base_ns */
     QEMUTimer *poweroff_timer;  /* detects a parked CPU (poweroff/halt) */
+    QEMUTimer *nitest_timer;    /* MT7621_NITEST: synthetic RX probes */
     unsigned halt_ticks;
     bool halt_seen_running;
 
@@ -585,7 +591,7 @@ static bool mt7621_tx_strip_tag(MT7621State *s, uint8_t *f, size_t *plen)
     return true;
 }
 
-static void mt7621_eth_pdma_tx(MT7621State *s);
+static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q);
 
 /*
  * MT7530 behind the MDIO bus: Linux talks to it through PHY address 0x1f
@@ -706,19 +712,35 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
         fprintf(stderr, "eth: write %04x <- %08x (size %u)\n",
                 (unsigned)off, val, size);
     }
+    if (getenv("MT7621_QDMALOG") && off >= 0x1a00 && off < 0x1b80) {
+        fprintf(stderr, "qdma: write %04x <- %08x (size %u)\n",
+                (unsigned)off, val, size);
+    }
 
     if (off == ETH_QDMA_GLO_CFG) {
         s->qtx_en = !!(val & 1);
         s->eth_regs[off >> 2] = val;
         return;
     }
-    if (off == ETH_PTX_BASE_PTR0 || off == ETH_PTX_MAX_CNT0 ||
-        off == ETH_PTX_CTX_IDX0 || off == ETH_PDMA_GLO_CFG) {
+    if (off == ETH_PDMA_GLO_CFG) {
         s->eth_regs[off >> 2] = val;
-        if (off == ETH_PTX_BASE_PTR0) {
-            s->ptx_idx = 0;
+        return;
+    }
+    /*
+     * Four PDMA transmit rings, one per Linux TX queue: BASE_PTR/MAX_CNT/
+     * CTX_IDX/DTX_IDX at 0x0800 + q*0x10.  Ring 0 is the only one RouterBOOT
+     * uses, but the Linux driver puts its queues on all four and waits for a
+     * TX_DONE bit per queue, so an unmodelled ring stalls that queue forever
+     * (NETDEV WATCHDOG: "transmit queue N timed out").
+     */
+    if (off >= ETH_PTX_BASE_PTR0 && off < ETH_PTX_BASE_PTR0 + 4 * 0x10) {
+        unsigned q = (off - ETH_PTX_BASE_PTR0) >> 4;
+
+        s->eth_regs[off >> 2] = val;
+        if ((off & 0xf) == 0) {                 /* BASE_PTR: ring reload */
+            s->ptx_idx[q] = 0;
         }
-        mt7621_eth_pdma_tx(s);
+        mt7621_eth_pdma_tx(s, q);
         return;
     }
     if (off == ETH_QTX_DTX_PTR) {
@@ -855,12 +877,12 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
  * engine with DDONE clear and a length in SDL0; the engine clears it and
  * sets DDONE when the frame is gone.
  */
-static void mt7621_eth_pdma_tx(MT7621State *s)
+static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q)
 {
-    uint32_t base = s->eth_regs[ETH_PTX_BASE_PTR0 / 4];
-    uint32_t cnt = s->eth_regs[ETH_PTX_MAX_CNT0 / 4];
-    uint32_t ctx = s->eth_regs[ETH_PTX_CTX_IDX0 / 4];
-    uint32_t idx = s->ptx_idx;
+    uint32_t base = s->eth_regs[(ETH_PTX_BASE_PTR0 + q * 0x10) / 4];
+    uint32_t cnt = s->eth_regs[(ETH_PTX_MAX_CNT0 + q * 0x10) / 4];
+    uint32_t ctx = s->eth_regs[(ETH_PTX_CTX_IDX0 + q * 0x10) / 4];
+    uint32_t idx = s->ptx_idx[q];
     bool processed = false;
     uint8_t frame[2048];
     size_t flen = 0;
@@ -868,7 +890,7 @@ static void mt7621_eth_pdma_tx(MT7621State *s)
     int guard = 0;
 
     if (!base || !cnt || cnt > 0x1000) {
-        s->ptx_idx = ctx;
+        s->ptx_idx[q] = ctx;
         return;
     }
     if (idx >= cnt) {
@@ -965,8 +987,8 @@ static void mt7621_eth_pdma_tx(MT7621State *s)
         idx = (idx + 1) % cnt;
     }
 
-    s->ptx_idx = idx;
-    s->eth_regs[ETH_PTX_DTX_IDX0 / 4] = idx;
+    s->ptx_idx[q] = idx;
+    s->eth_regs[(ETH_PTX_DTX_IDX0 + q * 0x10) / 4] = idx;
     /*
      * Tell the driver that the descriptors it handed us are free again.
      * Linux masks TX_DONE_INT0 and reclaims in its interrupt handler; with
@@ -979,8 +1001,9 @@ static void mt7621_eth_pdma_tx(MT7621State *s)
      * unexpected status bit wedges its TFTP state machine (the transfer
      * crawls through 1400 retries instead of completing).
      */
-    if (processed && s->eth_regs[ETH_PDMA_INT_MASK / 4]) {
-        s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_TX_DONE0;
+    if (processed &&
+        (s->eth_regs[ETH_PDMA_INT_MASK / 4] & (PDMA_TX_DONE0 << q))) {
+        s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_TX_DONE0 << q;
         mt7621_eth_update_irq(s);
     }
     if (getenv("MT7621_ETHLOG")) {
@@ -999,8 +1022,45 @@ static void mt7621_eth_update_irq(MT7621State *s)
 }
 
 /* Move one received frame into the next PDMA descriptor. */
+
+/*
+ * Netinstall discovery chatter (UDP 5000 / 59813) is worth seeing in full:
+ * the handshake state machine is byte-exact, so dump whole payloads.
+ */
+static void mt7621_ni_dump(const char *dir, const uint8_t *f, size_t len)
+{
+    unsigned sport, dport;
+    size_t i;
+
+    if (!getenv("MT7621_NILOG") || len < 42) {
+        return;
+    }
+    if (f[12] != 0x08 || f[13] != 0x00 || f[23] != 0x11) {
+        return;                                   /* IPv4 UDP only */
+    }
+    if ((f[14] & 0x0f) != 5) {
+        return;
+    }
+    sport = (f[34] << 8) | f[35];
+    dport = (f[36] << 8) | f[37];
+    if (sport != 5000 && dport != 5000 && sport != 59813 && dport != 59813) {
+        return;
+    }
+    fprintf(stderr, "eth: ni-%s len=%zu sport=%u dport=%u:", dir, len, sport, dport);
+    for (i = 42; i < len && i < 242; i++) {
+        fprintf(stderr, " %02x", f[i]);
+    }
+    fprintf(stderr, " |");
+    for (i = 42; i < len && i < 242; i++) {
+        fputc(g_ascii_isprint(f[i]) ? f[i] : '.', stderr);
+    }
+    fprintf(stderr, "|\n");
+}
+
 static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
 {
+    mt7621_ni_dump("rx", buf, len);
+
     uint32_t base = s->eth_regs[ETH_PRX_BASE_PTR0 / 4];
     uint32_t cnt = s->eth_regs[ETH_PRX_MAX_CNT0 / 4];
     uint32_t idx = s->eth_regs[ETH_PRX_DRX_IDX0 / 4];
@@ -1008,6 +1068,7 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     uint8_t tagged[1600];
     size_t flen;
     unsigned rx_off;
+    bool tagged_mode;
     bool took_bql = !bql_locked();
     static int dbg;
 
@@ -1044,6 +1105,25 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
         }
     }
 
+    if (base && cnt && len >= 14 && getenv("MT7621_NILOG")) {
+        const char *probe = NULL;
+        size_t i;
+
+        for (i = 12; i + 4 <= len; i++) {
+            if (!memcmp(buf + i, "PING", 4) || !memcmp(buf + i, "OFFR", 4)) {
+                probe = (const char *)buf + i;
+                break;
+            }
+        }
+        if (probe) {
+            fprintf(stderr, "eth: probe %c%c%c%c len=%zu idx=%u crx=%u "
+                    "drx=%u base=%08x cnt=%u tail=%zu off=%zu\n",
+                    probe[0], probe[1], probe[2], probe[3], len, idx, crx,
+                    s->eth_regs[ETH_PRX_DRX_IDX0 / 4], base, cnt,
+                    (size_t)((const uint8_t *)probe - buf), len);
+        }
+    }
+
     if (took_bql) {
         bql_lock();
     }
@@ -1073,7 +1153,8 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
      * without the tag and with RX_2B_OFFSET clear, so honour that bit
      * instead of always building a tagged frame.
      */
-    if (s->eth_regs[ETH_PDMA_GLO_CFG / 4] & (1u << 31)) {
+    tagged_mode = !!(s->eth_regs[ETH_PDMA_GLO_CFG / 4] & (1u << 31));
+    if (tagged_mode) {
         if (len + 4 > sizeof(tagged)) {
             len = sizeof(tagged) - 4;
         }
@@ -1108,8 +1189,16 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     /* rxd2's DONE bit is the release flag, so write it last. */
     address_space_stl_le(&address_space_memory, desc + 8, 0,
                          MEMTXATTRS_UNSPECIFIED, NULL);
+    /*
+     * Word 3 of a filled RX descriptor carries the forward port.  The
+     * RouterOS raeth driver extracts it with ext(.,18,3) and, in the tagged
+     * (switch) mode, only accepts frames whose value is 5 - the CPU port -
+     * otherwise it prints "switch0: rx too long: %d+" and throws the frame
+     * away.  RouterBOOT never looks at the field, so keep its old value in
+     * the untagged mode.
+     */
     address_space_stl_le(&address_space_memory, desc + 12,
-                         (1u << RX_DMA_FPORT_SHIFT),   /* fport 1 = GMAC1 */
+                         tagged_mode ? (5u << 18) : (1u << RX_DMA_FPORT_SHIFT),
                          MEMTXATTRS_UNSPECIFIED, NULL);
     address_space_stl_le(&address_space_memory, desc + 4,
                          RX_DMA_DONE | RX_DMA_PLEN0(flen),
@@ -1117,7 +1206,9 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
 
     s->rx_drx_idx = (idx + 1) % cnt;
     s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = s->rx_drx_idx;
-    s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_RX_DONE;
+    if (s->eth_regs[ETH_PDMA_INT_MASK / 4] & PDMA_RX_DONE) {
+        s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_RX_DONE;
+    }
 
     {
         static unsigned big_budget = 6;
@@ -1172,6 +1263,84 @@ static ssize_t mt7621_eth_receive(NetClientState *nc, const uint8_t *buf,
 
     mt7621_eth_rx(s, buf, size);
     return size;
+}
+
+/*
+ * MT7621_NITEST: inject synthetic discovery-style datagrams into the RX ring
+ * so that "does this frame reach the agent's socket?" can be answered without
+ * netinstall in the loop.  One probe per interesting source/destination pair.
+ */
+static void mt7621_nitest_send(MT7621State *s, uint32_t sip, uint32_t dip,
+                               bool bcast, const char *tag)
+{
+    uint8_t f[128];
+    uint8_t *ip = f + 14;
+    uint8_t *udp = ip + 20;
+    uint8_t *pl = udp + 8;
+    unsigned plen = 20 + 5;
+    unsigned i;
+    uint32_t sum = 0;
+
+    memcpy(f, bcast ? "\xff\xff\xff\xff\xff\xff" : "\x64\xd1\x54\x09\xb8\x25", 6);
+    memcpy(f + 6, "\x02\x00\x00\x00\x00\x01", 6);
+    f[12] = 0x08;
+    f[13] = 0x00;
+
+    memset(ip, 0, 20);
+    ip[0] = 0x45;
+    ip[2] = (20 + 8 + plen) >> 8;
+    ip[3] = (20 + 8 + plen) & 0xff;
+    ip[4] = 0x12;
+    ip[5] = 0x34;
+    ip[8] = 64;
+    ip[9] = 17;
+    ip[12] = sip & 0xff; ip[13] = (sip >> 8) & 0xff;
+    ip[14] = (sip >> 16) & 0xff; ip[15] = (sip >> 24) & 0xff;
+    ip[16] = dip & 0xff; ip[17] = (dip >> 8) & 0xff;
+    ip[18] = (dip >> 16) & 0xff; ip[19] = (dip >> 24) & 0xff;
+    for (i = 0; i < 20; i += 2) {
+        sum += (ip[i] << 8) | ip[i + 1];
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum = ~sum & 0xffff;
+    ip[10] = sum >> 8;
+    ip[11] = sum & 0xff;
+
+    udp[0] = 0x13; udp[1] = 0x88;         /* 5000 */
+    udp[2] = 0x13; udp[3] = 0x88;
+    udp[4] = (8 + plen) >> 8;
+    udp[5] = (8 + plen) & 0xff;
+    udp[6] = udp[7] = 0;                  /* no UDP checksum */
+
+    memset(pl, 0, 20);
+    memcpy(pl, "\x64\xd1\x54\x09\xb8\x25", 6);   /* peer MAC, non-zero */
+    pl[14] = plen;
+    pl[16] = 1;
+    memcpy(pl + 20, tag, 5);
+
+    fprintf(stderr, "nitest: inject %s sip=%08x dip=%08x bcast=%d "
+            "base=%08x cnt=%u drx=%u crx=%u\n",
+            tag, sip, dip, bcast,
+            s->eth_regs[ETH_PRX_BASE_PTR0 / 4], s->eth_regs[ETH_PRX_MAX_CNT0 / 4],
+            s->eth_regs[ETH_PRX_DRX_IDX0 / 4], s->eth_regs[ETH_PRX_CRX_IDX0 / 4]);
+    mt7621_eth_rx(s, f, 14 + 20 + 8 + plen);
+}
+
+static void mt7621_nitest_tick(void *opaque)
+{
+    MT7621State *s = opaque;
+    static unsigned n;
+
+    n++;
+    mt7621_nitest_send(s, 0x00000000, 0xffffffff, true, "PINGA");
+    mt7621_nitest_send(s, 0xc0a80102, 0xffffffff, true, "PINGB");
+    mt7621_nitest_send(s, 0xc0a80102, 0xc0a80103, false, "PINGC");
+    if (n < 30) {
+        timer_mod(s->nitest_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2000);
+    }
 }
 
 static void mt7621_eth_cleanup(NetClientState *nc)
@@ -1526,6 +1695,9 @@ static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
                             frame[0], frame[1], frame[2], frame[3], frame[4],
                             frame[5], frame[6], frame[7], frame[8], frame[9],
                             frame[10], frame[11], frame[12], frame[13], flen);
+                }
+                if (forward) {
+                    mt7621_ni_dump("tx", frame, flen);
                 }
                 if (forward && s->nic) {
                     qemu_send_packet(qemu_get_queue(s->nic), frame, flen);
@@ -4075,6 +4247,13 @@ static void mt7621_machine_init(MachineState *machine)
         mips_gictimer_set_freq(875 * 1000 * 1000);
     }
 
+
+    if (getenv("MT7621_NITEST")) {
+        s->nitest_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                       mt7621_nitest_tick, s);
+        timer_mod(s->nitest_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 20000);
+    }
 
     s->poweroff_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                      mt7621_poweroff_poll, s);
