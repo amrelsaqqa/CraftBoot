@@ -16,6 +16,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/visitor.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/units.h"
@@ -406,6 +407,12 @@ struct MT7621State {
     uint8_t spi_rx[32];
     bool spi_read_mode;
     uint32_t spi_addr;
+    /*
+     * Winbond RDUID (0x4B) value.  RouterOS derives its software-id (and
+     * therefore validates its license key) from this, so it has to be
+     * stable and configurable per board: -M mt7621,spi-uid=0x...
+     */
+    uint64_t spi_uid;
 
     /* boot image */
     uint32_t load_addr;
@@ -542,6 +549,35 @@ static void mt7621_reg_write(void *opaque, hwaddr addr, uint64_t val,
  */
 static void mt7621_eth_update_irq(MT7621State *s);
 static void mt7621_eth_tx(MT7621State *s, uint32_t ctx);
+/*
+ * MT7621 switch special tag
+ * ------------------------
+ * The switch driver inserts four bytes after the source MAC before handing a
+ * frame to the CPU port: 00 <port bitmap> 00 00.  The real switch strips them
+ * on the wire; we have no switch, so strip them here.  Without this the
+ * netinstall discovery broadcast (00 50 00 00 08 00 ...) reaches the tap with
+ * 0x0050 where an EtherType belongs and every listener drops it.
+ *
+ * Returns true if the frame should be sent, false if it was addressed to a
+ * switch port other than the one this backend represents.
+ */
+static bool mt7621_tx_strip_tag(MT7621State *s, uint8_t *f, size_t *plen)
+{
+    size_t len = *plen;
+    unsigned bitmap;
+
+    if (len < 18 || f[12] != 0x00 || f[14] != 0x00 || f[15] != 0x00) {
+        return true;                        /* untagged conduit frame */
+    }
+    bitmap = f[13];
+    if (!(f[0] & 1) && bitmap && !(bitmap & (1u << s->eth_port))) {
+        return false;                       /* another port owns it */
+    }
+    memmove(f + 12, f + 16, len - 16);
+    *plen = len - 4;
+    return true;
+}
+
 static void mt7621_eth_pdma_tx(MT7621State *s);
 
 /*
@@ -870,28 +906,24 @@ static void mt7621_eth_pdma_tx(MT7621State *s)
         if (last && flen >= 14) {
             bool forward = true;
 
-            /*
-             * Same special-tag rule as the QDMA path: the switch tag lives
-             * at offset 12, tag type in byte 12 and the port bitmap in 13.
-             */
-            if (flen > 18 && (frame[12] & 0xfe) <= 2 && !(frame[13] & 0xc0)) {
-                forward = !!(frame[13] & (1u << s->eth_port));
-                if (forward) {
-                    memmove(frame + 12, frame + 16, flen - 16);
-                    flen -= 4;
-                }
-            }
+            forward = mt7621_tx_strip_tag(s, frame, &flen);
             if (getenv("MT7621_ETHLOG")) {
                 fprintf(stderr, "eth: ptx idx=%u fport=%u tag=%02x%02x "
-                        "len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x fwd=%d\n",
+                        "len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x fwd=%d",
                         idx, fport, frame[12], frame[13], flen, frame[0],
                         frame[1], frame[2], frame[3], frame[4], frame[5],
                         forward);
+                if (flen >= 34 && frame[12] == 0x08 && frame[13] == 0x00) {
+                    fprintf(stderr, " sport=%u dport=%u proto=%u",
+                            (frame[34] << 8) | frame[35],
+                            (frame[36] << 8) | frame[37], frame[23]);
+                }
+                fprintf(stderr, "\n");
             }
             {
-                static unsigned dump_budget = 16;
-                if (getenv("MT7621_ETHLOG") && dump_budget && flen > 12) {
-                    unsigned i, n = flen < 48 ? (unsigned)flen : 48;
+                static unsigned dump_budget = 40;
+                if (getenv("MT7621_ETHLOG") && dump_budget && flen >= 60) {
+                    unsigned i, n = flen < 96 ? (unsigned)flen : 96;
                     dump_budget--;
                     fprintf(stderr, "eth: dump len=%zu:", flen);
                     for (i = 0; i < n; i++) {
@@ -1066,6 +1098,18 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = s->rx_drx_idx;
     s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_RX_DONE;
 
+    {
+        static unsigned big_budget = 6;
+        if (getenv("MT7621_ETHLOG") && big_budget && len >= 1000) {
+            unsigned i, n = flen < 52 ? (unsigned)flen : 52;
+            big_budget--;
+            fprintf(stderr, "eth: rxdump len=%zu:", flen);
+            for (i = 0; i < n; i++) {
+                fprintf(stderr, " %02x", tagged[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
     dbg++;
     if (getenv("MT7621_ETHLOG") && dbg < 16) {
         uint32_t prev = desc - 16;
@@ -1436,16 +1480,8 @@ static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
                  * switch would put on our port may leave through this
                  * backend; GMAC2 (the wan MAC) is not behind the switch.
                  */
-                if (frame_fport == 1 && flen > 18) {
-                    if ((frame[12] & 0xfe) <= 2 && !(frame[13] & 0xc0)) {
-                        if (frame[13] & (1u << s->eth_port)) {
-                            memmove(frame + 12, frame + 16, flen - 16);
-                            flen -= 4;
-                            forward = true;
-                        }
-                    } else {
-                        forward = true;     /* untagged conduit frame */
-                    }
+                if (frame_fport == 1) {
+                    forward = mt7621_tx_strip_tag(s, frame, &flen);
                 }
 
                 if (forward && frame_tso) {
@@ -1836,6 +1872,23 @@ static void mt7621_spi_flash_run(MT7621State *s, const uint8_t *mosi,
         s->spi_read_mode = false;
         for (i = 0; i < rx_len; i++) {
             miso[i] = i < 3 ? mt7621_spi_id[i] : 0xff;
+        }
+        break;
+    case 0x4b:                          /* RDUID (Winbond): 64-bit UID */
+        /*
+         * flash_get_uid() reads nine bytes - one dummy followed by the ID -
+         * and prints them as a little-endian u64, so emit the dummy and then
+         * the ID least-significant byte first.
+         */
+        s->spi_read_mode = false;
+        for (i = 0; i < rx_len; i++) {
+            if (i == 0) {
+                miso[i] = 0xff;
+            } else if (i <= 8) {
+                miso[i] = (uint8_t)(s->spi_uid >> (8 * (i - 1)));
+            } else {
+                miso[i] = 0xff;
+            }
         }
         break;
     case 0x90:                          /* manufacturer + device ID */
@@ -4077,6 +4130,32 @@ static void mt7621_set_board(Object *obj, const char *value,
     s->board_name = g_strdup(value);
 }
 
+/*
+ * Default RDUID value: a fixed, plausible Winbond unique ID.  Boards that
+ * care about matching a real chip's identity override it with
+ * -M mt7621,spi-uid=0x...
+ */
+#define MT7621_SPI_UID_DEFAULT 0xe4c1a75b3d9206f8ULL
+
+static void mt7621_machine_instance_init(Object *obj)
+{
+    MT7621State *s = MT7621_MACHINE(obj);
+
+    s->spi_uid = MT7621_SPI_UID_DEFAULT;
+}
+
+static void mt7621_set_spi_uid(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    MT7621State *s = MT7621_MACHINE(obj);
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+    s->spi_uid = value;
+}
+
 static void mt7621_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -4084,6 +4163,11 @@ static void mt7621_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "board", NULL, mt7621_set_board);
     object_class_property_set_description(oc, "board",
         "board preset: lg-gapm7200 (parallel NAND) or rb750gr3 (SPI NOR)");
+
+    object_class_property_add(oc, "spi-uid", "uint64", NULL,
+                              mt7621_set_spi_uid, NULL, NULL);
+    object_class_property_set_description(oc, "spi-uid",
+        "Winbond SPI NOR 64-bit unique ID reported by command 0x4b");
 
     mc->desc = "MediaTek MT7621 (MIPS 1004Kc)";
     mc->init = mt7621_machine_init;
@@ -4097,6 +4181,7 @@ static const TypeInfo mt7621_machine_type = {
     .name = TYPE_MT7621_MACHINE,
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(MT7621State),
+    .instance_init = mt7621_machine_instance_init,
     .class_init = mt7621_machine_class_init,
 };
 
