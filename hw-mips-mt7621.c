@@ -1996,6 +1996,23 @@ static void mt7621_spi_flash_run(MT7621State *s, const uint8_t *mosi,
     (void)rx_pos;
 }
 
+/*
+ * Opcodes the model actually implements (plus the common JEDEC ones), used to
+ * disambiguate the MOREBUF command byte order.
+ */
+static bool mt7621_spi_opcode_known(unsigned op)
+{
+    switch (op) {
+    case 0x01: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06:
+    case 0x0b: case 0x13: case 0x20: case 0x35: case 0x3b: case 0x4b:
+    case 0x52: case 0x60: case 0x90: case 0x9f: case 0xab: case 0xc7:
+    case 0xd8: case 0xeb:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void mt7621_spi_exec(MT7621State *s)
 {
     uint32_t trans = s->spi_regs[SPI_TRANS / 4];
@@ -2065,19 +2082,32 @@ static void mt7621_spi_exec(MT7621State *s)
                 "cmd_len=%u mosi_len=%u rx_len=%u\n",
                 trans, morebuf, opcode, cmd_len, mosi_len, rx_len);
     }
+    if (getenv("MT7621_SPIENC")) {
+        fprintf(stderr, "spienc: trans=%08x more=%08x op=%08x cmd=%u mosi=%u rx=%u\n",
+                trans, morebuf, opcode, cmd_len, mosi_len, rx_len);
+    }
 
     if (morebuf) {
         /*
-         * MOREBUF command bytes are packed in the OPCODE register with the
-         * first byte on the wire in the *low* byte, exactly like the legacy
-         * TRANS path below.  RouterOS 6.36 issues its status read as
-         * cmd_bits=32 with OPCODE=0x00000005 (RDSR); building this MSB-first
-         * put 0x00 on the wire, the model fell through to "unknown opcode"
-         * and returned 0xff, which stalled the yaffs mount with
-         * "raspi_wait_ready: read_sr fail: ff".
+         * MOREBUF command bytes come from the OPCODE register, but the two
+         * firmware generations pack it differently:
+         *
+         *   RouterOS 7.18 agent : OPCODE=0x03000014 -> 03 00 00 14 (read @0x14)
+         *   RouterOS 6.36       : OPCODE=0x00000005 -> 05 00 00 00 (RDSR)
+         *
+         * i.e. one puts the opcode in the high byte and the other in the low
+         * byte with everything else zero.  Decide from whichever byte holds
+         * a real flash command; default to MSB-first (the hardware layout).
          */
-        for (i = 0; i < (int)cmd_len; i++) {
-            mosi[i] = (opcode >> (8 * i)) & 0xff;
+        if (!mt7621_spi_opcode_known((opcode >> 24) & 0xff) &&
+            mt7621_spi_opcode_known(opcode & 0xff)) {
+            for (i = 0; i < (int)cmd_len; i++) {
+                mosi[i] = (opcode >> (8 * i)) & 0xff;
+            }
+        } else {
+            for (i = 0; i < (int)cmd_len; i++) {
+                mosi[i] = (opcode >> (8 * (cmd_len - 1 - i))) & 0xff;
+            }
         }
     } else {
         static const int rot[4] = { 0, 24, 16, 8 };
