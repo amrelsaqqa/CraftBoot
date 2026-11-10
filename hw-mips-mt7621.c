@@ -220,6 +220,7 @@ typedef enum MT7621Board {
  */
 #define MT7621_CM_BASE          0x1fbf0000
 #define MT7621_CM_SIZE          0x00010000
+#define MT7621_MAX_CPUS         4
 #define MT7621_GCR_OFF          0x00008000
 
 /* GCR register offsets */
@@ -277,8 +278,14 @@ typedef enum MT7621Board {
 struct MT7621State {
     MachineState parent;
 
-    MIPSCPU *cpu;
+    MIPSCPU *cpu;               /* CPU0: keeps the existing tracing paths */
+    MIPSCPU *cpus[MT7621_MAX_CPUS];
+    unsigned ncpus;
     Clock *cpuclk;
+    /* Latched by mt7621_cm_write() so a CPC reset can start that core. */
+    uint32_t co_other;          /* GCR_CL_OTHER: core selector (CM < 3) */
+    uint32_t cpc_other;         /* CPC_CL_OTHER: core selector for the CPC */
+    uint32_t co_reset_base;
     DeviceState *gic;
 
     MemoryRegion ram;
@@ -917,6 +924,20 @@ static void mt7621_eth_pdma_tx(MT7621State *s)
                     fprintf(stderr, " sport=%u dport=%u proto=%u",
                             (frame[34] << 8) | frame[35],
                             (frame[36] << 8) | frame[37], frame[23]);
+                }
+                fprintf(stderr, "\n");
+            }
+            if (getenv("MT7621_ETHLOG") && flen >= 300 &&
+                frame[12] == 0x08 && frame[13] == 0x00 &&
+                frame[23] == 0x11 &&
+                (((frame[34] << 8) | frame[35]) == 68 ||
+                 ((frame[36] << 8) | frame[37]) == 67 ||
+                 ((frame[34] << 8) | frame[35]) == 67 ||
+                 ((frame[36] << 8) | frame[37]) == 68)) {
+                unsigned i;
+                fprintf(stderr, "eth: bootp len=%zu:", flen);
+                for (i = 42; i < flen && i < 420; i++) {
+                    fprintf(stderr, " %02x", frame[i]);
                 }
                 fprintf(stderr, "\n");
             }
@@ -2760,6 +2781,14 @@ static uint64_t mt7621_cm_read(void *opaque, hwaddr addr, unsigned size)
      */
     if (off == 0x4008 || off == MT7621_GCR_OFF + 0x4008) {
         val = 0x00380001;
+    } else if (off == MT7621_GCR_OFF + 0x2028) {
+        /*
+         * GCR_CL_ID: the core-local block is per-core, so the reader sees
+         * its own id.  mips_cps_core_entry uses this to find its entry in
+         * mips_cps_core_bootcfg[]; returning 0 for everyone made every
+         * secondary jump through cpu 0's (empty) VPE config, i.e. to PC 0.
+         */
+        val = current_cpu ? (uint32_t)current_cpu->cpu_index : 0;
     } else {
         val = regs[off >> 2];
     }
@@ -2783,17 +2812,111 @@ static uint64_t mt7621_cm_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
+/*
+ * Start a secondary core the way the CM/CPC pair does it: CPU reset, then
+ * fetch from GCR_Cx_RESET_BASE (the kernel puts CKSEG1ADDR(mips_cps_core_entry)
+ * there) with BEV/ERL cleared, because cps-vec.S expects to come out of reset
+ * in a normal privileged state.
+ */
+static void mt7621_start_core_work(CPUState *cs, run_on_cpu_data data)
+{
+    MT7621State *s = data.host_ptr;
+    CPUMIPSState *env = cpu_env(cs);
+
+    cpu_reset(cs);
+    env->active_tc.PC = s->co_reset_base & 0xfffff000u;  /* keep KSEG1 */
+    env->CP0_Status &= ~((1u << CP0St_BEV) | (1u << CP0St_ERL));
+    /*
+     * Mark the VPE enabled & activated, like firmware does on the real
+     * 1004Kc.  mips_cpu_has_work() forces "no work" when mips_vpe_active()
+     * is false, so without VPEConf0.VPA a halted secondary can never wake
+     * on an interrupt (CPU1 sat in r4k_wait with IP7+IP2 pending forever).
+     */
+    env->CP0_VPEConf0 |= (1u << CP0VPEC0_VPA);
+    env->active_tc.CP0_TCStatus |= (1u << CP0TCSt_A);
+    env->active_tc.CP0_TCHalt &= ~1u;
+    if (env->mvp) {
+        env->mvp->CP0_MVPControl |= (1u << CP0MVPCo_EVP);
+    }
+    cs->halted = 0;
+}
+
+static void mt7621_start_core(MT7621State *s)
+{
+    /*
+     * CM 2.x semantics: GCR_CL_OTHER (0xa018) selects the core for the
+     * COCB redirect, CPC_CL_OTHER (0x2010) selects it for the CPC.  The
+     * kernel writes both (mips_cm_lock_other / mips_cpc_lock_other); the
+     * CPC one is the authoritative target for CPC_Cx_CMD_RESET.
+     */
+    unsigned core = (s->cpc_other >> 16) & 0xff;
+    CPUState *cs;
+
+    if (!core) {
+        core = (s->co_other >> 16) & 0x1f;
+    }
+    if (core == 0 || core >= s->ncpus) {
+        return;
+    }
+    if (mt7621_flag("MT7621_SMPLOG")) {
+        fprintf(stderr, "mt7621: start core %u at %08x (cpc_other=%08x)\n",
+                core, s->co_reset_base & 0xfffff000u, s->cpc_other);
+    }
+    cs = CPU(s->cpus[core]);
+    /*
+     * The target vCPU is halted; run the reset on its own thread so the
+     * halt is cleared and the thread is kicked out of its wait.
+     */
+    async_safe_run_on_cpu(cs, mt7621_start_core_work,
+                          RUN_ON_CPU_HOST_PTR(s));
+}
+
+static void mt7621_cpu_reset(void *opaque)
+{
+    MIPSCPU *cpu = opaque;
+    CPUState *cs = CPU(cpu);
+
+    cpu_reset(cs);
+    if (cs->cpu_index != 0) {
+        /* Secondary cores wait for the CPC to release them. */
+        cs->halted = 1;
+    }
+}
+
 static void mt7621_cm_write(void *opaque, hwaddr addr, uint64_t val,
                             unsigned size)
 {
     MT7621State *s = opaque;
     uint32_t *regs = s->cm_regs;
+    uint32_t off = addr & (MT7621_CM_SIZE - 1);
 
     if (mt7621_trace) {
         qemu_log_mask(LOG_UNIMP, "mt7621: cm write %08" HWADDR_PRIx
                       " <- %08" PRIx64 "\n", addr, val);
     }
-    regs[(addr & (MT7621_CM_SIZE - 1)) >> 2] = val;
+    regs[off >> 2] = val;
+
+    if (mt7621_flag("MT7621_SMPLOG") &&
+        ((off >= 0x2000 && off < 0x2040) || (off >= 0x4000 && off < 0x4040) ||
+         (off >= 0xa000 && off < 0xa040) || (off >= 0xc000 && off < 0xc040))) {
+        fprintf(stderr, "mt7621: cm w %04x <- %08x\n", off, (uint32_t)val);
+    }
+
+    /* GCR core-other block (selected core + its reset vector). */
+    if (off == MT7621_GCR_OFF + 0x2018) {
+        /* GCR_CL_OTHER (CM < 3): core << 16 */
+        s->co_other = val;
+    } else if (off == 0x2010) {
+        /* CPC_CL_OTHER (CM < 3): core << 16 */
+        s->cpc_other = val;
+    } else if (off == MT7621_GCR_OFF + 0x4018) {
+        s->co_other = val;
+    } else if (off == MT7621_GCR_OFF + 0x4020) {
+        s->co_reset_base = val;
+    } else if (off == 0x4000 && (val & 0xf) == 0x4) {
+        /* CPC_Cx_CMD_RESET through the core-other redirect block. */
+        mt7621_start_core(s);
+    }
 }
 
 static const MemoryRegionOps mt7621_cm_ops = {
@@ -3309,7 +3432,9 @@ static void mt7621_sysctl_defaults(MT7621State *s)
 static void mt7621_cm_defaults(MT7621State *s)
 {
     memset(s->cm_regs, 0, sizeof(s->cm_regs));
-    s->cm_regs[(MT7621_GCR_OFF + GCR_CONFIG) / 4] = 0x00000004; /* 4 cores */
+    /* GCR_CONFIG.PCORES is "cores minus one". */
+    s->cm_regs[(MT7621_GCR_OFF + GCR_CONFIG) / 4] =
+        (s->ncpus > 1 ? s->ncpus - 1 : 0);
     s->cm_regs[(MT7621_GCR_OFF + GCR_BASE) / 4]   = 0x1fbf8000;
     s->cm_regs[(MT7621_GCR_OFF + GCR_REV) / 4]    = 0x00000002;
     /*
@@ -3843,9 +3968,26 @@ static void mt7621_machine_init(MachineState *machine)
     s->cpuclk = clock_new(OBJECT(s), "cpu-refclk");
     clock_set_hz(s->cpuclk, 880 * 1000 * 1000);
 
-    s->cpu = mips_cpu_create_with_clock(machine->cpu_type, s->cpuclk, false);
-    cpu_mips_irq_init_cpu(s->cpu);
-    cpu_mips_clock_init(s->cpu);
+    s->ncpus = machine->smp.cpus;
+    if (s->ncpus < 1) {
+        s->ncpus = 1;
+    }
+    if (s->ncpus > MT7621_MAX_CPUS) {
+        s->ncpus = MT7621_MAX_CPUS;
+    }
+    for (i = 0; i < (int)s->ncpus; i++) {
+        MIPSCPU *cpu = mips_cpu_create_with_clock(machine->cpu_type,
+                                                  s->cpuclk, false);
+
+        s->cpus[i] = cpu;
+        cpu_mips_irq_init_cpu(cpu);
+        cpu_mips_clock_init(cpu);
+        qemu_register_reset(mt7621_cpu_reset, cpu);
+        if (i) {
+            CPU(cpu)->halted = 1;
+        }
+    }
+    s->cpu = s->cpus[0];
 
     if (getenv("MT7621_CFG1")) {
         /*
@@ -3984,7 +4126,7 @@ static void mt7621_machine_init(MachineState *machine)
      * contains 0x1fbc0000, and a later subregion wins.
      */
     s->gic = qdev_new(TYPE_MIPS_GIC);
-    qdev_prop_set_uint32(s->gic, "num-vp", 1);
+    qdev_prop_set_uint32(s->gic, "num-vp", s->ncpus);
     qdev_prop_set_uint32(s->gic, "num-irq", MT7621_GIC_NUM_IRQ);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->gic), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(s->gic), 0, MT7621_GIC_BASE);
@@ -4189,7 +4331,8 @@ static void mt7621_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = MIPS_CPU_TYPE_NAME("1004Kc");
     mc->default_ram_size = 256 * MiB;
     mc->default_ram_id = "mt7621.ram";
-    mc->max_cpus = 1;
+    mc->max_cpus = MT7621_MAX_CPUS;
+    mc->default_cpus = 4;
 }
 
 static const TypeInfo mt7621_machine_type = {
