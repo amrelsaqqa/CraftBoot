@@ -1906,6 +1906,7 @@ static void mt7621_spi_flash_run(MT7621State *s, const uint8_t *mosi,
         break;
     case 0x03:                          /* READ */
     case 0x0b: {                        /* FAST READ */
+        static int rdlog_budget = 8;
         uint32_t addr = 0;
 
         for (i = 0; i < 3 && i < nargs; i++) {
@@ -1916,6 +1917,11 @@ static void mt7621_spi_flash_run(MT7621State *s, const uint8_t *mosi,
         rx_pos = mosi[0] == 0x0b ? 5 : 4;
         for (i = 0; i < rx_len; i++) {
             miso[i] = mt7621_flash_read_byte(s, s->spi_addr++);
+        }
+        if (getenv("MT7621_SPILOG") && rdlog_budget-- > 0) {
+            fprintf(stderr, "spi: read op=%02x addr=%06x len=%d -> %02x %02x "
+                    "%02x %02x %02x %02x\n", mosi[0], addr, rx_len,
+                    miso[0], miso[1], miso[2], miso[3], miso[4], miso[5]);
         }
         break;
     }
@@ -2040,8 +2046,17 @@ static void mt7621_spi_exec(MT7621State *s)
     }
 
     if (morebuf) {
+        /*
+         * MOREBUF command bytes are packed in the OPCODE register with the
+         * first byte on the wire in the *low* byte, exactly like the legacy
+         * TRANS path below.  RouterOS 6.36 issues its status read as
+         * cmd_bits=32 with OPCODE=0x00000005 (RDSR); building this MSB-first
+         * put 0x00 on the wire, the model fell through to "unknown opcode"
+         * and returned 0xff, which stalled the yaffs mount with
+         * "raspi_wait_ready: read_sr fail: ff".
+         */
         for (i = 0; i < (int)cmd_len; i++) {
-            mosi[i] = (opcode >> (8 * (cmd_len - 1 - i))) & 0xff;
+            mosi[i] = (opcode >> (8 * i)) & 0xff;
         }
     } else {
         static const int rot[4] = { 0, 24, 16, 8 };
