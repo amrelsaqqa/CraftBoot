@@ -3411,11 +3411,13 @@ static void mt7621_reset(void *opaque)
     }
 
     /*
-     * A/B hook: the real 1004Kc advertises ULRI + CMGCR, but RouterOS 3.3.5's
-     * mmips kernel reacts to seeing a CM ("GCMP present") and then stops in
-     * early init, so make it possible to hide the CM again.
+     * The real 1004Kc advertises ULRI + CMGCR, but with them visible this
+     * model's OpenWrt guests take the MIPS CPS path and die before printing
+     * anything (openwrt 5.15: zero bytes), while RouterOS 3.3.5 is unaffected.
+     * Default to the pre-CPS view and let MT7621_CMGCR=1 (or MT7621_CFG3) opt
+     * in - MikroTik's 5.6.3 netinstall kernel needs it to find the CM/GIC.
      */
-    if (getenv("MT7621_NO_CMGCR")) {
+    if (!getenv("MT7621_CMGCR") && !getenv("MT7621_CFG3")) {
         env->CP0_Config3 &= ~((1u << 13) | (1u << 29));
     }
     if (getenv("MT7621_CFG3")) {
