@@ -101,7 +101,15 @@ typedef enum MT7621Board {
  * "ralink,mt7621-systick" 50 kHz counter on shared interrupt 5.
  */
 #define MT7621_GIC_BASE         0x1fbc0000
-#define MT7621_GIC_NUM_IRQ      256
+/*
+ * 64 shared interrupts, not an arbitrary 256.  RouterBOOT validates the
+ * GIC before it will use it: it reads GIC_SH_CONFIG and requires the
+ * NUMINTRS field (bits 23:16, which QEMU derives as num_irq / 8 - 1) to be
+ * exactly 7 -- i.e. 64 interrupts.  Our own devices only use IRQ 5 and 26,
+ * and Linux sizes the GIC from this same field, so 64 is both the hardware
+ * truth and strictly safer.
+ */
+#define MT7621_GIC_NUM_IRQ      64
 #define MT7621_UART0_IRQ        26
 #define MT7621_SYSTICK_IRQ      5
 
@@ -170,6 +178,19 @@ typedef enum MT7621Board {
 #define ETH_QDMA_INT_MASK       0x1a1c
 
 #define PDMA_RX_DONE            (1u << 30)
+/*
+ * The Linux raeth driver masks 0x0003000f in PDMA_INT_MASK: TX done for the
+ * four queues in bits 0..3 and RX done for the two RX rings in bits 16..17.
+ * RouterBOOT only polls, so these used to be missing entirely - which left
+ * Linux waiting for TX completions until NETDEV WATCHDOG fired.
+ */
+#define PDMA_TX_DONE0           (1u << 0)
+/*
+ * Note: bit 16 (RX_DONE_INT0) is deliberately left alone.  The driver polls
+ * its RX index, and raising the interrupt so early makes net_rx_action()
+ * run before the switch driver has registered its NAPI instances, so
+ * n->poll is NULL and the kernel faults with epc=0.
+ */
 #define QDMA_TX_DONE            (1u << 28)
 /*
  * TX descriptor ownership: the CPU fills a descriptor (owner bit clear) and
@@ -339,6 +360,7 @@ struct MT7621State {
      * to parse it (see mt7621_cmdline_poll()).
      */
     QEMUTimer *cmdline_timer;
+    QEMUTimer *flash_save_timer;   /* MT7621_FLASH_SAVE: periodic flash dump */
     char *cmdline_extra;
     uint32_t cmdline_cursor;
     uint32_t cmdline_phys;      /* discovered buffer address, 0 = unknown */
@@ -401,6 +423,24 @@ struct MT7621State {
 };
 
 static bool mt7621_trace;
+
+/*
+ * Boolean env knob.  These ML-style knobs used to be tested with a bare
+ * getenv(), which is true for *any* value -- including "0" -- so a launcher
+ * that always exports MT7621_FOO=0 silently turned the feature on.  Treat
+ * the usual false spellings as off.
+ */
+static bool mt7621_flag(const char *name)
+{
+    const char *v = getenv(name);
+
+    if (!v || !*v) {
+        return false;
+    }
+    return strcmp(v, "0") && strcmp(v, "no") && strcmp(v, "off") &&
+           strcmp(v, "false");
+}
+
 
 /*
  * The GPIO block lives inside the system controller.  Bits set in the
@@ -560,8 +600,17 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
      * link.  MT7621_ETH_ANYLINK reports link on every PHY, which is what
      * the tap actually represents while we model a single backend.
      */
-    up = phy && (phy == s->eth_port || getenv("MT7621_ETH_ANYLINK"));
-    if (up) {
+    if (getenv("MT7621_ETH_ANYLINK")) {
+        /*
+         * Debug/etherboot knob: claim link on every PHY (including the WAN
+         * PHY at address 0) and without the autoneg delay, so booters that
+         * probe the wrong PHY, or probe only once, still see a cable.
+         */
+        up = true;
+    } else {
+        up = phy && phy == s->eth_port;
+    }
+    if (up && !getenv("MT7621_ETH_ANYLINK")) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
         if (!s->phy_link_ns) {
@@ -769,6 +818,7 @@ static void mt7621_eth_pdma_tx(MT7621State *s)
     uint32_t cnt = s->eth_regs[ETH_PTX_MAX_CNT0 / 4];
     uint32_t ctx = s->eth_regs[ETH_PTX_CTX_IDX0 / 4];
     uint32_t idx = s->ptx_idx;
+    bool processed = false;
     uint8_t frame[2048];
     size_t flen = 0;
     unsigned fport = 0;
@@ -838,6 +888,18 @@ static void mt7621_eth_pdma_tx(MT7621State *s)
                         frame[1], frame[2], frame[3], frame[4], frame[5],
                         forward);
             }
+            {
+                static unsigned dump_budget = 16;
+                if (getenv("MT7621_ETHLOG") && dump_budget && flen > 12) {
+                    unsigned i, n = flen < 48 ? (unsigned)flen : 48;
+                    dump_budget--;
+                    fprintf(stderr, "eth: dump len=%zu:", flen);
+                    for (i = 0; i < n; i++) {
+                        fprintf(stderr, " %02x", frame[i]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
             if (forward && s->nic) {
                 qemu_send_packet(qemu_get_queue(s->nic), frame, flen);
             }
@@ -846,11 +908,28 @@ static void mt7621_eth_pdma_tx(MT7621State *s)
 
         address_space_stl_le(&address_space_memory, p + 4,
                              info2 | PTX_DDONE, MEMTXATTRS_UNSPECIFIED, NULL);
+        processed = true;
         idx = (idx + 1) % cnt;
     }
 
     s->ptx_idx = idx;
     s->eth_regs[ETH_PTX_DTX_IDX0 / 4] = idx;
+    /*
+     * Tell the driver that the descriptors it handed us are free again.
+     * Linux masks TX_DONE_INT0 and reclaims in its interrupt handler; with
+     * no interrupt every queue fills up to max_tx_buffers_per_port and the
+     * stack times out, restarts the switch and retries forever.
+     */
+    /*
+     * Only report completions once the guest has enabled PDMA interrupts.
+     * RouterBOOT polls PDMA_INT_STATUS without ever setting the mask, and an
+     * unexpected status bit wedges its TFTP state machine (the transfer
+     * crawls through 1400 retries instead of completing).
+     */
+    if (processed && s->eth_regs[ETH_PDMA_INT_MASK / 4]) {
+        s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_TX_DONE0;
+        mt7621_eth_update_irq(s);
+    }
     if (getenv("MT7621_ETHLOG")) {
         fprintf(stderr, "eth: ptx done idx=%u ctx=%u\n", idx, ctx);
     }
@@ -2596,23 +2675,42 @@ static const MemoryRegionOps mt7621_systick_ops = {
 /* The CM/CPC block is 64 KiB, so it needs a wider index than mt7621_reg_ops. */
 static uint64_t mt7621_cm_read(void *opaque, hwaddr addr, unsigned size)
 {
-    uint32_t *regs = opaque;
+    MT7621State *s = opaque;
+    uint32_t *regs = s->cm_regs;
+    uint32_t off = addr & (MT7621_CM_SIZE - 1);
     uint32_t val;
 
     /*
-     * Breed releases every core through GCR_CL_OTHER and then polls
-     * GCR_CO_COHERENCE until the core reports in.  We only model CPU0
-     * (QEMU has no MT VPEs), so always report the domain as coherent.
+     * COCB+0x8 is aliased, and both aliases are polled during bring-up:
+     *
+     *   0x4008  CPC_CO_STAT_CONF - what Linux polls; CPC base is 0x1fbf0000
+     *   0xc008  GCR_CO_COHERENCE - what RouterBOOT polls (GCR at 0x1fbf8000)
+     *
+     * Report the core as coherent (bit 0) and in sequence state U6
+     * (bits 22:19 == 7), the "coherent execution" state cps_smp_setup() /
+     * boot_core() waits for before it considers a secondary core started.
      */
-    if ((addr & (MT7621_CM_SIZE - 1)) == MT7621_GCR_OFF + 0x4008) {
-        val = 1;
+    if (off == 0x4008 || off == MT7621_GCR_OFF + 0x4008) {
+        val = 0x00380001;
     } else {
-        val = regs[(addr & (MT7621_CM_SIZE - 1)) >> 2];
+        val = regs[off >> 2];
     }
 
     if (mt7621_trace) {
         qemu_log_mask(LOG_UNIMP, "mt7621: cm read  %08" HWADDR_PRIx
                       " -> %08x\n", addr, val);
+    }
+    /*
+     * MT7621_CMLOG traces the registers the firmware/kernel actually use.
+     * RouterBOOT takes a catastrophic path as soon as GCR_GIC_STATUS.EX is
+     * set, so this tells us who read it and from where.
+     */
+    if (mt7621_flag("MT7621_CMLOG") &&
+        (off == MT7621_GCR_OFF + GCR_GIC_STATUS ||
+         off == MT7621_GCR_OFF + GCR_GIC_BASE ||
+         off == MT7621_GCR_OFF + GCR_CONFIG)) {
+        fprintf(stderr, "mt7621: cm read %04x pc=%08x -> %08x\n", off,
+                s->cpu ? (uint32_t)s->cpu->env.active_tc.PC : 0, val);
     }
     return val;
 }
@@ -2620,7 +2718,8 @@ static uint64_t mt7621_cm_read(void *opaque, hwaddr addr, unsigned size)
 static void mt7621_cm_write(void *opaque, hwaddr addr, uint64_t val,
                             unsigned size)
 {
-    uint32_t *regs = opaque;
+    MT7621State *s = opaque;
+    uint32_t *regs = s->cm_regs;
 
     if (mt7621_trace) {
         qemu_log_mask(LOG_UNIMP, "mt7621: cm write %08" HWADDR_PRIx
@@ -2767,6 +2866,30 @@ static ssize_t mt7621_flash_pread(MT7621State *s, int fd, uint64_t off,
 }
 
 /*
+ * MT7621_FLASH_SAVE=<path> keeps a copy of the (writable) NOR buffer on disk
+ * while the guest runs.  The memory window only exposes the first 4 MiB, so
+ * pmemsave cannot reach the rest; netinstall writes the whole 16 MiB.
+ */
+static void mt7621_flash_save_cb(void *opaque)
+{
+    MT7621State *s = opaque;
+    const char *path = getenv("MT7621_FLASH_SAVE");
+    int fd;
+
+    if (path && s->flash) {
+        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
+        if (fd >= 0) {
+            if (write(fd, s->flash, s->flash_size) != (ssize_t)s->flash_size) {
+                error_report("mt7621: short write saving %s", path);
+            }
+            close(fd);
+        }
+    }
+    timer_mod(s->flash_save_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
+}
+
+/*
  * SPI NOR boards boot from a memory-mapped flash: the BootROM maps the
  * first 4 MiB at 0x1fc00000 and enters at 0xbfc00000.  There is no RAM
  * load and no uImage header; RouterBOOT's own stage-1 header jumps into
@@ -2811,6 +2934,13 @@ static void mt7621_nor_load(MT7621State *s, const char *filename)
      */
     memory_region_add_subregion(get_system_memory(), MT7621_SPI_FLASH_BASE,
                                 &s->flash_mr);
+
+    if (getenv("MT7621_FLASH_SAVE")) {
+        s->flash_save_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                          mt7621_flash_save_cb, s);
+        timer_mod(s->flash_save_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
+    }
 
     s->entry = MT7621_SPI_FLASH_BASE | 0xa0000000;   /* KSEG1 0xbfc00000 */
     printf("mt7621: SPI NOR %0.1f MiB mapped at 0x%08x, entry 0x%08x\n",
@@ -3121,6 +3251,28 @@ static void mt7621_cm_defaults(MT7621State *s)
      */
     s->cm_regs[(MT7621_GCR_OFF + GCR_GIC_STATUS) / 4] = 0x00000000;
     s->cm_regs[(MT7621_GCR_OFF + GCR_CPC_STATUS) / 4] = 0x00000001;
+
+    /*
+     * MT7621_CMGIC advertises the (legacy) GIC through the CM, which is
+     * what Linux 5.6's mips_cps_init() insists on before it registers its
+     * SMP ops: without CM_GCR_GIC_STATUS.EX it prints "MIPS CPS SMP unable
+     * to proceed without a GIC", leaves mp_ops NULL and dies on the first
+     * indirect call through them.  Off by default because RouterBOOT itself
+     * jumps through a bogus pointer as soon as the GIC is advertised.
+     */
+    if (mt7621_flag("MT7621_CMGIC")) {
+        s->cm_regs[(MT7621_GCR_OFF + GCR_GIC_STATUS) / 4] = 0x00000001;
+        s->cm_regs[(MT7621_GCR_OFF + GCR_GIC_BASE) / 4] =
+            (MT7621_GIC_BASE & 0x3fff8000) | 0x1;
+    }
+    /*
+     * MT7621_UP=1 reports a single core (no secondary bring-up).  PCORES is
+     * "cores minus one" (mips_cps_numcores() adds one back), so a single
+     * core is 0, not 1.
+     */
+    if (mt7621_flag("MT7621_UP")) {
+        s->cm_regs[(MT7621_GCR_OFF + GCR_CONFIG) / 4] = 0x00000000;
+    }
 }
 
 static void mt7621_dramc_defaults(MT7621State *s)
@@ -3593,16 +3745,12 @@ static void mt7621_apply_board(MT7621State *s, const char *filename)
     }
 
     /*
-     * RouterOS 3.3.5 derives its cache flush strategy from Config1.  The
-     * 1004Kc model's default geometry makes flush_icache_range take the
-     * "range larger than the cache" path, which calls a r4k_blast_*()
-     * pointer that this firmware never installs, so the kernel jumps to
-     * 0 during cache init.  These fields (4-way, 32-byte lines, 256
-     * sets) keep it on the per-line path.
+     * Cache geometry lives in the 1004Kc model (cpu-defs.c.inc): 32 KiB,
+     * 4-way, 32-byte lines.  Firmware and Linux both derive their flush
+     * strategy from it, and Linux only installs r4k_blast_icache/dcache for
+     * line sizes 16/32/64/128, so it must stay plausible.  MT7621_CFG1 can
+     * still override the descriptor bits for experiments.
      */
-    if (s->board == MT7621_BOARD_RB750GR3) {
-        s->cfg1_cache_fields = 0xd2d2;
-    }
 }
 
 static void mt7621_machine_init(MachineState *machine)
@@ -3632,10 +3780,15 @@ static void mt7621_machine_init(MachineState *machine)
     cpu_mips_clock_init(s->cpu);
 
     if (getenv("MT7621_CFG1")) {
-        s->cfg1_cache_fields = strtoul(getenv("MT7621_CFG1"), NULL, 0) & 0xffff;
+        /*
+         * Only the cache descriptor bits (Ds/Dl/Da at 15:7).  Masking the
+         * whole low half would also clobber the feature bits, in particular
+         * Config1.FP, and hide the FPU from the guest.
+         */
+        s->cfg1_cache_fields = strtoul(getenv("MT7621_CFG1"), NULL, 0) & 0xff80;
     }
     if (s->cfg1_cache_fields) {
-        s->cpu->env.CP0_Config1 = (s->cpu->env.CP0_Config1 & ~0xffffu) |
+        s->cpu->env.CP0_Config1 = (s->cpu->env.CP0_Config1 & ~0xff80u) |
                                   s->cfg1_cache_fields;
     }
     qemu_register_reset(mt7621_reset, s);
@@ -3859,7 +4012,7 @@ static void mt7621_machine_init(MachineState *machine)
 
     /* Coherence manager + cluster power controller */
     mt7621_cm_defaults(s);
-    memory_region_init_io(&s->cm, NULL, &mt7621_cm_ops, s->cm_regs,
+    memory_region_init_io(&s->cm, NULL, &mt7621_cm_ops, s,
                           "mt7621.cm", MT7621_CM_SIZE);
     memory_region_add_subregion(sysmem, MT7621_CM_BASE, &s->cm);
 
