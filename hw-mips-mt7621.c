@@ -3407,6 +3407,18 @@ static void mt7621_reset(void *opaque)
                 env->active_tc.PC, env->active_tc.gpr[31]);
     }
 
+    /*
+     * A/B hook: the real 1004Kc advertises ULRI + CMGCR, but RouterOS 3.3.5's
+     * mmips kernel reacts to seeing a CM ("GCMP present") and then stops in
+     * early init, so make it possible to hide the CM again.
+     */
+    if (getenv("MT7621_NO_CMGCR")) {
+        env->CP0_Config3 &= ~((1u << 13) | (1u << 29));
+    }
+    if (getenv("MT7621_CFG3")) {
+        env->CP0_Config3 = strtoul(getenv("MT7621_CFG3"), NULL, 0);
+    }
+
     if (s->wdt_timer) {
         timer_del(s->wdt_timer);
     }
