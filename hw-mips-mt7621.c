@@ -2469,6 +2469,9 @@ static uint32_t mt7621_systick_count(MT7621State *s, int64_t now)
 static void mt7621_systick_set_pending(MT7621State *s, bool pending)
 {
     s->systick_pending = pending;
+    if (getenv("MT7621_NO_SYSTICK")) {
+        return;                     /* bring-up probe: no GIC input at all */
+    }
     qemu_set_irq(s->systick_irq, pending);
 }
 
