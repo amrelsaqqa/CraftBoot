@@ -3469,10 +3469,30 @@ static void mt7621_reset(void *opaque)
         }
     }
     if (s->elf_kernel) {
-        env->active_tc.gpr[4] = s->elf_argc;
-        env->active_tc.gpr[5] = s->elf_argv;
-        env->active_tc.gpr[6] = 0;
-        env->active_tc.gpr[7] = 0;
+        uint32_t a0 = s->elf_argc, a1 = s->elf_argv, a2 = 0, a3 = 0;
+        const char *ov;
+
+        /*
+         * Some bootloaders (MikroTik's, for the RouterOS kernel) use the
+         * VxWorks-style convention where a0 == -2 marks a1 as the boot
+         * argument block; the kernel only records that pointer in that case.
+         */
+        if ((ov = getenv("MT7621_ELF_A0")) != NULL) {
+            a0 = strtoul(ov, NULL, 0);
+        }
+        if ((ov = getenv("MT7621_ELF_A1")) != NULL) {
+            a1 = strtoul(ov, NULL, 0);
+        }
+        if ((ov = getenv("MT7621_ELF_A2")) != NULL) {
+            a2 = strtoul(ov, NULL, 0);
+        }
+        if ((ov = getenv("MT7621_ELF_A3")) != NULL) {
+            a3 = strtoul(ov, NULL, 0);
+        }
+        env->active_tc.gpr[4] = a0;
+        env->active_tc.gpr[5] = a1;
+        env->active_tc.gpr[6] = a2;
+        env->active_tc.gpr[7] = a3;
     }
 
     /*
