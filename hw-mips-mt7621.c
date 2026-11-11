@@ -364,6 +364,11 @@ struct MT7621State {
     /* systick state: count = base + elapsed, anchored at base_ns */
     QEMUTimer *poweroff_timer;  /* detects a parked CPU (poweroff/halt) */
     QEMUTimer *nitest_timer;    /* MT7621_NITEST: synthetic RX probes */
+    QEMUTimer *cp_timer;        /* MT7621_CP_*: guest code patcher */
+    QEMUTimer *ramdump_timer;   /* MT7621_RAMDUMP=<ms>:<path> */
+    QEMUTimer *ramwin_timer;    /* MT7621_RAMWIN=first:step:count:start:len:prefix */
+    unsigned ramwin_n;
+    bool cp_done;
     unsigned halt_ticks;
     bool halt_seen_running;
 
@@ -592,6 +597,7 @@ static bool mt7621_tx_strip_tag(MT7621State *s, uint8_t *f, size_t *plen)
 }
 
 static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q);
+static void mt7621_ni_dump(const char *dir, const uint8_t *f, size_t len);
 
 /*
  * MT7530 behind the MDIO bus: Linux talks to it through PHY address 0x1f
@@ -975,6 +981,15 @@ static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q)
                     fprintf(stderr, "\n");
                 }
             }
+            if (getenv("MT7621_NILOG")) {
+                fprintf(stderr, "eth: txn len=%zu fport=%u b12=%02x%02x%02x%02x "
+                        "dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                        flen, fport, frame[12], frame[13], frame[14], frame[15],
+                        frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]);
+            }
+            if (forward) {
+                mt7621_ni_dump("tx", frame, flen);
+            }
             if (forward && s->nic) {
                 qemu_send_packet(qemu_get_queue(s->nic), frame, flen);
             }
@@ -1160,7 +1175,13 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
         }
         memcpy(tagged, buf, 12);
         tagged[12] = 0x00;                /* untagged special tag */
-        tagged[13] = s->eth_port & 0x3f;  /* source port */
+        /*
+         * Byte 13 of the special tag is the source port number in its low
+         * three bits: switch.ko masks it with 0x7 before indexing its port
+         * table, so a bitmap value of 1<<4 lands on port 0 (eth0) and the
+         * agent's per-interface sockets never see their own frames.
+         */
+        tagged[13] = s->eth_port & 0x7;  /* source port */
         tagged[14] = 0x00;
         tagged[15] = 0x00;
         memcpy(tagged + 16, buf + 12, len - 12);
@@ -1201,7 +1222,8 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
                          tagged_mode ? (5u << 18) : (1u << RX_DMA_FPORT_SHIFT),
                          MEMTXATTRS_UNSPECIFIED, NULL);
     address_space_stl_le(&address_space_memory, desc + 4,
-                         RX_DMA_DONE | RX_DMA_PLEN0(flen),
+                         RX_DMA_DONE | RX_DMA_PLEN0(flen) |
+                         (getenv("MT7621_RX_LSO") ? (1u << 30) : 0),
                          MEMTXATTRS_UNSPECIFIED, NULL);
 
     s->rx_drx_idx = (idx + 1) % cnt;
@@ -1341,6 +1363,186 @@ static void mt7621_nitest_tick(void *opaque)
         timer_mod(s->nitest_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2000);
     }
+}
+
+/*
+ * MT7621_CP_SIG / MT7621_CP_PATCH: debug-only guest code patcher.
+ *
+ * Finds a hex signature in guest RAM (the agent's /init is unpacked into a
+ * ramfs, so its text is an ordinary page-cache page) and overwrites words at
+ * fixed deltas from the match.  Used to neutralise one branch at a time in
+ * the netinstall discovery responder and see which condition produces the
+ * NACK it answers with.
+ */
+static int mt7621_hexval(int c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+static void mt7621_cp_apply(MT7621State *s, hwaddr at)
+{
+    const char *p = getenv("MT7621_CP_PATCH");
+    char buf[256];
+
+    if (!p || strlen(p) >= sizeof(buf)) {
+        return;
+    }
+    strcpy(buf, p);
+    for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+        unsigned long delta, word;
+
+        if (sscanf(tok, "%li:%li", &delta, &word) != 2) {
+            continue;
+        }
+        address_space_stl_le(&address_space_memory, at + delta, (uint32_t)word,
+                             MEMTXATTRS_UNSPECIFIED, NULL);
+        fprintf(stderr, "cp: patched %08" HWADDR_PRIx " <- %08lx\n",
+                at + delta, word);
+    }
+}
+
+static void mt7621_cp_tick(void *opaque)
+{
+    MT7621State *s = opaque;
+    const char *sig_hex = getenv("MT7621_CP_SIG");
+    uint8_t sig[16];
+    unsigned siglen = 0, i;
+    static uint8_t chunk[4 << 20];
+    hwaddr base;
+
+    if (s->cp_done || !sig_hex) {
+        return;
+    }
+    for (i = 0; sig_hex[i] && sig_hex[i + 1] && siglen < sizeof(sig); i += 2) {
+        int hi = mt7621_hexval(sig_hex[i]);
+        int lo = mt7621_hexval(sig_hex[i + 1]);
+
+        if (hi < 0 || lo < 0) {
+            break;
+        }
+        sig[siglen++] = (hi << 4) | lo;
+    }
+    if (siglen < 4) {
+        s->cp_done = true;
+        return;
+    }
+    for (base = 0; base + sizeof(chunk) <= 0x10000000;
+         base += sizeof(chunk) - sizeof(sig)) {
+        uint8_t *hit;
+
+        address_space_read(&address_space_memory, base,
+                           MEMTXATTRS_UNSPECIFIED, chunk, sizeof(chunk));
+        hit = memmem(chunk, sizeof(chunk), sig, siglen);
+        if (hit) {
+            hwaddr at = base + (hit - chunk);
+
+            fprintf(stderr, "cp: signature at %08" HWADDR_PRIx "\n", at);
+            mt7621_cp_apply(s, at);
+            s->cp_done = true;
+            return;
+        }
+    }
+    timer_mod(s->cp_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2000);
+}
+
+/*
+ * MT7621_RAMDUMP=<ms>:<path> - one-shot dump of guest RAM, so runtime state
+ * can be inspected without the monitor (its unix socket does not survive).
+ */
+static void mt7621_ramdump(void *opaque)
+{
+    const char *spec = getenv("MT7621_RAMDUMP");
+    char *copy, *colon, *path;
+    static uint8_t buf[1 << 20];
+    hwaddr a;
+    FILE *f;
+
+    if (!spec) {
+        return;
+    }
+    copy = g_strdup(spec);
+    colon = strchr(copy, ':');
+    if (!colon) {
+        g_free(copy);
+        return;
+    }
+    *colon = 0;
+    path = colon + 1;
+    f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "ramdump: cannot open %s\n", path);
+        g_free(copy);
+        return;
+    }
+    for (a = 0; a < 0x10000000; a += sizeof(buf)) {
+        address_space_read(&address_space_memory, a, MEMTXATTRS_UNSPECIFIED,
+                           buf, sizeof(buf));
+        fwrite(buf, 1, sizeof(buf), f);
+    }
+    fclose(f);
+    fprintf(stderr, "ramdump: wrote %s\n", path);
+    g_free(copy);
+}
+
+/*
+ * MT7621_RAMWIN=first_ms:step_ms:count:start_hex:len_hex:prefix - dump a
+ * window of guest RAM a few times in a row (prefix.N), for state that only
+ * exists briefly during startup.
+ */
+static void mt7621_ramwin(void *opaque)
+{
+    MT7621State *s = opaque;
+    const char *spec = getenv("MT7621_RAMWIN");
+    char *copy, *tok, *save = NULL;
+    long first, step, count, start, len;
+    char *prefix;
+    char path[256];
+    static uint8_t buf[1 << 20];
+    FILE *f;
+    hwaddr a;
+
+    if (!spec || s->ramwin_n >= 1000) {
+        return;
+    }
+    copy = g_strdup(spec);
+    tok = strtok_r(copy, ":", &save);
+    first = tok ? strtol(tok, NULL, 0) : 0;
+    (void)first;
+    tok = strtok_r(NULL, ":", &save); step = tok ? strtol(tok, NULL, 0) : 1000;
+    tok = strtok_r(NULL, ":", &save); count = tok ? strtol(tok, NULL, 0) : 0;
+    tok = strtok_r(NULL, ":", &save); start = tok ? strtol(tok, NULL, 16) : 0;
+    tok = strtok_r(NULL, ":", &save); len = tok ? strtol(tok, NULL, 16) : 0;
+    tok = strtok_r(NULL, ":", &save); prefix = tok;
+    if (!prefix || len <= 0 || len > (long)sizeof(buf) || count <= 0) {
+        g_free(copy);
+        return;
+    }
+    snprintf(path, sizeof(path), "%s.%u", prefix, s->ramwin_n);
+    f = fopen(path, "wb");
+    if (f) {
+        for (a = start; a < (hwaddr)(start + len); a += 4096) {
+            address_space_read(&address_space_memory, a,
+                               MEMTXATTRS_UNSPECIFIED, buf, 4096);
+            fwrite(buf, 1, 4096, f);
+        }
+        fclose(f);
+    }
+    s->ramwin_n++;
+    timer_mod(s->ramwin_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + step);
+    if (s->ramwin_n >= (unsigned)count) {
+        fprintf(stderr, "ramwin: %u windows written\n", s->ramwin_n);
+    }
+    g_free(copy);
 }
 
 static void mt7621_eth_cleanup(NetClientState *nc)
@@ -1988,6 +2190,22 @@ static const MemoryRegionOps mt7621_wdt_ops = {
 
 static const uint8_t mt7621_spi_id[3] = { 0xef, 0x40, 0x18 };
 
+/* MT7621_SPI_JEDEC=0xef4018: override the RDID bytes (identity probing). */
+static void mt7621_spi_jedec(uint8_t out[3])
+{
+    const char *p = getenv("MT7621_SPI_JEDEC");
+    unsigned long v;
+
+    memcpy(out, mt7621_spi_id, 3);
+    if (!p) {
+        return;
+    }
+    v = strtoul(p, NULL, 0);
+    out[0] = (v >> 16) & 0xff;
+    out[1] = (v >> 8) & 0xff;
+    out[2] = v & 0xff;
+}
+
 static uint8_t mt7621_flash_read_byte(MT7621State *s, uint32_t addr)
 {
     if (s->flash && addr < s->flash_size) {
@@ -2002,7 +2220,17 @@ static void mt7621_flash_write_bytes(MT7621State *s, uint32_t addr,
     int i;
 
     if (!s->flash) {
+        if (getenv("MT7621_WRLOG")) {
+            fprintf(stderr, "spi: WR helper called with s->flash == NULL "
+                    "(addr=%06x len=%d)\n", addr, len);
+        }
         return;
+    }
+    if (getenv("MT7621_WRLOG")) {
+        uint8_t before = addr < s->flash_size ? s->flash[addr] : 0xee;
+        fprintf(stderr, "spi: WR helper addr=%06x len=%d flash_size=%06llx "
+                "before=%02x\n", addr, len,
+                (unsigned long long)s->flash_size, before);
     }
     for (i = 0; i < len; i++) {
         if (addr + i < s->flash_size) {
@@ -2015,6 +2243,12 @@ static void mt7621_flash_erase(MT7621State *s, uint32_t addr, uint32_t len)
 {
     uint32_t start = addr & ~(len - 1);
 
+    if (getenv("MT7621_WRLOG")) {
+        fprintf(stderr, "spi: ER helper addr=%06x len=%06x -> start=%06x "
+                "flash=%p size=%06llx inrange=%d\n", addr, len, start,
+                (void *)s->flash, (unsigned long long)s->flash_size,
+                !!(s->flash && start + len <= s->flash_size));
+    }
     if (s->flash && start + len <= s->flash_size) {
         memset(s->flash + start, 0xff, len);
     }
@@ -2025,6 +2259,9 @@ static void mt7621_flash_erase(MT7621State *s, uint32_t addr, uint32_t len)
  * the chip returns.  bytes_out is advanced only for the RX phase (bytes
  * after cmd_len), which is what the controller captures into the FIFO.
  */
+/* Diagnostics: log every flash *modifying* SPI transaction. */
+static int mt7621_wrlog_budget = 5000;
+
 static void mt7621_spi_flash_run(MT7621State *s, const uint8_t *mosi,
                                  int n, int cmd_len, uint8_t *miso, int rx_len)
 {
@@ -2060,13 +2297,42 @@ static void mt7621_spi_flash_run(MT7621State *s, const uint8_t *mosi,
         args[nargs++] = mosi[i];
     }
 
+    if (getenv("MT7621_WRLOG") && mt7621_wrlog_budget-- > 0) {
+        /* Everything that is not a plain read/ID/status query is interesting:
+         * those are the paths that modify the device. */
+        switch (mosi[0]) {
+        case 0x03: case 0x0b: case 0xeb: case 0x05: case 0x35:
+        case 0x9f: case 0x4b: case 0x90: case 0xab:
+            break;
+        default:
+            fprintf(stderr, "spi: OP op=%02x n=%d cmd=%d rx=%d bytes=",
+                    mosi[0], n, cmd_len, rx_len);
+            for (i = 0; i < n; i++) {
+                fprintf(stderr, "%02x", mosi[i]);
+            }
+            fprintf(stderr, "\n");
+            break;
+        }
+    }
+
     switch (mosi[0]) {
     case 0x9f:                          /* RDID */
+    {
+        uint8_t id[3];
+
+        mt7621_spi_jedec(id);
         s->spi_read_mode = false;
-        for (i = 0; i < rx_len; i++) {
-            miso[i] = i < 3 ? mt7621_spi_id[i] : 0xff;
+        /*
+         * RouterBOOT reads the JEDEC ID as a 32-bit word and compares the
+         * whole thing against the table entry 0x001840ef (ef 40 18), so the
+         * fourth byte has to be zero - not 0xff - or the booter decides the
+         * chip is unknown and disables flash programming.
+         */
+        for (i = 0; i < (int)rx_len; i++) {
+            miso[i] = i < 3 ? id[i] : 0x00;
         }
         break;
+    }
     case 0x4b:                          /* RDUID (Winbond): 64-bit UID */
         /*
          * flash_get_uid() reads nine bytes - one dummy followed by the ID -
@@ -2215,12 +2481,17 @@ static void mt7621_spi_exec(MT7621State *s)
          *
          * so the wire order is opcode first, then the address MSB first.
          */
+        /*
+         * TRANS[3:0] is the *total* number of bytes shifted out: the
+         * command word (up to 4 bytes) plus any data bytes that follow it
+         * from the FIFO.  Page program issues 8 (02 + 3 address bytes +
+         * the 4 payload bytes stashed in DATA0), while one-byte commands
+         * such as WREN use 1 and plain reads use 4.
+         */
         cmd_len = trans & 0xf;
-        mosi_len = 0;
+        mosi_len = cmd_len > 4 ? cmd_len - 4 : 0;
+        cmd_len = cmd_len > 4 ? 4 : cmd_len;
         rx_len = (trans >> 4) & 0xf;
-    }
-    if (cmd_len > 4) {
-        cmd_len = 4;
     }
     if (getenv("MT7621_SPISTAT")) {
         static unsigned long long tx;
@@ -2351,6 +2622,14 @@ static void mt7621_spi_write(void *opaque, hwaddr addr, uint64_t val,
          off == SPI_MOREBUF || off == SPI_POLAR)) {
         fprintf(stderr, "spi: reg %03x <- %08x\n",
                 (unsigned)off, (uint32_t)val);
+    }
+    if (getenv("MT7621_SPIREG")) {
+        static int spireg_budget = 200000;
+        if (spireg_budget-- > 0) {
+            fprintf(stderr, "spi: REG %03x <- %08x (pc=%08x)\n",
+                    (unsigned)off, (uint32_t)val,
+                    (unsigned)s->pc_hist[(s->pc_hist_idx - 1) % PC_HIST]);
+        }
     }
     if (off < 0x04) {
         s->spi_regs[off / 4] = val;
@@ -3724,7 +4003,7 @@ static void mt7621_poweroff_poll(void *opaque)
     if (getenv("MT7621_ENTRYLOG") && !s->entry_logged && s->cpu) {
         uint32_t pc = env->active_tc.PC;
 
-        if (pc >= 0x80b80000 && pc < 0x81100000) {
+        if (pc >= 0x80600000 && pc < 0x81000000) {
             int i;
 
             s->entry_logged = true;
@@ -4247,6 +4526,30 @@ static void mt7621_machine_init(MachineState *machine)
         mips_gictimer_set_freq(875 * 1000 * 1000);
     }
 
+
+    if (getenv("MT7621_RAMWIN")) {
+        const char *spec = getenv("MT7621_RAMWIN");
+        long first = strtol(spec, NULL, 0);
+
+        s->ramwin_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, mt7621_ramwin, s);
+        timer_mod(s->ramwin_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + first);
+    }
+
+    if (getenv("MT7621_RAMDUMP")) {
+        const char *spec = getenv("MT7621_RAMDUMP");
+        long ms = strtol(spec, NULL, 0);
+
+        s->ramdump_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, mt7621_ramdump, s);
+        timer_mod(s->ramdump_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + ms);
+    }
+
+    if (getenv("MT7621_CP_SIG")) {
+        s->cp_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, mt7621_cp_tick, s);
+        timer_mod(s->cp_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 8000);
+    }
 
     if (getenv("MT7621_NITEST")) {
         s->nitest_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
