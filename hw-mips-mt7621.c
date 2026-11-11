@@ -27,6 +27,7 @@
 #include "hw/irq.h"
 #include "hw/loader.h"
 #include "hw/mips/mips.h"
+#include "accel/tcg/cpu-ldst.h"
 #include "hw/qdev-clock.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
@@ -247,6 +248,8 @@ typedef enum MT7621Board {
 
 #define MT7621_UART_CLOCK       50000000
 #define MT7621_UART_BAUD_BASE   (MT7621_UART_CLOCK / 16)
+#define MT7621_UART1_OFF        0x00000e00
+#define MT7621_UART1_IRQ        27
 
 /* sysctl register offsets we care about */
 #define SYS_CHIP_NAME0          0x00
@@ -299,6 +302,9 @@ struct MT7621State {
     MemoryRegion rstctl;
     MemoryRegion wdt;
     MemoryRegion systick;
+    MemoryRegion uart1;            /* TX-only mirror of uartlite@e00 */
+    MemoryRegion crypto;           /* EIP-93 window at crypto@1e004000 */
+    uint32_t crypto_regs[0x800 / 4];   /* EIP-93 register file */
     MemoryRegion dramc;
     MemoryRegion nfi;
     MemoryRegion sram;            /* unused, kept for layout stability */
@@ -1061,7 +1067,13 @@ static void mt7621_ni_dump(const char *dir, const uint8_t *f, size_t len)
     if (sport != 5000 && dport != 5000 && sport != 59813 && dport != 59813) {
         return;
     }
-    fprintf(stderr, "eth: ni-%s len=%zu sport=%u dport=%u:", dir, len, sport, dport);
+    fprintf(stderr, "eth: ni-%s len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x "
+            "src=%02x:%02x:%02x:%02x:%02x:%02x ip=%u.%u.%u.%u->%u.%u.%u.%u "
+            "sport=%u dport=%u:", dir, len,
+            f[0], f[1], f[2], f[3], f[4], f[5],
+            f[6], f[7], f[8], f[9], f[10], f[11],
+            f[26], f[27], f[28], f[29], f[30], f[31], f[32], f[33],
+            sport, dport);
     for (i = 42; i < len && i < 242; i++) {
         fprintf(stderr, " %02x", f[i]);
     }
@@ -1074,6 +1086,44 @@ static void mt7621_ni_dump(const char *dir, const uint8_t *f, size_t len)
 
 static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
 {
+    /*
+     * MT7621_NIMACFIX=1: netinstall-cli's protocol frames carry a zero server
+     * MAC in the payload (bytes 0..5 after the UDP header).  7.15's client
+     * printed "Found server at 00:00:00:00:00:00" and carried on; 7.24.6's
+     * client silently ignores such offers and waits forever.  Fill the field
+     * with the frame's real Ethernet source MAC to test that theory.
+     */
+    uint8_t nimacfix_buf[1600];
+    if (mt7621_flag("MT7621_NIMACFIX") && len >= 48 && len <= sizeof(nimacfix_buf)) {
+        unsigned sp, dp, i;
+        bool zero = true;
+
+        memcpy(nimacfix_buf, buf, len);
+        if (nimacfix_buf[12] == 0x08 && nimacfix_buf[13] == 0x00 &&
+            nimacfix_buf[23] == 0x11) {
+            sp = (nimacfix_buf[34] << 8) | nimacfix_buf[35];
+            dp = (nimacfix_buf[36] << 8) | nimacfix_buf[37];
+            if (sp == 5000 || dp == 5000 || sp == 59813 || dp == 59813) {
+                for (i = 42; i < 48; i++) {
+                    if (nimacfix_buf[i]) {
+                        zero = false;
+                    }
+                }
+                if (zero) {
+                    memcpy(nimacfix_buf + 42, nimacfix_buf + 6, 6);
+                    if (getenv("MT7621_NILOG")) {
+                        fprintf(stderr, "nimacfix: server MAC %02x:%02x:%02x:"
+                                "%02x:%02x:%02x filled in\n",
+                                nimacfix_buf[6], nimacfix_buf[7],
+                                nimacfix_buf[8], nimacfix_buf[9],
+                                nimacfix_buf[10], nimacfix_buf[11]);
+                    }
+                }
+            }
+        }
+        buf = nimacfix_buf;
+    }
+
     mt7621_ni_dump("rx", buf, len);
 
     uint32_t base = s->eth_regs[ETH_PRX_BASE_PTR0 / 4];
@@ -2227,10 +2277,26 @@ static void mt7621_flash_write_bytes(MT7621State *s, uint32_t addr,
         return;
     }
     if (getenv("MT7621_WRLOG")) {
+        static int prog_budget = 16;
+        int dirty = 0;
         uint8_t before = addr < s->flash_size ? s->flash[addr] : 0xee;
-        fprintf(stderr, "spi: WR helper addr=%06x len=%d flash_size=%06llx "
-                "before=%02x\n", addr, len,
-                (unsigned long long)s->flash_size, before);
+
+        if (addr < s->flash_size) {
+            for (i = 0; i < len; i++) {
+                if (s->flash[addr + i] != 0xff) {
+                    dirty++;
+                }
+            }
+        }
+        if (dirty && prog_budget-- > 0) {
+            fprintf(stderr, "spi: PROG-NONERASED addr=%06x len=%d dirty=%d "
+                    "first=%02x\n", addr, len, dirty, before);
+        } else if (prog_budget == 16) {
+            fprintf(stderr, "spi: WR helper addr=%06x len=%d flash_size=%06llx "
+                    "before=%02x\n", addr, len,
+                    (unsigned long long)s->flash_size, before);
+            prog_budget--;
+        }
     }
     for (i = 0; i < len; i++) {
         if (addr + i < s->flash_size) {
@@ -2260,7 +2326,7 @@ static void mt7621_flash_erase(MT7621State *s, uint32_t addr, uint32_t len)
  * after cmd_len), which is what the controller captures into the FIFO.
  */
 /* Diagnostics: log every flash *modifying* SPI transaction. */
-static int mt7621_wrlog_budget = 5000;
+static int mt7621_wrlog_budget = 40000;
 
 static void mt7621_spi_flash_run(MT7621State *s, const uint8_t *mosi,
                                  int n, int cmd_len, uint8_t *miso, int rx_len)
@@ -2297,20 +2363,23 @@ static void mt7621_spi_flash_run(MT7621State *s, const uint8_t *mosi,
         args[nargs++] = mosi[i];
     }
 
-    if (getenv("MT7621_WRLOG") && mt7621_wrlog_budget-- > 0) {
+    if (getenv("MT7621_WRLOG")) {
         /* Everything that is not a plain read/ID/status query is interesting:
-         * those are the paths that modify the device. */
+         * those are the paths that modify the device.  Only *logged* ops
+         * consume the budget, otherwise the boot's reads eat it. */
         switch (mosi[0]) {
         case 0x03: case 0x0b: case 0xeb: case 0x05: case 0x35:
         case 0x9f: case 0x4b: case 0x90: case 0xab:
             break;
         default:
-            fprintf(stderr, "spi: OP op=%02x n=%d cmd=%d rx=%d bytes=",
-                    mosi[0], n, cmd_len, rx_len);
-            for (i = 0; i < n; i++) {
-                fprintf(stderr, "%02x", mosi[i]);
+            if (mt7621_wrlog_budget-- > 0) {
+                fprintf(stderr, "spi: OP op=%02x n=%d cmd=%d rx=%d bytes=",
+                        mosi[0], n, cmd_len, rx_len);
+                for (i = 0; i < n; i++) {
+                    fprintf(stderr, "%02x", mosi[i]);
+                }
+                fprintf(stderr, "\n");
             }
-            fprintf(stderr, "\n");
             break;
         }
     }
@@ -2381,6 +2450,16 @@ static void mt7621_spi_flash_run(MT7621State *s, const uint8_t *mosi,
             fprintf(stderr, "spi: read op=%02x addr=%06x len=%d -> %02x %02x "
                     "%02x %02x %02x %02x\n", mosi[0], addr, rx_len,
                     miso[0], miso[1], miso[2], miso[3], miso[4], miso[5]);
+        }
+        if (getenv("MT7621_RDLOG")) {
+            /* Semantic read trace: what the guest asked the flash for. Keeps
+             * the mount/verify sequence visible without SPILOG's register
+             * firehose. */
+            static int rdlog2 = 200000;
+            if (rdlog2-- > 0) {
+                fprintf(stderr, "spi: RD addr=%06x len=%d %02x%02x%02x%02x\n",
+                        addr, rx_len, miso[0], miso[1], miso[2], miso[3]);
+            }
         }
         break;
     }
@@ -3594,7 +3673,22 @@ static void mt7621_nor_load(MT7621State *s, const char *filename)
     s->flash_size = sz;
     s->spi_nor = true;
 
-    window = MIN((uint64_t)sz, (uint64_t)MT7621_SPI_WINDOW);
+    /*
+     * The flash controller's memory window covers the whole part, not just the
+     * 4 MiB the boot ROM maps for boot: RouterOS's mtd driver reads through
+     * this window (its SPI reads never show up as controller transactions),
+     * and a YAFFS scan that runs off the end of a 4 MiB alias sees nothing but
+     * zeros and refuses to mount.  MT7621_FLASH_WINDOW=4m restores the old
+     * behaviour for A/B testing.
+     */
+    window = (uint64_t)sz;
+    {
+        const char *w = getenv("MT7621_FLASH_WINDOW");
+
+        if (w && (!strcmp(w, "4m") || !strcmp(w, "4M"))) {
+            window = MIN((uint64_t)sz, (uint64_t)MT7621_SPI_WINDOW);
+        }
+    }
     memory_region_init_ram_ptr(&s->flash_mr, NULL, "mt7621.spi-nor",
                                window, s->flash);
     /*
@@ -4000,6 +4094,39 @@ static void mt7621_poweroff_poll(void *opaque)
             fprintf(stderr, "\n");
         }
     }
+    /* Diagnostic: report every architectural exception the guest takes. */
+    if (getenv("MT7621_EXCLOG") && s->cpu) {
+        static int exc_budget = 4096;
+        uint32_t cause = env->CP0_Cause;
+        unsigned code = (cause >> 2) & 0x1f;
+
+        /* TLB misses (1,2,3,8) are normal user-space traffic and would eat
+         * the budget long before the interesting fault; only report the
+         * codes that mean something went wrong. */
+        bool interesting = (code == 4 || code == 5 || code == 10 ||
+                            code == 11 || code == 12 || code == 13);
+        if (code && interesting && exc_budget-- > 0) {
+            fprintf(stderr, "exc: code=%u pc=%08x epc=%08x badvaddr=%08x "
+                    "status=%08x cause=%08x\n", code,
+                    (uint32_t)env->active_tc.PC, (uint32_t)env->CP0_EPC,
+                    (uint32_t)env->CP0_BadVAddr, env->CP0_Status, cause);
+            /* Reserved Instruction: show the word the guest choked on and
+             * the preceding few, which names the instruction and its delay
+             * slot context without needing a guest-side disassembler. */
+            if (code == 11) {
+                uint32_t epc = (uint32_t)env->CP0_EPC;
+                uint32_t insn[4];
+                int k;
+
+                for (k = 0; k < 4; k++) {
+                    insn[k] = cpu_ldl_code(env, epc - 8 + 4 * k);
+                }
+                fprintf(stderr, "RI: %08x: %08x %08x [%08x] %08x\n", epc - 8,
+                        insn[0], insn[1], insn[2], insn[3]);
+            }
+        }
+    }
+
     if (getenv("MT7621_ENTRYLOG") && !s->entry_logged && s->cpu) {
         uint32_t pc = env->active_tc.PC;
 
@@ -4052,7 +4179,7 @@ static void mt7621_poweroff_poll(void *opaque)
 
     timer_mod(s->poweroff_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              (getenv("MT7621_ENTRYLOG") ? 1 : 250));
+              (getenv("MT7621_ENTRYLOG") || getenv("MT7621_EXCLOG") ? 1 : 250));
 }
 
 /*
@@ -4427,6 +4554,221 @@ static void mt7621_apply_board(MT7621State *s, const char *filename)
      */
 }
 
+/*
+ * TX-only mirror of the second UART.  Enough of a 16550 for a polled console:
+ * LSR always reports THRE|TEMT, everything else reads as zero, and writes to
+ * THR end up in the host log.  RouterOS uses this port when it moves the
+ * console off uartlite@c00, and without a sink the kernel's printk vanishes.
+ */
+static uint64_t mt7621_uart1_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MT7621State *s = opaque;
+    unsigned reg = (addr & 0xff) >> 2;
+
+    switch (reg) {
+    case 5:                             /* LSR */
+        (void)s;
+        return 0x60;                    /* THRE | TEMT */
+    case 6:                             /* MSR */
+        return 0xb0;                    /* CTS | DSR | DCD */
+    default:
+        return 0;
+    }
+}
+
+static void mt7621_uart1_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    MT7621State *s = opaque;
+    unsigned reg = (addr & 0xff) >> 2;
+    static bool at_line_start = true;
+
+    switch (reg) {
+    case 0:                             /* THR (ignoring DLAB) */
+        if (at_line_start) {
+            fputs("[uart1] ", stderr);
+            at_line_start = false;
+        }
+        fputc((int)(val & 0xff), stderr);
+        if ((val & 0xff) == '\n') {
+            at_line_start = true;
+        }
+        fflush(stderr);
+        break;
+    case 1:                             /* IER */
+    case 2:                             /* FCR */
+    case 3:                             /* LCR */
+    case 4:                             /* MCR */
+        break;
+    default:
+        break;
+    }
+    (void)s;
+}
+
+static const MemoryRegionOps mt7621_uart1_ops = {
+    .read = mt7621_uart1_read,
+    .write = mt7621_uart1_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/*
+ * Minimal Inside Secure EIP-93 crypto engine (crypto@1e004000, periph offset
+ * 0x4000).  RouterOS probes PE_REVISION and panics with "EipNumber: N" unless
+ * EIP_NO (bits 7:0 of 0x1fc) is the value it expects; the MT7621 pairs with an
+ * EIP-93, i.e. EIP_NO = 93 decimal = 0x5d (NOT 0x93 - the field is the IP
+ * number, not a hex literal).
+ *
+ * Register map follows drivers/crypto/inside-secure/eip93/eip93-regs.h.  This
+ * models the probe/configuration half: the revision and option registers
+ * describe the MT7621's algorithm set, the control/status registers report the
+ * engine ready, and every other register is a plain store so the driver's
+ * ring setup reads back what it wrote.  Command completion is not modelled -
+ * no operation is ever reported done - which is enough for bring-up; real
+ * crypto work would need the descriptor ring and an interrupt.
+ */
+#define MT7621_CRYPTO_OFF       0x00004000
+#define MT7621_CRYPTO_SIZE      0x00000800
+
+#define EIP93_REG_PE_CTRL_STAT  0x000
+#define EIP93_REG_PE_LENGTH     0x01c
+#define EIP93_REG_PE_CD_COUNT   0x090
+#define EIP93_REG_PE_RD_COUNT   0x094
+#define EIP93_REG_PE_RING_PNTR  0x098
+#define EIP93_REG_PE_CONFIG     0x100
+#define EIP93_REG_PE_STATUS     0x104
+#define EIP93_REG_PE_OPTION_1   0x1f4
+#define EIP93_REG_PE_REVISION   0x1fc
+#define EIP93_REG_INT_MASK_STAT 0x204
+#define EIP93_REG_INT_MASK      0x208
+
+#define EIP93_REV_MAJ           1
+#define EIP93_REV_MIN           0
+#define EIP93_REV_PATCH         0
+#define EIP93_EIP_NO            93      /* decimal, as the register encodes it */
+
+/* AES (128/192/256), DES/TDES, MD5, SHA1, SHA224, SHA256 - MT7621's set. */
+#define EIP93_OPTION_1_VAL      ((1u << 19) | (1u << 18) | (1u << 17) | \
+                                 (1u << 16) | (1u << 15) | (1u << 14) | \
+                                 (1u << 13) | (1u << 2) | (1u << 0))
+
+static void mt7621_crypto_reset(MT7621State *s)
+{
+    memset(s->crypto_regs, 0, sizeof(s->crypto_regs));
+    s->crypto_regs[EIP93_REG_PE_REVISION / 4] =
+        (EIP93_REV_MAJ << 24) | (EIP93_REV_MIN << 20) |
+        (EIP93_REV_PATCH << 16) | EIP93_EIP_NO;
+    /*
+     * MT7621_CRYPTO_OPTS=0 advertises no algorithms: the driver then registers
+     * none and every crypto request takes the kernel's software path.  That is
+     * the honest choice while this model does not complete descriptors - a
+     * registered-but-never-completing engine would hang real requests, and a
+     * faked completion would hand back wrong data.
+     */
+    {
+        const char *o = getenv("MT7621_CRYPTO_OPTS");
+
+        /* Default: advertise nothing (see above), i.e. software crypto by
+         * default.  MT7621_CRYPTO_OPTS=<bits> enables the algorithm set once
+         * descriptor completion exists; EIP93_OPTION_1_VAL is the full MT7621
+         * set. */
+        s->crypto_regs[EIP93_REG_PE_OPTION_1 / 4] =
+            o ? (strtoul(o, NULL, 0) & EIP93_OPTION_1_VAL) : 0;
+    }
+    /* PE_READY | HOST_READY: engine up, host may hand it work. */
+    s->crypto_regs[EIP93_REG_PE_CTRL_STAT / 4] = 0x3;
+}
+
+static uint64_t mt7621_crypto_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MT7621State *s = opaque;
+    uint32_t off = addr & (MT7621_CRYPTO_SIZE - 1);
+    uint32_t val;
+
+    switch (off) {
+    case EIP93_REG_PE_CTRL_STAT:
+        val = 0x3;                      /* still ready */
+        break;
+    case EIP93_REG_PE_STATUS:
+        val = 0;
+        break;
+    case EIP93_REG_PE_CD_COUNT:
+    case EIP93_REG_PE_RD_COUNT:
+    case EIP93_REG_PE_RING_PNTR:
+        val = 0;                        /* no descriptors completed */
+        break;
+    case EIP93_REG_PE_REVISION:
+        val = s->crypto_regs[off / 4];
+        if (getenv("MT7621_CRYPTO_NUM")) {
+            val = (val & ~0xffu) | (strtoul(getenv("MT7621_CRYPTO_NUM"),
+                                            NULL, 0) & 0xff);
+        }
+        break;
+    default:
+        val = s->crypto_regs[off / 4];
+        break;
+    }
+    if (getenv("MT7621_CRYPTLOG")) {
+        static int budget = 64;
+
+        if (budget-- > 0) {
+            fprintf(stderr, "crypto: read  %04x size=%u -> %08x\n",
+                    (unsigned)off, size, val);
+        }
+    }
+    return val;
+}
+
+static void mt7621_crypto_write(void *opaque, hwaddr addr, uint64_t value,
+                                unsigned size)
+{
+    MT7621State *s = opaque;
+    uint32_t off = addr & (MT7621_CRYPTO_SIZE - 1);
+    uint32_t val = (uint32_t)value;
+
+    if (getenv("MT7621_CRYPTLOG")) {
+        static int budget = 64;
+
+        if (budget-- > 0) {
+            fprintf(stderr, "crypto: write %04x <- %08x size=%u\n",
+                    (unsigned)off, val, size);
+        }
+    }
+    switch (off) {
+    case EIP93_REG_PE_CONFIG:
+        if (val & 0x1) {                /* RST_PE */
+            mt7621_crypto_reset(s);
+            return;
+        }
+        s->crypto_regs[off / 4] = val;
+        return;
+    case EIP93_REG_INT_MASK_STAT:
+        /* write-one-to-clear status */
+        s->crypto_regs[off / 4] &= ~val;
+        return;
+    case EIP93_REG_PE_CD_COUNT:
+    case EIP93_REG_PE_RD_COUNT:
+        /* writing the low byte kicks the engine; nothing completes here */
+        return;
+    case EIP93_REG_PE_REVISION:
+    case EIP93_REG_PE_OPTION_1:
+        return;                         /* read-only */
+    default:
+        s->crypto_regs[off / 4] = val;
+        return;
+    }
+}
+
+static const MemoryRegionOps mt7621_crypto_ops = {
+    .read = mt7621_crypto_read,
+    .write = mt7621_crypto_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 static void mt7621_machine_init(MachineState *machine)
 {
     MT7621State *s = MT7621_MACHINE(machine);
@@ -4562,7 +4904,7 @@ static void mt7621_machine_init(MachineState *machine)
                                      mt7621_poweroff_poll, s);
     timer_mod(s->poweroff_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              (getenv("MT7621_ENTRYLOG") ? 1 : 250));
+              (getenv("MT7621_ENTRYLOG") || getenv("MT7621_EXCLOG") ? 1 : 250));
 
     if (getenv("MT7621_CMDLINE")) {
         s->cmdline_extra = g_strdup(getenv("MT7621_CMDLINE"));
@@ -4742,6 +5084,23 @@ static void mt7621_machine_init(MachineState *machine)
     serial_mm_init(&s->periph, MT7621_UART0_OFF, 2, uart_irq,
                    MT7621_UART_BAUD_BASE, serial_hd(0),
                    DEVICE_LITTLE_ENDIAN);
+    /*
+     * The second UART gets a TX-only stand-in rather than a second chardev
+     * frontend (qemu_chr_fe_init refuses to share 'ser0').  RouterOS can move
+     * its console to 0x1e000e00, and when that output has nowhere to go the
+     * kernel looks silent.  Bytes written to its THR are mirrored into the
+     * host log with a "[uart1] " prefix.  MT7621_UART1=0 disables the mirror.
+     */
+    if (mt7621_flag("MT7621_UART1")) {
+        memory_region_init_io(&s->uart1, NULL, &mt7621_uart1_ops, s,
+                              "mt7621.uart1", 0x100);
+        memory_region_add_subregion(&s->periph, MT7621_UART1_OFF, &s->uart1);
+    }
+
+    mt7621_crypto_reset(s);
+    memory_region_init_io(&s->crypto, NULL, &mt7621_crypto_ops, s,
+                          "mt7621.crypto", MT7621_CRYPTO_SIZE);
+    memory_region_add_subregion(&s->periph, MT7621_CRYPTO_OFF, &s->crypto);
 
     memory_region_add_subregion(sysmem, MT7621_PERIPH_BASE, &s->periph);
 
