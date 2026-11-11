@@ -1022,7 +1022,7 @@ static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q)
      * unexpected status bit wedges its TFTP state machine (the transfer
      * crawls through 1400 retries instead of completing).
      */
-    if (processed &&
+    if (processed && !getenv("MT7621_NOPDMA_TXDONE") &&
         (s->eth_regs[ETH_PDMA_INT_MASK / 4] & (PDMA_TX_DONE0 << q))) {
         s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_TX_DONE0 << q;
         mt7621_eth_update_irq(s);
@@ -4384,6 +4384,18 @@ static void mt7621_reset(void *opaque)
     if (s->cfg1_cache_fields) {
         env->CP0_Config1 = (env->CP0_Config1 & ~0xffffu) |
                            s->cfg1_cache_fields;
+    }
+    /*
+     * The gapm7200 firmware path (Breed 1.1 + OpenWrt) gives up inside its
+     * rt2880-eth init with "unable to allocate fifos" when Config1 reports the
+     * part's real 32-byte data-cache lines (Dl=4); with the earlier, wrong
+     * 8-byte value (Dl=2) it boots all the way to init.  The RouterOS kernels
+     * on the RB750Gr3 need Dl=4 to get past their cache setup, so the field
+     * has to follow the board until the d-cache model itself is understood.
+     * Config1.Dl is bits 12:10.
+     */
+    if (s->board == MT7621_BOARD_LG_GAPM7200) {
+        env->CP0_Config1 = (env->CP0_Config1 & ~(7u << 10)) | (2u << 10);
     }
 
     /* Everything the guest programmed is gone after a real reset. */
