@@ -181,6 +181,19 @@ typedef enum MT7621Board {
 
 #define PDMA_RX_DONE            (1u << 16)
 /*
+ * The driver normally runs the frame engine with *delayed* RX interrupts:
+ * PDMA_RX_DLY_INT_CFG (0x0a08) / TX_DLY_INT_CFG (0x0a0c) are programmed and
+ * MTK_PDMA_INT_MASK is set to MTK_RX_DONE_DLY (bit 30) instead of
+ * MTK_RX_DONE_INT0.  The hardware then coalesces completions and raises that
+ * one latched bit; the driver's ISR tests the same bit in INT_STATUS.
+ *
+ * Modelling only bit 16 means a driver in delayed mode is never interrupted,
+ * its rx NAPI never polls, and every frame we place in the ring stays there
+ * with RX_DMA_DONE set - which looks exactly like "the tap never sent
+ * anything".
+ */
+#define PDMA_RX_DLY_INT         (1u << 30)
+/*
  * The Linux raeth driver masks 0x0003000f in PDMA_INT_MASK: TX done for the
  * four queues in bits 0..3 and RX done for the two RX rings in bits 16..17.
  * RouterBOOT only polls, so these used to be missing entirely - which left
@@ -1084,6 +1097,42 @@ static void mt7621_ni_dump(const char *dir, const uint8_t *f, size_t len)
     fprintf(stderr, "|\n");
 }
 
+/*
+ * RX descriptor word 3 names the port a frame arrived on, but the two stacks
+ * that run on this SoC put the field at different bits and disagree on what
+ * it means:
+ *
+ *   Linux mtk_eth_soc.h: RX_DMA_FPORT_SHIFT 19, and the driver does
+ *   mac = fport - 1 before indexing eth->netdev[], which has MTK_MAC_COUNT
+ *   (2) entries.  So bit 19 must carry 1 for GMAC0 / 2 for GMAC1.
+ *
+ *   RouterOS raeth extracts ext(rxd4, 18, 3) and, in switch mode, only
+ *   accepts 5 (the switch CPU port); anything else is thrown away with
+ *   "switch0: rx too long".
+ *
+ * Either encoding is "an out-of-range MAC index" to the other stack, and the
+ * Linux driver then releases the descriptor before any counter moves: the
+ * ring looks untouched and every interface reports zero RX, which is easy to
+ * mistake for the backend never sending anything.
+ *
+ * Only the Linux driver enables the QDMA transmit engine (GLO_CFG bit 0);
+ * RouterOS transmits through the PDMA rings, so that bit is the run-time
+ * tell.  MT7621_RX_FPORT forces the port number (Linux layout) for tests.
+ */
+static uint32_t mt7621_rx_fport_field(MT7621State *s, unsigned *fport)
+{
+    const char *p = getenv("MT7621_RX_FPORT");
+    unsigned port = p ? ((unsigned)atoi(p) & 0x7) : (s->qtx_en ? 1 : 5);
+
+    if (fport) {
+        *fport = port;
+    }
+    if (p || s->qtx_en) {
+        return (uint32_t)port << 19;        /* Linux: bits 19..21 */
+    }
+    return 5u << 18;                        /* RouterOS: bits 18..20 */
+}
+
 static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
 {
     /*
@@ -1134,6 +1183,8 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     size_t flen;
     unsigned rx_off;
     bool tagged_mode;
+    unsigned fport = 0;
+    uint32_t fport_bits = 0;
     bool took_bql = !bql_locked();
     static int dbg;
 
@@ -1268,8 +1319,23 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
      * away.  RouterBOOT never looks at the field, so keep its old value in
      * the untagged mode.
      */
+    fport_bits = mt7621_rx_fport_field(s, &fport);
+    if (getenv("MT7621_ETHLOG")) {
+        static int fillbudget = 24;
+
+        if (fillbudget-- > 0) {
+            fprintf(stderr, "eth: fill base=%08x cnt=%u idx=%u desc=%08x "
+                    "buf=%08x off=%u len=%zu rxd2=%08x fport=%u "
+                    "mask=%08x status=%08x\n",
+                    base, cnt, idx, desc, rxd1, rx_off, flen,
+                    RX_DMA_DONE | RX_DMA_PLEN0((unsigned)flen), fport,
+                    s->eth_regs[ETH_PDMA_INT_MASK / 4],
+                    s->eth_regs[ETH_PDMA_INT_STATUS / 4]);
+        }
+    }
     address_space_stl_le(&address_space_memory, desc + 12,
-                         tagged_mode ? (5u << 18) : (1u << RX_DMA_FPORT_SHIFT),
+                         tagged_mode ? fport_bits :
+                         (1u << RX_DMA_FPORT_SHIFT),
                          MEMTXATTRS_UNSPECIFIED, NULL);
     address_space_stl_le(&address_space_memory, desc + 4,
                          RX_DMA_DONE | RX_DMA_PLEN0(flen) |
@@ -1278,8 +1344,13 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
 
     s->rx_drx_idx = (idx + 1) % cnt;
     s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = s->rx_drx_idx;
-    if (s->eth_regs[ETH_PDMA_INT_MASK / 4] & PDMA_RX_DONE) {
-        s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= PDMA_RX_DONE;
+    {
+        uint32_t rxint = s->eth_regs[ETH_PDMA_INT_MASK / 4] &
+                         (PDMA_RX_DONE | PDMA_RX_DLY_INT);
+
+        if (rxint) {
+            s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= rxint;
+        }
     }
 
     {
@@ -1295,6 +1366,20 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
         }
     }
     dbg++;
+    if (getenv("MT7621_RXDBG")) {
+        static int deliv;
+        unsigned et = tagged_mode ? 16 : 12;
+
+        if (deliv++ < 200) {
+            fprintf(stderr, "rxdeliver[%d]: idx=%u len=%zu tagged=%d fport=%u "
+                    "type=%02x%02x "
+                    "dst=%02x:%02x:%02x:%02x:%02x:%02x\n", deliv, idx, flen,
+                    tagged_mode, fport, flen > et + 1 ? tagged[et] : 0,
+                    flen > et + 1 ? tagged[et + 1] : 0,
+                    tagged[0], tagged[1], tagged[2], tagged[3], tagged[4],
+                    tagged[5]);
+        }
+    }
     if (getenv("MT7621_ETHLOG") && dbg < 16) {
         uint32_t prev = desc - 16;
         uint32_t prev_rxd2 = address_space_ldl_le(&address_space_memory,
@@ -1898,6 +1983,15 @@ static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
         bool filled = !(txd3 & TX_DMA_OWNER_CPU);
         bool last = !!(txd3 & TX_DMA_LS0);
 
+        if (getenv("MT7621_TXDBG")) {
+            static int budget = 24;
+
+            if (budget-- > 0) {
+                fprintf(stderr, "txd @%08x: %08x %08x %08x %08x len=%u "
+                        "filled=%d last=%d\n", p, txd1, txd2, txd3, txd4,
+                        len, filled, last);
+            }
+        }
         if (filled && txd1 && len) {
             if (!frame_started) {
                 frame_started = true;
