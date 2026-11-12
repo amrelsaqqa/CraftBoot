@@ -660,8 +660,13 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
 
     /*
      * Only the switch port that owns the net backend has a cable in it.
-     * The internal PHYs are addressed by port number (lan4 = 1 ... lan1 = 4)
-     * and the wan PHY sits at address 0.
+     * MT7530 PHY addresses are the switch port numbers: 0 = the WAN port,
+     * 1..4 = the four LAN PHYs.  Which *label* a port carries is a
+     * device-tree decision, not hardware: mainline OpenWrt maps lan1 = port 1
+     * ... lan4 = port 4 (the real board's dmesg shows wan = mt7530-0:00,
+     * lan1 = :01 ... lan4 = :04), while the vendor image used for bring-up
+     * reverses them (its lan1 is mt7530-0:04 and its lan4 is :01).  So the
+     * backend port also decides which label reports the cable.
      *
      * A real PHY reports link only after autonegotiation finished; claiming
      * it on the very first poll makes genphy_read_status() resolve the link
@@ -4071,11 +4076,21 @@ static void mt7621_sysctl_defaults(MT7621State *s)
     s->sysctl_regs[SYS_CHIP_NAME0 / 4]   = 0x3637544d;
     s->sysctl_regs[SYS_CHIP_NAME1 / 4]   = 0x20203132;
     /*
-     * SYS_CHIP_REV_ID, decoded the way U-Boot and Breed do it:
-     * bit 17 = CPU_ID (second core present), bit 16 = PKG_ID, bits 11:8
-     * = version, bits 3:0 = eco.  A real MT7621A has both bits set.
+     * SYS_CHIP_REV_ID, decoded the way U-Boot, Breed and Linux's ralink probe
+     * do it: bit 17 = CPU_ID (second core present), bit 16 = PKG_ID,
+     * bits 11:8 = version, bits 3:0 = eco.
+     *
+     * The real lg-gapm7200 boards report "SoC Type: MediaTek MT7621 ver:1
+     * eco:3", so model exactly that; Breed prints the same fields as
+     * "MT7621A ver 1, eco 3".  MT7621_ECO overrides the eco nibble for A/B
+     * tests (some kernels gate errata workarounds on it).
      */
-    s->sysctl_regs[SYS_CHIP_REV_ID / 4]  = 0x00030000 | (1 << 8) | 0;
+    {
+        const char *eco = getenv("MT7621_ECO");
+        unsigned e = eco ? (unsigned)atoi(eco) & 0xf : 3;
+
+        s->sysctl_regs[SYS_CHIP_REV_ID / 4]  = 0x00030000 | (1 << 8) | e;
+    }
     /*
      * SYSCFG0: CHIP_MODE[3:0] tells the firmware which boot flash is wired
      * up; 0 means "no NAND" and makes board_init skip the NFI entirely.
@@ -5125,8 +5140,16 @@ static void mt7621_machine_init(MachineState *machine)
      * so a tap device on the host is bridged at layer 2.
      */
     {
+        /*
+         * The tap is a cable in one switch port.  Model the hardware: the
+         * LAN PHYs are ports 1..4, so the cable sits in port 1 (mainline's
+         * lan1).  MT7621_ETH_PORT moves it; use 4 to make the vendor image's
+         * own "lan1" the live port, which is what the bring-up logs used.
+         * RouterOS numbers ether1..5 as ports 0..4 and the tap has always
+         * been ether5 there, so that board keeps 4.
+         */
         const char *p = getenv("MT7621_ETH_PORT");
-        unsigned def_port = s->board == MT7621_BOARD_RB750GR3 ? 4 : 4;
+        unsigned def_port = s->board == MT7621_BOARD_RB750GR3 ? 4 : 1;
 
         s->eth_port = p ? (unsigned)atoi(p) : def_port;
     }
