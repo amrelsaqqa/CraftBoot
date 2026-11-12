@@ -3051,6 +3051,26 @@ static uint64_t mt7621_nfi_read(void *opaque, hwaddr addr, unsigned size)
         break;
     }
 
+    if (getenv("MT7621_NFISPIN")) {
+        /*
+         * Diagnostic: a driver stuck in a poll loop reads the same register
+         * with the same value thousands of times.  Report the first such
+         * loop so the offending register can be modelled.
+         */
+        static uint32_t last_off = 0xffffffff, last_val;
+        static unsigned spins;
+
+        if (off == last_off && (uint32_t)val == last_val) {
+            if (++spins == 5000) {
+                fprintf(stderr, "nfi spin: off=%03x val=%08x\n",
+                        (unsigned)off, (uint32_t)val);
+            }
+        } else {
+            last_off = off;
+            last_val = (uint32_t)val;
+            spins = 0;
+        }
+    }
     if (mt7621_trace) {
         qemu_log_mask(LOG_UNIMP, "mt7621: nfi read  %03x (size %u) -> %0*"
                       PRIx64 "\n", (unsigned)off, size, size * 2, val);
