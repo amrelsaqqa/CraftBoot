@@ -4242,7 +4242,12 @@ static void mt7621_dramc_defaults(MT7621State *s)
      * the GIC counter is modelled at (mips_gictimer_set_freq) and the value
      * RouterBOOT reports for the RB750Gr3.
      */
-    s->dramc_regs[0x648 / 4] = (69 << 4) | (1 << 12);   /* 875 MHz */
+    {
+        const char *pll = getenv("MT7621_CPU_PLL");
+
+        s->dramc_regs[0x648 / 4] = pll ? (uint32_t)strtoul(pll, NULL, 0)
+                                       : ((69 << 4) | (1 << 12)); /* 875MHz */
+    }
     s->dramc_regs[0x3fc / 4] = 0x00000400;
 }
 
@@ -5200,6 +5205,22 @@ static void mt7621_machine_init(MachineState *machine)
     s->gic = qdev_new(TYPE_MIPS_GIC);
     qdev_prop_set_uint32(s->gic, "num-vp", s->ncpus);
     qdev_prop_set_uint32(s->gic, "num-irq", MT7621_GIC_NUM_IRQ);
+    /*
+     * The SoC's GIC has a 64-bit shared counter: Linux on the real board
+     * reports "clocksource: GIC: mask 0xffffffffffffffff", which it derives
+     * from GIC_SH_CONFIG.COUNTERBITS.  Keep the generic model's 32-bit
+     * default for everything else.
+     */
+    {
+        /*
+         * Hardware is 64-bit on the MT7621; the knob exists to A/B other
+         * guests (RouterOS) that may not cope with the wide counter.
+         */
+        const char *cb = getenv("MT7621_GIC_COUNTER_BITS");
+
+        qdev_prop_set_uint32(s->gic, "counter-bits",
+                             cb ? (uint32_t)atoi(cb) : 8);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->gic), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(s->gic), 0, MT7621_GIC_BASE);
 
