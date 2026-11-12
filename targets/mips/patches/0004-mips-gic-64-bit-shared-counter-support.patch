@@ -1,0 +1,242 @@
+From a596e4dc050c5e71a66aecc8fcab0a3b2f4e6690 Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Thu, 12 Nov 2026 15:59:05 +0200
+Subject: [PATCH 4/5] mips-gic: 64-bit shared counter support
+
+MIPSGICTimerState.sh_counter is now 64-bit; COUNTERHI is implemented for both
+read and write, a 32-bit COUNTERLO write preserves the high half, and
+start_count() resumes from the frozen value instead of re-subtracting the
+elapsed ticks.
+
+mt7621: program MEMC CPU PLL (FBDIV 69 / PREDIV 1 -> 875 MHz) so clk-mt7621
+reports a real CPU clock, and advertise GIC_SH_CONFIG.COUNTERBITS = 8
+(64-bit).  Together these fix the guest's timestamps jumping between 1 s and
+8793 s and the 60 s NAND bad-block scans.
+---
+ hw/intc/mips_gic.c               |  17 +++++-
+ hw/timer/mips_gictimer.c         | 102 ++++++++++++++++++++++---------
+ include/hw/timer/mips_gictimer.h |   4 +-
+ 3 files changed, 91 insertions(+), 32 deletions(-)
+
+diff --git a/hw/intc/mips_gic.c b/hw/intc/mips_gic.c
+index 42ef79e..b92553a 100644
+--- a/hw/intc/mips_gic.c
++++ b/hw/intc/mips_gic.c
+@@ -182,7 +182,7 @@ static uint64_t gic_read(void *opaque, hwaddr addr, unsigned size)
+         ret = mips_gictimer_get_sh_count(gic->gic_timer);
+         break;
+     case GIC_SH_COUNTERHI_OFS:
+-        ret = 0;
++        ret = (uint32_t)(mips_gictimer_get_sh_count64(gic->gic_timer) >> 32);
+         break;
+     case GIC_SH_PEND_OFS ... GIC_SH_PEND_LAST_OFS:
+         /* each bit represents pending status for an interrupt pin */
+@@ -341,6 +341,11 @@ static void gic_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
+             mips_gictimer_store_sh_count(gic->gic_timer, data);
+         }
+         break;
++    case GIC_SH_COUNTERHI_OFS:
++        if (mips_gictimer_get_countstop(gic->gic_timer)) {
++            mips_gictimer_store_sh_count_hi(gic->gic_timer, data);
++        }
++        break;
+     case GIC_SH_RMASK_OFS ... GIC_SH_RMASK_LAST_OFS:
+         /* up to 64 bits per a pin */
+         base = (addr - GIC_SH_RMASK_OFS) * 8;
+@@ -421,7 +426,15 @@ static void gic_reset(void *opaque)
+ 
+     gic->sh_config = /* COUNTSTOP = 0 it is accessible via MIPSGICTimer*/
+                      /* CounterHi not implemented */
+-                     (0            << GIC_SH_CONFIG_COUNTBITS_SHF) |
++                     /*
++                      * COUNTERBITS is (bits - 32) / 4, so 8 means a 64-bit
++                      * shared counter.  The MT7621's GIC really is 64-bit
++                      * (its dmesg reports mask 0xffffffffffffffff) and the
++                      * kernel registers sched_clock with 64 bits regardless
++                      * of this field - advertising 32 bits while sched_clock
++                      * assumes 64 made every 4.9 s wrap a bogus forward jump.
++                      */
++                     (8            << GIC_SH_CONFIG_COUNTBITS_SHF) |
+                      (numintrs     << GIC_SH_CONFIG_NUMINTRS_SHF)  |
+                      (gic->num_vps << GIC_SH_CONFIG_PVPS_SHF);
+     for (i = 0; i < gic->num_vps; i++) {
+diff --git a/hw/timer/mips_gictimer.c b/hw/timer/mips_gictimer.c
+index 1b9d359..5181fa0 100644
+--- a/hw/timer/mips_gictimer.c
++++ b/hw/timer/mips_gictimer.c
+@@ -52,6 +52,15 @@ static uint64_t gictimer_ns(uint64_t ticks)
+     return muldiv64(ticks, NANOSECONDS_PER_SECOND, gictimer_freq);
+ }
+ 
++/* 32-bit view of the shared counter, used by the per-VP compare logic. */
++static uint32_t gictimer_count32(MIPSGICTimerState *gictimer, uint64_t now)
++{
++    if (gictimer->countstop) {
++        return (uint32_t)gictimer->sh_counter;
++    }
++    return (uint32_t)(gictimer->sh_counter + gictimer_ticks(now));
++}
++
+ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+                                    uint32_t vp_index, uint64_t now)
+ {
+@@ -71,13 +80,12 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+         timer_del(gictimer->vptimers[vp_index].qtimer);
+         return;
+     }
+-    wait = gictimer->vptimers[vp_index].comparelo - gictimer->sh_counterlo -
+-           (uint32_t)gictimer_ticks(now);
++    wait = gictimer->vptimers[vp_index].comparelo - gictimer_count32(gictimer, now);
+     next = now + gictimer_ns((uint64_t)wait);
+     if (gt_log_on()) {
+         fprintf(stderr, "gictimer: vp%d cmp=%08x cnt=%08x wait=%u now=%lld\n",
+                 (int)vp_index, gictimer->vptimers[vp_index].comparelo,
+-                gictimer->sh_counterlo + (uint32_t)gictimer_ticks(now),
++                gictimer_count32(gictimer, now),
+                 wait, (long long)now);
+     }
+ 
+@@ -107,41 +115,72 @@ static void gic_vptimer_cb(void *opaque)
+                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+ }
+ 
+-uint32_t mips_gictimer_get_sh_count(MIPSGICTimerState *gictimer)
++uint64_t mips_gictimer_get_sh_count64(MIPSGICTimerState *gictimer)
+ {
+     int i;
++    uint64_t now;
++
+     if (gictimer->countstop) {
+-        return gictimer->sh_counterlo;
+-    } else {
+-        uint64_t now;
+-        now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+-        for (i = 0; i < gictimer->num_vps; i++) {
+-            if (timer_pending(gictimer->vptimers[i].qtimer)
+-                && timer_expired(gictimer->vptimers[i].qtimer, now)) {
+-                /* The timer has already expired.  */
+-                gic_vptimer_expire(gictimer, i, now);
+-            }
++        return gictimer->sh_counter;
++    }
++    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    for (i = 0; i < gictimer->num_vps; i++) {
++        if (timer_pending(gictimer->vptimers[i].qtimer)
++            && timer_expired(gictimer->vptimers[i].qtimer, now)) {
++            /* The timer has already expired.  */
++            gic_vptimer_expire(gictimer, i, now);
+         }
+-        return gictimer->sh_counterlo + (uint32_t)gictimer_ticks(now);
+     }
++    return gictimer->sh_counter + gictimer_ticks(now);
+ }
+ 
+-void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
++uint32_t mips_gictimer_get_sh_count(MIPSGICTimerState *gictimer)
++{
++    return (uint32_t)mips_gictimer_get_sh_count64(gictimer);
++}
++
++/* Re-anchor the base so that the counter reads back as `count` right now. */
++static void gictimer_reanchor(MIPSGICTimerState *gictimer, uint64_t count,
++                              uint64_t now)
+ {
+     int i;
+-    uint64_t now;
+ 
+     if (gictimer->countstop || !gictimer->vptimers[0].qtimer) {
+-        gictimer->sh_counterlo = count;
+-    } else {
+-        /* Store new count register */
+-        now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+-        gictimer->sh_counterlo = count - (uint32_t)gictimer_ticks(now);
+-        /* Update timer timer */
+-        for (i = 0; i < gictimer->num_vps; i++) {
+-            gic_vptimer_update(gictimer, i, now);
+-        }
++        gictimer->sh_counter = count;
++        return;
+     }
++    gictimer->sh_counter = count - gictimer_ticks(now);
++    for (i = 0; i < gictimer->num_vps; i++) {
++        gic_vptimer_update(gictimer, i, now);
++    }
++}
++
++static uint64_t gictimer_count_now(MIPSGICTimerState *gictimer)
++{
++    if (gictimer->countstop) {
++        return gictimer->sh_counter;
++    }
++    return gictimer->sh_counter +
++        gictimer_ticks(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++}
++
++void mips_gictimer_store_sh_count_hi(MIPSGICTimerState *gictimer, uint32_t hi)
++{
++    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    uint64_t cur = gictimer_count_now(gictimer);
++
++    gictimer_reanchor(gictimer,
++                      (cur & 0xffffffffULL) | ((uint64_t)hi << 32), now);
++}
++
++void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
++{
++    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    uint64_t cur = gictimer_count_now(gictimer);
++
++    /* A 32-bit write replaces the low half and leaves the high half alone. */
++    gictimer_reanchor(gictimer,
++                      (cur & ~0xffffffffULL) | (count & 0xffffffffULL), now);
+ }
+ 
+ uint32_t mips_gictimer_get_vp_compare(MIPSGICTimerState *gictimer,
+@@ -165,8 +204,13 @@ uint8_t mips_gictimer_get_countstop(MIPSGICTimerState *gictimer)
+ 
+ void mips_gictimer_start_count(MIPSGICTimerState *gictimer)
+ {
++    /*
++     * The base holds the count as of the stop, so simply letting the ticks
++     * accumulate again resumes from the same value.  (It used to call
++     * store_sh_count() here, which re-subtracted the elapsed ticks and moved
++     * the counter backwards.)
++     */
+     gictimer->countstop = 0;
+-    mips_gictimer_store_sh_count(gictimer, gictimer->sh_counterlo);
+ }
+ 
+ void mips_gictimer_stop_count(MIPSGICTimerState *gictimer)
+@@ -175,8 +219,8 @@ void mips_gictimer_stop_count(MIPSGICTimerState *gictimer)
+ 
+     gictimer->countstop = 1;
+     /* Store the current value */
+-    gictimer->sh_counterlo +=
+-        (uint32_t)gictimer_ticks(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++    gictimer->sh_counter +=
++        gictimer_ticks(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+     for (i = 0; i < gictimer->num_vps; i++) {
+         timer_del(gictimer->vptimers[i].qtimer);
+     }
+diff --git a/include/hw/timer/mips_gictimer.h b/include/hw/timer/mips_gictimer.h
+index 17d71dc..0f69d9f 100644
+--- a/include/hw/timer/mips_gictimer.h
++++ b/include/hw/timer/mips_gictimer.h
+@@ -25,7 +25,7 @@ struct MIPSGICTimerVPState {
+ struct MIPSGICTimerState {
+     void *opaque;
+     uint8_t countstop;
+-    uint32_t sh_counterlo;
++    uint64_t sh_counter;        /* 64-bit shared counter base */
+     int32_t num_vps;
+     MIPSGICTimerVPState *vptimers;
+     MIPSGICTimerCB *cb;
+@@ -35,6 +35,8 @@ void mips_gictimer_set_freq(uint32_t freq);
+ uint32_t mips_gictimer_get_freq(MIPSGICTimerState *gic);
+ uint32_t mips_gictimer_get_sh_count(MIPSGICTimerState *gic);
+ void mips_gictimer_store_sh_count(MIPSGICTimerState *gic, uint64_t count);
++void mips_gictimer_store_sh_count_hi(MIPSGICTimerState *gic, uint32_t hi);
++uint64_t mips_gictimer_get_sh_count64(MIPSGICTimerState *gic);
+ uint32_t mips_gictimer_get_vp_compare(MIPSGICTimerState *gictimer,
+                                       uint32_t vp_index);
+ void mips_gictimer_store_vp_compare(MIPSGICTimerState *gic, uint32_t vp_index,

@@ -1,0 +1,159 @@
+From 38aa5ee9d855dbf1cc68ed031ebd414995a525a3 Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Thu, 12 Nov 2026 01:42:11 +0200
+Subject: [PATCH 2/5] mt7621: MT7621_SYSLOG trace (syscalls + read buffers)
+
+Restores the diagnostic that was lost when the QEMU-side working tree was
+reset: logs open/mount/stat/ioctl/mknod/symlink with decoded string arguments,
+plus small read() buffers and the return value.
+---
+ target/mips/tcg/system/special_helper.c |   2 +-
+ target/mips/tcg/system/tlb_helper.c     | 108 ++++++++++++++++++++++++
+ 2 files changed, 109 insertions(+), 1 deletion(-)
+
+diff --git a/target/mips/tcg/system/special_helper.c b/target/mips/tcg/system/special_helper.c
+index fb90f45..bbb6fa5 100644
+--- a/target/mips/tcg/system/special_helper.c
++++ b/target/mips/tcg/system/special_helper.c
+@@ -116,7 +116,7 @@ static inline void exception_return(CPUMIPSState *env)
+     }
+     compute_hflags(env);
+     debug_post_eret(env);
+-    if (getenv("MT7621_RECVLOG")) {
++    if (getenv("MT7621_RECVLOG") || getenv("MT7621_SYSLOG")) {
+         mt7621_sysret_trace(env);
+     }
+ }
+diff --git a/target/mips/tcg/system/tlb_helper.c b/target/mips/tcg/system/tlb_helper.c
+index b38307c..f546d4f 100644
+--- a/target/mips/tcg/system/tlb_helper.c
++++ b/target/mips/tcg/system/tlb_helper.c
+@@ -1031,6 +1031,49 @@ static inline void set_badinstr_registers(CPUMIPSState *env)
+ static int mt7621_pend;
+ static int mt7621_pendfd;
+ static uint32_t mt7621_pendbuf;
++
++/*
++ * MT7621_SYSLOG: trace the filesystem side syscalls a guest makes (open/mount/
++ * stat/ioctl/mknod/symlink...) with decoded string arguments plus small read()
++ * buffers.  Arguments are captured on the syscall exception, the return value
++ * on the way out in mt7621_sysret_trace().  This is how a guest that keeps its
++ * console silent can still be followed from the host.
++ */
++static int mt7621_sys_pend;
++static unsigned mt7621_sys_nr;
++static uint32_t mt7621_sys_a0, mt7621_sys_a1, mt7621_sys_a2, mt7621_sys_a3;
++
++static void mt7621_sys_readstr(CPUMIPSState *env, uint32_t addr, char *out,
++                               size_t len)
++{
++    uint8_t buf[128];
++    size_t i;
++
++    memset(out, 0, len);
++    if (!addr || len == 0) {
++        return;
++    }
++    memset(buf, 0, sizeof(buf));
++    if (cpu_memory_rw_debug(env_cpu(env), addr, buf, sizeof(buf) - 1, false)) {
++        return;
++    }
++    for (i = 0; i < len - 1 && i < sizeof(buf) - 1 && buf[i]; i++) {
++        out[i] = g_ascii_isprint(buf[i]) ? buf[i] : '.';
++    }
++}
++
++static bool mt7621_sys_interesting(unsigned nr)
++{
++    switch (nr) {
++    case 4004: case 4005: case 4006: case 4014: case 4021: case 4022:
++    case 4054: case 4083: case 4085: case 4099: case 4100: case 4106:
++    case 4107: case 4288:
++        return true;
++    default:
++        return false;
++    }
++}
++
+ void mt7621_sysret_trace(CPUMIPSState *env);
+ 
+ void mips_cpu_do_interrupt(CPUState *cs)
+@@ -1229,6 +1272,33 @@ void mips_cpu_do_interrupt(CPUState *cs)
+         cause = 7;
+         goto set_EPC;
+     case EXCP_SYSCALL: {
++        if (getenv("MT7621_SYSLOG")) {
++            static int sysbudget = 60000;
++            unsigned nr = (unsigned)env->active_tc.gpr[2];
++
++            mt7621_sys_pend = 1;
++            mt7621_sys_nr = nr;
++            mt7621_sys_a0 = (uint32_t)env->active_tc.gpr[4];
++            mt7621_sys_a1 = (uint32_t)env->active_tc.gpr[5];
++            mt7621_sys_a2 = (uint32_t)env->active_tc.gpr[6];
++            mt7621_sys_a3 = (uint32_t)env->active_tc.gpr[7];
++            if (sysbudget-- > 0 && mt7621_sys_interesting(nr)) {
++                char s0[72], s1[72], s2[72];
++
++                mt7621_sys_readstr(env, mt7621_sys_a0, s0, sizeof(s0));
++                mt7621_sys_readstr(env, mt7621_sys_a1, s1, sizeof(s1));
++                mt7621_sys_readstr(env, mt7621_sys_a2, s2, sizeof(s2));
++                if (nr == 4054) {
++                    fprintf(stderr, "sys ioctl fd=%d req=%08x arg=%08x\n",
++                            (int)mt7621_sys_a0, mt7621_sys_a1, mt7621_sys_a2);
++                } else {
++                    fprintf(stderr, "sys %u a0=%08x(\"%s\") a1=%08x(\"%s\") "
++                            "a2=%08x(\"%s\") a3=%08x\n",
++                            nr, mt7621_sys_a0, s0, mt7621_sys_a1, s1,
++                            mt7621_sys_a2, s2, mt7621_sys_a3);
++                }
++            }
++        }
+         static int budget = 400;
+         static int netbudget = 4000;
+         if (getenv("MT7621_RECVLOG")) {
+@@ -1465,6 +1535,44 @@ void mt7621_sysret_trace(CPUMIPSState *env)
+     char pbuf[56];
+     size_t i;
+ 
++    if (mt7621_sys_pend && getenv("MT7621_SYSLOG")) {
++        static int retbudget = 60000;
++
++        mt7621_sys_pend = 0;
++        if (retbudget-- > 0) {
++            fprintf(stderr, "sys ret %u v0=%d pc=%08x\n",
++                    mt7621_sys_nr, v0, pc);
++            if (mt7621_sys_nr == 4003 && v0 > 0 && v0 <= 512) {
++                uint8_t rb[512];
++                int k;
++
++                memset(rb, 0, sizeof(rb));
++                cpu_memory_rw_debug(env_cpu(env), mt7621_sys_a1, rb,
++                                    v0 < (int)sizeof(rb) ? v0 : (int)sizeof(rb),
++                                    false);
++                fprintf(stderr, "    read[%d]: ", v0);
++                for (k = 0; k < v0 && k < 256; k++) {
++                    fputc(g_ascii_isprint(rb[k]) || rb[k] == '\n' ? rb[k] : '.',
++                          stderr);
++                }
++                fprintf(stderr, "\n");
++            }
++            if (mt7621_sys_nr == 4054 && mt7621_sys_a2) {
++                uint8_t ib[64];
++                size_t k;
++
++                memset(ib, 0, sizeof(ib));
++                cpu_memory_rw_debug(env_cpu(env), mt7621_sys_a2, ib,
++                                    sizeof(ib), false);
++                fprintf(stderr, "    ioctl argv:");
++                for (k = 0; k < 32; k++) {
++                    fprintf(stderr, " %02x", ib[k]);
++                }
++                fprintf(stderr, "\n");
++            }
++        }
++    }
++
+     if (!mt7621_pend || pc != 0x43222c) {
+         return;
+     }

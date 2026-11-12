@@ -1,0 +1,7 @@
+# Target mips — applied in this order to the pinned tag.
+# 'make TARGET=mips check-patches' proves they apply to a pristine checkout.
+targets/mips/patches/0001-mt7621-QEMU-side-changes-for-the-MT7621-machine.patch
+targets/mips/patches/0002-mt7621-MT7621_SYSLOG-trace-syscalls-read-buffers.patch
+targets/mips/patches/0003-mt7621-NFI-0xEC-default-on-CMGCR-CMGIC-RX_LSO-DL-CAC.patch
+targets/mips/patches/0004-mips-gic-64-bit-shared-counter-support.patch
+targets/mips/patches/0005-mips-gic-64-bit-per-VP-compare-width-aware-timer-sem.patch

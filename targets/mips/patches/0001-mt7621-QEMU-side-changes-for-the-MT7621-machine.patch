@@ -1,0 +1,1058 @@
+From 661ed37605e6c6af54d5c32cf25fbef7ce91cac6 Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Thu, 12 Nov 2026 01:39:41 +0200
+Subject: [PATCH 1/5] mt7621: QEMU-side changes for the MT7621 machine
+
+Working-tree additions that used to live only in qemu-mt7621.patch:
+instruction-cache shadow, GIC/gictimer adjustments, CP0 Def/config
+tweaks for the 1004Kc model.  Committed on a local branch so revisions
+can be switched with git checkout instead of applying patches.
+---
+ accel/tcg/cpu-exec.c                    |  44 ++++++++
+ accel/tcg/cputlb.c                      | 111 ++++++++++++++++++-
+ accel/tcg/translator.c                  |   4 +
+ hw/intc/mips_gic.c                      |  62 +++++++++++
+ hw/mips/Kconfig                         |   6 +
+ hw/mips/meson.build                     |   1 +
+ hw/timer/mips_gictimer.c                |  72 ++++++++++--
+ include/exec/icache-shadow.h            |  54 +++++++++
+ include/hw/timer/mips_gictimer.h        |   1 +
+ target/mips/cpu-defs.c.inc              | 107 ++++++++++++++++++
+ target/mips/tcg/system/special_helper.c |  15 +++
+ target/mips/tcg/system/tlb_helper.c     | 139 +++++++++++++++++++++++-
+ target/mips/tcg/system_helper.h.inc     |   1 +
+ target/mips/tcg/translate.c             |  69 ++++++++----
+ 14 files changed, 658 insertions(+), 28 deletions(-)
+ create mode 100644 include/exec/icache-shadow.h
+
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index ad94f96..43c4607 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -881,6 +881,49 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
+     return false;
+ }
+ 
++
++/*
++ * Bring-up aid (MT7621_PCWATCH): keep the last 128 translated-block PCs and
++ * dump them the first time execution leaves the kernel image range, i.e. the
++ * first user-space entry or the first runaway into the heap.
++ */
++static void pcwatch_note(uint64_t pc)
++{
++    static int on = -1;
++    static int armed, done;
++    static uint64_t ring[256];
++    static unsigned idx;
++    unsigned i;
++
++    if (on < 0) {
++        on = getenv("MT7621_PCWATCH") != NULL;
++    }
++    if (!on || done || pc < 0x80000000ULL) {
++        return;
++    }
++    /* arm when the kernel's syscall dispatch runs (execve("/init") path) */
++    if (!armed) {
++        if (pc < 0x8010c200ULL || pc >= 0x8010c400ULL) {
++            return;
++        }
++        armed = 1;
++        fprintf(stderr, "pcwatch: armed at exec path pc=%08llx\n",
++                (unsigned long long)pc);
++    }
++    ring[idx & 255] = pc;
++    idx++;
++    /* dump when the boot thread goes to sleep (r4k_wait) */
++    if (pc >= 0x80107400ULL && pc < 0x80107500ULL) {
++        done = 1;
++        fprintf(stderr, "pcwatch: first sleep at pc=%08llx, last %u TBs:\n",
++                (unsigned long long)pc, idx < 256 ? idx : 256);
++        for (i = 0; i < (idx < 256 ? idx : 256); i++) {
++            unsigned k = (idx - (idx < 256 ? idx : 256) + i) & 255;
++            fprintf(stderr, "  %08llx\n", (unsigned long long)ring[k]);
++        }
++    }
++}
++
+ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
+                                     vaddr pc, TranslationBlock **last_tb,
+                                     int *tb_exit)
+@@ -996,6 +1039,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+                 tb_add_jump(last_tb, tb_exit, tb);
+             }
+ 
++            pcwatch_note(tb->pc);
+             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
+ 
+             /* Try to align the host and virtual clocks
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index fd1606c..be4473f 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -34,6 +34,7 @@
+ #include "exec/mmu-access-type.h"
+ #include "exec/tlb-common.h"
+ #include "exec/vaddr.h"
++#include "exec/icache-shadow.h"
+ #include "tcg/tcg.h"
+ #include "qemu/error-report.h"
+ #include "exec/log.h"
+@@ -1332,6 +1333,109 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
+     return false;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* Minimal instruction-cache shadow, see exec/icache-shadow.h          */
++
++#define ICACHE_SHADOW_PAGES        1024
++#define ICACHE_SHADOW_PAGE_SIZE    4096
++#define ICACHE_SHADOW_PAGE_MASK    (ICACHE_SHADOW_PAGE_SIZE - 1)
++
++typedef struct ICacheShadowEntry {
++    uint64_t tag;
++    uint32_t gen;
++    uint8_t data[ICACHE_SHADOW_PAGE_SIZE];
++} ICacheShadowEntry;
++
++static ICacheShadowEntry *icache_shadow;
++static bool icache_shadow_on;
++static bool icache_shadow_busy;
++static uint64_t icache_shadow_lo, icache_shadow_hi;
++static uint32_t icache_shadow_gen = 1;
++
++void icache_shadow_enable(uint64_t lo, uint64_t hi)
++{
++    if (getenv("ICACHE_DEBUG")) {
++        fprintf(stderr, "icache: enabled %08llx-%08llx\n",
++                (unsigned long long)lo, (unsigned long long)hi);
++    }
++    icache_shadow_lo = lo;
++    icache_shadow_hi = hi;
++    icache_shadow_on = true;
++}
++
++bool icache_shadow_active(void)
++{
++    return icache_shadow_on;
++}
++
++void icache_shadow_flush(void)
++{
++    if (icache_shadow_on) {
++        icache_shadow_gen++;
++    }
++}
++
++void icache_shadow_invalidate(uint64_t addr)
++{
++    uint64_t page;
++    ICacheShadowEntry *e;
++
++    if (!icache_shadow_on || !icache_shadow) {
++        return;
++    }
++    page = addr & ~(uint64_t)ICACHE_SHADOW_PAGE_MASK;
++    e = &icache_shadow[(page >> 12) % ICACHE_SHADOW_PAGES];
++    if (e->tag == page + 1) {
++        e->tag = 0;
++    }
++}
++
++uint32_t icache_shadow_ldl(CPUArchState *env, vaddr addr, int mmu_idx,
++                           uint32_t fallback)
++{
++    uint64_t vaddr64 = (uint64_t)addr;
++    uint64_t page, off;
++    ICacheShadowEntry *e;
++    void *host;
++    int flags;
++
++    if (vaddr64 < icache_shadow_lo || vaddr64 >= icache_shadow_hi) {
++        return fallback;
++    }
++    off = vaddr64 & ICACHE_SHADOW_PAGE_MASK;
++    if (unlikely(off > ICACHE_SHADOW_PAGE_SIZE - 4)) {
++        return fallback;
++    }
++    page = vaddr64 & ~(uint64_t)ICACHE_SHADOW_PAGE_MASK;
++
++    if (unlikely(!icache_shadow)) {
++        icache_shadow = g_new0(ICacheShadowEntry, ICACHE_SHADOW_PAGES);
++    }
++    e = &icache_shadow[(page >> 12) % ICACHE_SHADOW_PAGES];
++
++    if (e->tag != page + 1 || e->gen != icache_shadow_gen) {
++        if (unlikely(icache_shadow_busy)) {
++            return fallback;
++        }
++        icache_shadow_busy = true;
++        flags = probe_access_flags(env, page, ICACHE_SHADOW_PAGE_SIZE,
++                                   MMU_INST_FETCH, mmu_idx, true, &host, 0);
++        icache_shadow_busy = false;
++        if ((flags & TLB_MMIO) || host == NULL) {
++            e->tag = 0;
++            return fallback;
++        }
++        memcpy(e->data, host, ICACHE_SHADOW_PAGE_SIZE);
++        e->tag = page + 1;
++        e->gen = icache_shadow_gen;
++        if (getenv("ICACHE_DEBUG")) {
++            fprintf(stderr, "icache: snapshot page %08llx gen %u\n",
++                    (unsigned long long)page, icache_shadow_gen);
++        }
++    }
++    return ldl_le_p(&e->data[off]);
++}
++
+ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
+                            CPUTLBEntryFull *full, uintptr_t retaddr)
+ {
+@@ -2912,7 +3016,12 @@ uint16_t cpu_ldw_code_mmu(CPUArchState *env, vaddr addr,
+ uint32_t cpu_ldl_code_mmu(CPUArchState *env, vaddr addr,
+                           MemOpIdx oi, uintptr_t retaddr)
+ {
+-    return do_ld4_mmu(env_cpu(env), addr, oi, retaddr, MMU_INST_FETCH);
++    uint32_t val = do_ld4_mmu(env_cpu(env), addr, oi, retaddr, MMU_INST_FETCH);
++
++    if (unlikely(icache_shadow_on)) {
++        val = icache_shadow_ldl(env, addr, get_mmuidx(oi), val);
++    }
++    return val;
+ }
+ 
+ uint64_t cpu_ldq_code_mmu(CPUArchState *env, vaddr addr,
+diff --git a/accel/tcg/translator.c b/accel/tcg/translator.c
+index 034f2f3..6bfd3dd 100644
+--- a/accel/tcg/translator.c
++++ b/accel/tcg/translator.c
+@@ -15,6 +15,7 @@
+ #include "accel/tcg/cpu-mmu-index.h"
+ #include "exec/target_page.h"
+ #include "exec/translator.h"
++#include "exec/icache-shadow.h"
+ #include "exec/plugin-gen.h"
+ #include "tcg/tcg-op-common.h"
+ #include "internal-common.h"
+@@ -496,6 +497,9 @@ uint32_t translator_ldl_end(CPUArchState *env, DisasContextBase *db,
+     if (endian & MO_BSWAP) {
+         val = bswap32(val);
+     }
++    if (unlikely(icache_shadow_active())) {
++        val = icache_shadow_ldl(env, pc, db->code_mmuidx, val);
++    }
+     return val;
+ }
+ 
+diff --git a/hw/intc/mips_gic.c b/hw/intc/mips_gic.c
+index 0c50ba4..42ef79e 100644
+--- a/hw/intc/mips_gic.c
++++ b/hw/intc/mips_gic.c
+@@ -19,10 +19,42 @@
+ #include "system/reset.h"
+ #include "kvm_mips.h"
+ #include "hw/intc/mips_gic.h"
++#include "qemu/osdep.h"
++#include <stdlib.h>
++static int gic_log_on(void)
++{
++    static int v = -1;
++    if (v < 0) v = getenv("MT7621_GICLOG") != NULL;
++    return v;
++}
++static void gic_log(const char *op, hwaddr addr, uint64_t val)
++{
++    CPUState *cs = qemu_get_cpu(0);
++    uint32_t pc = 0;
++    if (cs) {
++        CPUMIPSState *env = cpu_env(cs);
++        pc = (uint32_t)env->active_tc.PC;
++    }
++    fprintf(stderr, "gic: %s %04x <- %08x pc=%08x\n", op, (unsigned)addr,
++            (uint32_t)val, pc);
++}
+ #include "hw/irq.h"
+ #include "hw/qdev-properties.h"
+ 
++static void mips_gic_set_vp_irq_impl(MIPSGICState *gic, int vp, int pin);
++
+ static void mips_gic_set_vp_irq(MIPSGICState *gic, int vp, int pin)
++{
++    static int budget = 300;
++    if (gic_log_on() && budget-- > 0) {
++        CPUState *cs = qemu_get_cpu(0);
++        uint32_t pc = cs ? (uint32_t)cpu_env(cs)->active_tc.PC : 0;
++        fprintf(stderr, "gic: set_vp_irq vp=%d pin=%d pc=%08x\n", vp, pin, pc);
++    }
++    mips_gic_set_vp_irq_impl(gic, vp, pin);
++}
++
++static void mips_gic_set_vp_irq_impl(MIPSGICState *gic, int vp, int pin)
+ {
+     int ored_level = 0;
+     int i;
+@@ -50,6 +82,18 @@ static void mips_gic_set_vp_irq(MIPSGICState *gic, int vp, int pin)
+                                    pin + GIC_CPU_PIN_OFFSET,
+                                    ored_level);
+     } else {
++        if (gic_log_on()) {
++            static int budget = 120;
++            if (budget-- > 0) {
++                fprintf(stderr, "gic: cpu pin %d level %d (vp mask %08x pend %08x)\n",
++                        pin + GIC_CPU_PIN_OFFSET, ored_level,
++                        gic->vps[vp].mask, gic->vps[vp].pend);
++            }
++        }
++        if (getenv("MT7621_IPILOG") && vp != 0) {
++            fprintf(stderr, "ipilog: -> vp%d pin%d level%d\n",
++                    vp, pin + GIC_CPU_PIN_OFFSET, ored_level);
++        }
+         qemu_set_irq(gic->vps[vp].env->irq[pin + GIC_CPU_PIN_OFFSET],
+                      ored_level);
+     }
+@@ -70,6 +114,12 @@ static void gic_set_irq(void *opaque, int n_IRQ, int level)
+ {
+     MIPSGICState *gic = (MIPSGICState *) opaque;
+ 
++    if (gic_log_on()) {
++        static int budget = 200;
++        if (budget-- > 0) {
++            fprintf(stderr, "gic: input %d -> level %d\n", n_IRQ, level);
++        }
++    }
+     gic->irq_state[n_IRQ].pending = (uint8_t) level;
+     if (!gic->irq_state[n_IRQ].enabled) {
+         /* GIC interrupt source disabled */
+@@ -187,6 +237,9 @@ static uint64_t gic_read(void *opaque, hwaddr addr, unsigned size)
+                       size, addr);
+         break;
+     }
++    if (gic_log_on()) {
++        gic_log("rd", addr, ret);
++    }
+     return ret;
+ bad_offset:
+     qemu_log_mask(LOG_GUEST_ERROR, "Wrong GIC offset at 0x%" PRIx64 "\n", addr);
+@@ -259,6 +312,9 @@ bad_offset:
+ 
+ static void gic_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
+ {
++    if (gic_log_on()) {
++        gic_log("wr", addr, data);
++    }
+     int intr;
+     MIPSGICState *gic = (MIPSGICState *) opaque;
+     uint32_t vp_index = current_cpu->cpu_index;
+@@ -297,6 +353,12 @@ static void gic_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
+     case GIC_SH_WEDGE_OFS:
+         /* Figure out which VP/HW Interrupt this maps to */
+         intr = data & ~GIC_SH_WEDGE_RW_MSK;
++        if (getenv("MT7621_IPILOG")) {
++            fprintf(stderr, "ipilog: WEDGE irq=%u %s map_vp=%d pin=%u\n",
++                    intr, (data & GIC_SH_WEDGE_RW_MSK) ? "set" : "clr",
++                    (int)gic->irq_state[intr].map_vp,
++                    (unsigned)(gic->irq_state[intr].map_pin & GIC_MAP_MSK));
++        }
+         /* Mask/Enabled Checks */
+         OFFSET_CHECK(intr < gic->num_irq);
+         if (data & GIC_SH_WEDGE_RW_MSK) {
+diff --git a/hw/mips/Kconfig b/hw/mips/Kconfig
+index b59cb2f..c922d8f 100644
+--- a/hw/mips/Kconfig
++++ b/hw/mips/Kconfig
+@@ -86,3 +86,9 @@ config MIPS_BOSTON
+ 
+ config FW_CFG_MIPS
+     bool
++
++config MT7621
++    bool
++    default y
++    depends on MIPS
++    select SERIAL_MM
+diff --git a/hw/mips/meson.build b/hw/mips/meson.build
+index 390f0fd..2f2fba7 100644
+--- a/hw/mips/meson.build
++++ b/hw/mips/meson.build
+@@ -4,6 +4,7 @@ common_ss.add(when: 'CONFIG_FW_CFG_MIPS', if_true: files('fw_cfg.c'))
+ common_ss.add(when: 'CONFIG_LOONGSON3V', if_true: files('loongson3_bootp.c'))
+ mips_ss.add(when: 'CONFIG_LOONGSON3V', if_true: files('loongson3_virt.c'))
+ mips_ss.add(when: 'CONFIG_MALTA', if_true: files('malta.c'))
++mips_ss.add(when: 'CONFIG_MT7621', if_true: files('mt7621.c'))
+ mips_ss.add(when: 'CONFIG_MIPS_CPS', if_true: files('cps.c'))
+ 
+ if 'CONFIG_TCG' in config_all_accel
+diff --git a/hw/timer/mips_gictimer.c b/hw/timer/mips_gictimer.c
+index 2b0696d..1b9d359 100644
+--- a/hw/timer/mips_gictimer.c
++++ b/hw/timer/mips_gictimer.c
+@@ -9,12 +9,47 @@
+ #include "qemu/osdep.h"
+ #include "qemu/timer.h"
+ #include "hw/timer/mips_gictimer.h"
++#include <stdlib.h>
+ 
+-#define TIMER_PERIOD 10 /* 10 ns period for 100 Mhz frequency */
++static int gt_log_on(void)
++{
++    static int v = -1;
++    static int budget = 400;
++    if (v < 0) v = getenv("MT7621_GICTIMERLOG") != NULL;
++    if (!v) return 0;
++    if (budget-- <= 0) return 0;
++    return 1;
++}
++
++/*
++ * The GIC shared counter ticks at the SoC's "GIC frequency".  The MT7621
++ * feeds it from the CPU clock (RouterBOOT reports 875 MHz on the RB750Gr3 and
++ * OpenWrt programs its clockevents against that), which is why this has to be
++ * settable per machine instead of a fixed reference rate: with the wrong rate
++ * every guest timer fires 35x too early or too late.
++ */
++static uint32_t gictimer_freq = 25000000;
++
++void mips_gictimer_set_freq(uint32_t freq)
++{
++    gictimer_freq = freq ? freq : 25000000;
++}
+ 
+ uint32_t mips_gictimer_get_freq(MIPSGICTimerState *gic)
+ {
+-    return NANOSECONDS_PER_SECOND / TIMER_PERIOD;
++    return gictimer_freq;
++}
++
++/* Convert a QEMU virtual-clock timestamp into GIC counter ticks. */
++static uint64_t gictimer_ticks(uint64_t ns)
++{
++    return muldiv64(ns, gictimer_freq, NANOSECONDS_PER_SECOND);
++}
++
++/* Convert GIC counter ticks into nanoseconds. */
++static uint64_t gictimer_ns(uint64_t ticks)
++{
++    return muldiv64(ticks, NANOSECONDS_PER_SECOND, gictimer_freq);
+ }
+ 
+ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+@@ -23,9 +58,28 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+     uint64_t next;
+     uint32_t wait;
+ 
++    /*
++     * 0xffffffff is the reset value of the compare register and means "not
++     * programmed".  Treating it as a real deadline made the local compare
++     * interrupt fire once per 32-bit counter wrap even though the guest never
++     * asked for it; RouterOS 3.3.5 (which only dispatches shared interrupts)
++     * then sees an interrupt it can never acknowledge and spins forever with
++     * Cause.IP2 stuck high.
++     */
++    if (gictimer->vptimers[vp_index].comparelo == 0xffffffff &&
++        !getenv("MT7621_GICTIMER_LEGACY")) {
++        timer_del(gictimer->vptimers[vp_index].qtimer);
++        return;
++    }
+     wait = gictimer->vptimers[vp_index].comparelo - gictimer->sh_counterlo -
+-           (uint32_t)(now / TIMER_PERIOD);
+-    next = now + (uint64_t)wait * TIMER_PERIOD;
++           (uint32_t)gictimer_ticks(now);
++    next = now + gictimer_ns((uint64_t)wait);
++    if (gt_log_on()) {
++        fprintf(stderr, "gictimer: vp%d cmp=%08x cnt=%08x wait=%u now=%lld\n",
++                (int)vp_index, gictimer->vptimers[vp_index].comparelo,
++                gictimer->sh_counterlo + (uint32_t)gictimer_ticks(now),
++                wait, (long long)now);
++    }
+ 
+     timer_mod(gictimer->vptimers[vp_index].qtimer, next);
+ }
+@@ -37,6 +91,10 @@ static void gic_vptimer_expire(MIPSGICTimerState *gictimer, uint32_t vp_index,
+         /* timer stopped */
+         return;
+     }
++    if (gt_log_on()) {
++        fprintf(stderr, "gictimer: EXPIRE vp%d now=%lld\n",
++                (int)vp_index, (long long)now);
++    }
+     gictimer->cb(gictimer->opaque, vp_index);
+     gic_vptimer_update(gictimer, vp_index, now);
+ }
+@@ -64,7 +122,7 @@ uint32_t mips_gictimer_get_sh_count(MIPSGICTimerState *gictimer)
+                 gic_vptimer_expire(gictimer, i, now);
+             }
+         }
+-        return gictimer->sh_counterlo + (uint32_t)(now / TIMER_PERIOD);
++        return gictimer->sh_counterlo + (uint32_t)gictimer_ticks(now);
+     }
+ }
+ 
+@@ -78,7 +136,7 @@ void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
+     } else {
+         /* Store new count register */
+         now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+-        gictimer->sh_counterlo = count - (uint32_t)(now / TIMER_PERIOD);
++        gictimer->sh_counterlo = count - (uint32_t)gictimer_ticks(now);
+         /* Update timer timer */
+         for (i = 0; i < gictimer->num_vps; i++) {
+             gic_vptimer_update(gictimer, i, now);
+@@ -118,7 +176,7 @@ void mips_gictimer_stop_count(MIPSGICTimerState *gictimer)
+     gictimer->countstop = 1;
+     /* Store the current value */
+     gictimer->sh_counterlo +=
+-        (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / TIMER_PERIOD);
++        (uint32_t)gictimer_ticks(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+     for (i = 0; i < gictimer->num_vps; i++) {
+         timer_del(gictimer->vptimers[i].qtimer);
+     }
+diff --git a/include/exec/icache-shadow.h b/include/exec/icache-shadow.h
+new file mode 100644
+index 0000000..16a36f6
+--- /dev/null
++++ b/include/exec/icache-shadow.h
+@@ -0,0 +1,54 @@
++/*
++ * Minimal instruction-cache shadow (opt-in, MIPS).
++ *
++ * Real MIPS CPUs have separate I and D caches: a store does not change what
++ * the instruction fetch unit sees until the I-cache is invalidated.  Some
++ * guests rely on that.  In particular the MIPS compressed-kernel loader
++ * (arch/mips/boot/compressed/) is placed at its load address and is then
++ * *overwritten by its own decompression output*; it only survives because its
++ * instructions are still in the I-cache.  The kernel even admits it with a
++ * "FIXME: should we flush cache here?" comment.
++ *
++ * Plain TCG has no such separation: every instruction fetch reads the current
++ * RAM contents, so after the decompressor wrote over the loader the CPU
++ * re-translates those bytes as code and executes garbage.
++ *
++ * This provides a small page-granular shadow of instruction memory, consulted
++ * only for instruction fetch and only inside an address window chosen by the
++ * machine.  `cache`/`synci` instructions flush it, matching the architectural
++ * I-cache invalidation.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef EXEC_ICACHE_SHADOW_H
++#define EXEC_ICACHE_SHADOW_H
++
++#include "exec/vaddr.h"
++
++/*
++ * Enable the shadow for [lo, hi).  Pages are snapshot on their first
++ * instruction fetch.
++ */
++void icache_shadow_enable(uint64_t lo, uint64_t hi);
++
++/* Drop every snapshot. */
++void icache_shadow_flush(void);
++
++/*
++ * Drop the snapshot of the page containing @addr (one `cache`/`synci` line
++ * invalidate).  O(1), so a guest flushing line by line does not thrash.
++ */
++void icache_shadow_invalidate(uint64_t addr);
++
++/* Whether the shadow is enabled (used to decide whether to emit helpers). */
++bool icache_shadow_active(void);
++
++/*
++ * Instruction fetch: return the cached instruction word at @addr, snapshotting
++ * the containing page on first use.  Falls back to @fallback when the address
++ * is outside the enabled window or not plain RAM.
++ */
++uint32_t icache_shadow_ldl(CPUArchState *env, vaddr addr, int mmu_idx,
++                           uint32_t fallback);
++
++#endif
+diff --git a/include/hw/timer/mips_gictimer.h b/include/hw/timer/mips_gictimer.h
+index c7ca6c8..17d71dc 100644
+--- a/include/hw/timer/mips_gictimer.h
++++ b/include/hw/timer/mips_gictimer.h
+@@ -31,6 +31,7 @@ struct MIPSGICTimerState {
+     MIPSGICTimerCB *cb;
+ };
+ 
++void mips_gictimer_set_freq(uint32_t freq);
+ uint32_t mips_gictimer_get_freq(MIPSGICTimerState *gic);
+ uint32_t mips_gictimer_get_sh_count(MIPSGICTimerState *gic);
+ void mips_gictimer_store_sh_count(MIPSGICTimerState *gic, uint64_t count);
+diff --git a/target/mips/cpu-defs.c.inc b/target/mips/cpu-defs.c.inc
+index d93b9d3..26ad941 100644
+--- a/target/mips/cpu-defs.c.inc
++++ b/target/mips/cpu-defs.c.inc
+@@ -18,6 +18,39 @@
+  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++/*
++ * MT7621 (1004Kc) L1 caches: 32 KiB, 4-way, 32-byte lines, for both the
++ * instruction and the data cache.
++ *
++ * Config1.{I,D}l encode the line size as 2^(n+1), so 32 bytes is Dl=Il=4, and
++ * the generic MIPS32 probe in Linux computes sets = 32 << (Is+1), i.e. 256
++ * sets for a 4-way 32 KiB cache.  These fields matter beyond reporting:
++ * r4k_blast_icache_setup()/r4k_blast_dcache_setup() only install a blast
++ * routine for line sizes 16/32/64/128, so an implausible size (e.g. 8 bytes)
++ * leaves r4k_blast_icache NULL and the kernel's first cache flush jumps to 0.
++ * Firmware also derives DMA buffer alignment from Dl.
++ *
++ * Overridable for bring-up testing.
++ */
++#ifndef MT7621_CACHE_IS
++#define MT7621_CACHE_IS 2
++#endif
++#ifndef MT7621_CACHE_IL
++#define MT7621_CACHE_IL 4
++#endif
++#ifndef MT7621_CACHE_IA
++#define MT7621_CACHE_IA 3
++#endif
++#ifndef MT7621_CACHE_DS
++#define MT7621_CACHE_DS 2
++#endif
++#ifndef MT7621_CACHE_DL
++#define MT7621_CACHE_DL 4
++#endif
++#ifndef MT7621_CACHE_DA
++#define MT7621_CACHE_DA 3
++#endif
++
+ /* CPU / CPU family specific config register values. */
+ 
+ /* Have config1, uncached coherency */
+@@ -317,6 +350,80 @@ const mips_def_t mips_defs[] =
+         .insn_flags = CPU_MIPS32R2 | ASE_MIPS16 | ASE_DSP,
+         .mmu_type = MMU_TYPE_R4000,
+     },
++    {
++        /*
++         * MediaTek MT7621 uses a 1004Kc (34K-class, multi-threaded) core.
++         * The only functional difference from 34Kf that matters for
++         * firmware bring-up is that it must decode MIPS16: the Breed
++         * stage-1 stub is MIPS32 and JALX-es into MIPS16 code, so a CPU
++         * model that advertises microMIPS would decode that code with the
++         * wrong decoder.
++         */
++        .name = "1004Kc",
++        .CP0_PRid = 0x0001992f,
++        .CP0_Config0 = MIPS_CONFIG0 | (0x1 << CP0C0_AR) |
++                       (MMU_TYPE_R4000 << CP0C0_MT),
++        /*
++         * Dl/Il encode the cache line size as 2^(Dl+1) and Is/Is the number
++         * of sets as 32 << (Is+1).  The D-cache line size is what the
++         * firmware derives its DMA buffer alignment from, so it must match
++         * the part, not merely be plausible; Linux likewise only builds its
++         * cache-flush routines for 16/32/64/128-byte lines.
++         */
++        .CP0_Config1 = MIPS_CONFIG1 | (1 << CP0C1_FP) | (63 << CP0C1_MMU) |
++                       (MT7621_CACHE_IS << CP0C1_IS) | (MT7621_CACHE_IL << CP0C1_IL) |
++                       (MT7621_CACHE_IA << CP0C1_IA) |
++                       (MT7621_CACHE_DS << CP0C1_DS) | (MT7621_CACHE_DL << CP0C1_DL) |
++                       (MT7621_CACHE_DA << CP0C1_DA) |
++                       (1 << CP0C1_CA),
++        .CP0_Config2 = MIPS_CONFIG2,
++        /*
++         * A real 1004Kc implements the UserLocal register (ULRI) and the
++         * Cluster Manager (CMGCR, which also makes QEMU set CMGCRBase =
++         * 0x1fbf8000 >> 4).  MikroTik's 5.6 mmips kernel checks ULRI and then
++         * reads CMGCRBase to find the CM/GIC base; without these bits it
++         * gives up on that mapping init and later stores through a NULL base
++         * (PC 0x80410c1c, address 0xcc).
++         */
++        .CP0_Config3 = MIPS_CONFIG3 | (1 << CP0C3_VInt) | (1 << CP0C3_MT) |
++                       (1 << CP0C3_DSPP) | (1 << CP0C3_ULRI) |
++                       (1 << CP0C3_CMGCR),
++        .CP0_LLAddr_rw_bitmask = 0,
++        .CP0_LLAddr_shift = 0,
++        .SYNCI_Step = 32,
++        .CCRes = 2,
++        .CP0_Status_rw_bitmask = 0x3778FF1F,
++        .CP0_TCStatus_rw_bitmask = (0 << CP0TCSt_TCU3) | (0 << CP0TCSt_TCU2) |
++                    (1 << CP0TCSt_TCU1) | (1 << CP0TCSt_TCU0) |
++                    (0 << CP0TCSt_TMX) | (1 << CP0TCSt_DT) |
++                    (1 << CP0TCSt_DA) | (1 << CP0TCSt_A) |
++                    (0x3 << CP0TCSt_TKSU) | (1 << CP0TCSt_IXMT) |
++                    (0xff << CP0TCSt_TASID),
++        .CP1_fcr0 = (1 << FCR0_F64) | (1 << FCR0_L) | (1 << FCR0_W) |
++                    (1 << FCR0_D) | (1 << FCR0_S) | (0x92 << FCR0_PRID),
++        .CP1_fcr31 = 0,
++        .CP1_fcr31_rw_bitmask = 0xFF83FFFF,
++        .CP0_SRSCtl = (0xf << CP0SRSCtl_HSS),
++        .CP0_SRSConf0_rw_bitmask = 0x3fffffff,
++        .CP0_SRSConf0 = (1U << CP0SRSC0_M) | (0x3fe << CP0SRSC0_SRS3) |
++                    (0x3fe << CP0SRSC0_SRS2) | (0x3fe << CP0SRSC0_SRS1),
++        .CP0_SRSConf1_rw_bitmask = 0x3fffffff,
++        .CP0_SRSConf1 = (1U << CP0SRSC1_M) | (0x3fe << CP0SRSC1_SRS6) |
++                    (0x3fe << CP0SRSC1_SRS5) | (0x3fe << CP0SRSC1_SRS4),
++        .CP0_SRSConf2_rw_bitmask = 0x3fffffff,
++        .CP0_SRSConf2 = (1U << CP0SRSC2_M) | (0x3fe << CP0SRSC2_SRS9) |
++                    (0x3fe << CP0SRSC2_SRS8) | (0x3fe << CP0SRSC2_SRS7),
++        .CP0_SRSConf3_rw_bitmask = 0x3fffffff,
++        .CP0_SRSConf3 = (1U << CP0SRSC3_M) | (0x3fe << CP0SRSC3_SRS12) |
++                    (0x3fe << CP0SRSC3_SRS11) | (0x3fe << CP0SRSC3_SRS10),
++        .CP0_SRSConf4_rw_bitmask = 0x3fffffff,
++        .CP0_SRSConf4 = (0x3fe << CP0SRSC4_SRS15) |
++                    (0x3fe << CP0SRSC4_SRS14) | (0x3fe << CP0SRSC4_SRS13),
++        .SEGBITS = 32,
++        .PABITS = 32,
++        .insn_flags = CPU_MIPS32R2 | ASE_MIPS16 | ASE_DSP,
++        .mmu_type = MMU_TYPE_R4000,
++    },
+     {
+         .name = "74Kf",
+         .CP0_PRid = 0x00019700,
+diff --git a/target/mips/tcg/system/special_helper.c b/target/mips/tcg/system/special_helper.c
+index b54cbe8..fb90f45 100644
+--- a/target/mips/tcg/system/special_helper.c
++++ b/target/mips/tcg/system/special_helper.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "exec/icache-shadow.h"
+ #include "qemu/log.h"
+ #include "cpu.h"
+ #include "exec/helper-proto.h"
+@@ -101,6 +102,8 @@ bool mips_io_recompile_replay_branch(CPUState *cs, const TranslationBlock *tb)
+     return false;
+ }
+ 
++void mt7621_sysret_trace(CPUMIPSState *env);
++
+ static inline void exception_return(CPUMIPSState *env)
+ {
+     debug_pre_eret(env);
+@@ -113,6 +116,9 @@ static inline void exception_return(CPUMIPSState *env)
+     }
+     compute_hflags(env);
+     debug_post_eret(env);
++    if (getenv("MT7621_RECVLOG")) {
++        mt7621_sysret_trace(env);
++    }
+ }
+ 
+ void helper_eret(CPUMIPSState *env)
+@@ -139,6 +145,15 @@ void helper_deret(CPUMIPSState *env)
+     debug_post_eret(env);
+ }
+ 
++/*
++ * Flush the instruction-cache shadow: what the guest writes to memory is
++ * visible to instruction fetch again.
++ */
++void helper_icache_shadow_flush(CPUMIPSState *env, target_ulong addr)
++{
++    icache_shadow_invalidate(addr);
++}
++
+ void helper_cache(CPUMIPSState *env, target_ulong addr, uint32_t op)
+ {
+     static const char *const type_name[] = {
+diff --git a/target/mips/tcg/system/tlb_helper.c b/target/mips/tcg/system/tlb_helper.c
+index 566924b..b38307c 100644
+--- a/target/mips/tcg/system/tlb_helper.c
++++ b/target/mips/tcg/system/tlb_helper.c
+@@ -1028,6 +1028,11 @@ static inline void set_badinstr_registers(CPUMIPSState *env)
+     }
+ }
+ 
++static int mt7621_pend;
++static int mt7621_pendfd;
++static uint32_t mt7621_pendbuf;
++void mt7621_sysret_trace(CPUMIPSState *env);
++
+ void mips_cpu_do_interrupt(CPUState *cs)
+ {
+     MIPSCPU *cpu = MIPS_CPU(cs);
+@@ -1223,10 +1228,96 @@ void mips_cpu_do_interrupt(CPUState *cs)
+     case EXCP_DBE:
+         cause = 7;
+         goto set_EPC;
+-    case EXCP_SYSCALL:
++    case EXCP_SYSCALL: {
++        static int budget = 400;
++        static int netbudget = 4000;
++        if (getenv("MT7621_RECVLOG")) {
++            unsigned nr2 = (unsigned)env->active_tc.gpr[2];
++            /*
++             * The receive buffer doubles as the build buffer for sendto(),
++             * so dumping it on recvfrom() entry only shows the previous
++             * send.  Sample it at the first syscall after the call returned
++             * instead.
++             */
++            if (mt7621_pend) {
++                char pbuf[56];
++                size_t i;
++                mt7621_pend = 0;
++                memset(pbuf, 0, sizeof(pbuf));
++                cpu_memory_rw_debug(env_cpu(env), mt7621_pendbuf, (void *)pbuf, 48,
++                                    false);
++                fprintf(stderr, "net got fd=%d:", mt7621_pendfd);
++                for (i = 0; i < 48; i++) {
++                    fprintf(stderr, " %02x", (unsigned char)pbuf[i]);
++                }
++                fprintf(stderr, " |");
++                for (i = 0; i < 48; i++) {
++                    fputc(g_ascii_isprint(pbuf[i]) ? pbuf[i] : '.', stderr);
++                }
++                fprintf(stderr, "|\n");
++            }
++            if ((nr2 == 4176 || nr2 == 4180) && netbudget-- > 0) {
++                uint32_t b = (uint32_t)env->active_tc.gpr[5];
++                unsigned n = (unsigned)env->active_tc.gpr[6];
++                char dbuf[64];
++                size_t i;
++                memset(dbuf, 0, sizeof(dbuf));
++                if (n > 48) {
++                    n = 48;
++                }
++                cpu_memory_rw_debug(env_cpu(env), b, (void *)dbuf, n, false);
++                fprintf(stderr, "net %s fd=%u buf=%08x len=%u:",
++                        nr2 == 4176 ? "recv" : "send",
++                        (unsigned)env->active_tc.gpr[4], b,
++                        (unsigned)env->active_tc.gpr[6]);
++                for (i = 0; i < n; i++) {
++                    fprintf(stderr, " %02x", (unsigned char)dbuf[i]);
++                }
++                fprintf(stderr, " |");
++                for (i = 0; i < n; i++) {
++                    fputc(g_ascii_isprint(dbuf[i]) ? dbuf[i] : '.', stderr);
++                }
++                fprintf(stderr, "|\n");
++                if (nr2 == 4176) {
++                    mt7621_pend = 1;
++                    mt7621_pendfd = (int)env->active_tc.gpr[4];
++                    mt7621_pendbuf = b;
++                }
++            }
++        }
++        if (getenv("MT7621_SYSCALLLOG") && budget-- > 0) {
++            unsigned nr = (unsigned)env->active_tc.gpr[2];
++            fprintf(stderr, "syscall nr=%u a0=%08x a1=%08x a2=%08x pc=%08x",
++                    nr, (uint32_t)env->active_tc.gpr[4],
++                    (uint32_t)env->active_tc.gpr[5],
++                    (uint32_t)env->active_tc.gpr[6],
++                    (uint32_t)env->active_tc.PC);
++            /* 4005 = open, 4288 = openat: print the pathname */
++            if (nr == 4005 || nr == 4288) {
++                uint32_t a = (uint32_t)env->active_tc.gpr[4];
++                char path[80];
++                size_t i;
++                if (nr == 4288) {
++                    a = (uint32_t)env->active_tc.gpr[5];
++                }
++                memset(path, 0, sizeof(path));
++                if (cpu_memory_rw_debug(env_cpu(env), a, (void *)path,
++                                        sizeof(path) - 1, false) >= 0) {
++                    for (i = 0; i < sizeof(path) - 1; i++) {
++                        if (!g_ascii_isprint(path[i])) {
++                            path[i] = 0;
++                            break;
++                        }
++                    }
++                    fprintf(stderr, " path=\"%s\"", path);
++                }
++            }
++            fprintf(stderr, "\n");
++        }
+         cause = 8;
+         update_badinstr = 1;
+         goto set_EPC;
++    }
+     case EXCP_BREAK:
+         cause = 9;
+         update_badinstr = 1;
+@@ -1324,6 +1415,16 @@ void mips_cpu_do_interrupt(CPUState *cs)
+         }
+ 
+         env->active_tc.PC += offset;
++        if (getenv("MT7621_VECLOG")) {
++            static int budget = 60;
++            if (budget-- > 0) {
++                fprintf(stderr, "vec: ebase=%08x exbase=%08x status=%08x "
++                        "cause=%d pc=%08x epc=%08x\n",
++                        (unsigned)env->CP0_EBase, (unsigned)env->exception_base,
++                        (unsigned)env->CP0_Status, cause,
++                        (unsigned)env->active_tc.PC, (unsigned)env->CP0_EPC);
++            }
++        }
+         set_hflags_for_handler(env);
+         env->CP0_Cause = (env->CP0_Cause & ~(0x1f << CP0Ca_EC)) |
+                          (cause << CP0Ca_EC);
+@@ -1350,6 +1451,42 @@ void mips_cpu_do_interrupt(CPUState *cs)
+     cs->exception_index = EXCP_NONE;
+ }
+ 
++/*
++ * MT7621_RECVLOG: the netinstall agent polls its discovery sockets through
++ * the libc syscall stub at 0x432228, so sample the return value right after
++ * the stub resumes: a positive v0 is the number of bytes recvfrom() put in
++ * the buffer, which is the only reliable way to see what the agent got.
++ */
++
++void mt7621_sysret_trace(CPUMIPSState *env)
++{
++    uint32_t pc = (uint32_t)env->active_tc.PC;
++    int32_t v0 = (int32_t)env->active_tc.gpr[2];
++    char pbuf[56];
++    size_t i;
++
++    if (!mt7621_pend || pc != 0x43222c) {
++        return;
++    }
++    mt7621_pend = 0;
++    fprintf(stderr, "net ret fd=%d v0=%d", mt7621_pendfd, v0);
++    if (v0 > 0 && v0 < 1500) {
++        memset(pbuf, 0, sizeof(pbuf));
++        cpu_memory_rw_debug(env_cpu(env), mt7621_pendbuf, (void *)pbuf,
++                            v0 < 48 ? v0 : 48, false);
++        fprintf(stderr, ":");
++        for (i = 0; i < 48; i++) {
++            fprintf(stderr, " %02x", (unsigned char)pbuf[i]);
++        }
++        fprintf(stderr, " |");
++        for (i = 0; i < 48; i++) {
++            fputc(g_ascii_isprint(pbuf[i]) ? pbuf[i] : '.', stderr);
++        }
++        fprintf(stderr, "|");
++    }
++    fprintf(stderr, "\n");
++}
++
+ bool mips_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+ {
+     if (interrupt_request & CPU_INTERRUPT_HARD) {
+diff --git a/target/mips/tcg/system_helper.h.inc b/target/mips/tcg/system_helper.h.inc
+index eaac5e2..12ec343 100644
+--- a/target/mips/tcg/system_helper.h.inc
++++ b/target/mips/tcg/system_helper.h.inc
+@@ -175,6 +175,7 @@ DEF_HELPER_1(eret, void, env)
+ DEF_HELPER_1(eretnc, void, env)
+ DEF_HELPER_1(deret, void, env)
+ DEF_HELPER_3(cache, void, env, tl, i32)
++DEF_HELPER_2(icache_shadow_flush, void, env, tl)
+ 
+ #ifdef TARGET_MIPS64
+ /* Longson CSR */
+diff --git a/target/mips/tcg/translate.c b/target/mips/tcg/translate.c
+index 54849e9..7a6804a 100644
+--- a/target/mips/tcg/translate.c
++++ b/target/mips/tcg/translate.c
+@@ -28,6 +28,7 @@
+ #include "exec/helper-proto.h"
+ #include "exec/translation-block.h"
+ #include "exec/target_page.h"
++#include "exec/icache-shadow.h"
+ #include "semihosting/semihost.h"
+ #include "trace.h"
+ #include "fpu_helper.h"
+@@ -1227,7 +1228,29 @@ void gen_store_gpr_hi(TCGv_i64 t, int reg)
+ }
+ #endif /* TARGET_MIPS64 */
+ 
+-/* Moves to/from shadow registers. */
++/*
++ * Moves to/from shadow registers.
++ *
++ * The shadow register sets live in CPUMIPSState.tcs[]; index 0 of that array
++ * is also CPU TC0's state, so addressing the array from the start of the CPU
++ * state (as the register file base) aliases sets 1..15 onto unrelated fields
++ * such as active_tc.PC and the CP0 registers.  Address the array explicitly.
++ */
++static inline void gen_srsgpr_addr(TCGv_ptr addr, int reg)
++{
++    TCGv_i32 t2 = tcg_temp_new_i32();
++
++    tcg_gen_ld_i32(t2, tcg_env, offsetof(CPUMIPSState, CP0_SRSCtl));
++    tcg_gen_shri_i32(t2, t2, CP0SRSCtl_PSS);
++    tcg_gen_andi_i32(t2, t2, 0xf);
++    tcg_gen_muli_i32(t2, t2, sizeof(TCState));
++    tcg_gen_ext_i32_ptr(addr, t2);
++    tcg_gen_addi_ptr(addr, addr, offsetof(CPUMIPSState, tcs));
++    tcg_gen_add_ptr(addr, tcg_env, addr);
++    tcg_gen_addi_ptr(addr, addr, offsetof(TCState, gpr));
++    tcg_gen_addi_ptr(addr, addr, sizeof(target_ulong) * reg);
++}
++
+ static inline void gen_load_srsgpr(int from, int to)
+ {
+     TCGv t0 = tcg_temp_new();
+@@ -1235,17 +1258,10 @@ static inline void gen_load_srsgpr(int from, int to)
+     if (from == 0) {
+         tcg_gen_movi_tl(t0, 0);
+     } else {
+-        TCGv_i32 t2 = tcg_temp_new_i32();
+         TCGv_ptr addr = tcg_temp_new_ptr();
+ 
+-        tcg_gen_ld_i32(t2, tcg_env, offsetof(CPUMIPSState, CP0_SRSCtl));
+-        tcg_gen_shri_i32(t2, t2, CP0SRSCtl_PSS);
+-        tcg_gen_andi_i32(t2, t2, 0xf);
+-        tcg_gen_muli_i32(t2, t2, sizeof(target_ulong) * 32);
+-        tcg_gen_ext_i32_ptr(addr, t2);
+-        tcg_gen_add_ptr(addr, tcg_env, addr);
+-
+-        tcg_gen_ld_tl(t0, addr, sizeof(target_ulong) * from);
++        gen_srsgpr_addr(addr, from);
++        tcg_gen_ld_tl(t0, addr, 0);
+     }
+     gen_store_gpr(t0, to);
+ }
+@@ -1254,18 +1270,11 @@ static inline void gen_store_srsgpr(int from, int to)
+ {
+     if (to != 0) {
+         TCGv t0 = tcg_temp_new();
+-        TCGv_i32 t2 = tcg_temp_new_i32();
+         TCGv_ptr addr = tcg_temp_new_ptr();
+ 
+         gen_load_gpr(t0, from);
+-        tcg_gen_ld_i32(t2, tcg_env, offsetof(CPUMIPSState, CP0_SRSCtl));
+-        tcg_gen_shri_i32(t2, t2, CP0SRSCtl_PSS);
+-        tcg_gen_andi_i32(t2, t2, 0xf);
+-        tcg_gen_muli_i32(t2, t2, sizeof(target_ulong) * 32);
+-        tcg_gen_ext_i32_ptr(addr, t2);
+-        tcg_gen_add_ptr(addr, tcg_env, addr);
+-
+-        tcg_gen_st_tl(t0, addr, sizeof(target_ulong) * to);
++        gen_srsgpr_addr(addr, to);
++        tcg_gen_st_tl(t0, addr, 0);
+     }
+ }
+ 
+@@ -14390,6 +14399,14 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
+              * Break the TB to be able to sync copied instructions
+              * immediately.
+              */
++#ifndef CONFIG_USER_ONLY
++            if (icache_shadow_active()) {
++                TCGv isa = tcg_temp_new();
++
++                gen_base_offset_addr(ctx, isa, rs, imm);
++                gen_helper_icache_shadow_flush(tcg_env, isa);
++            }
++#endif
+             ctx->base.is_jmp = DISAS_STOP;
+             break;
+         case OPC_BPOSGE32:    /* MIPS DSP branch */
+@@ -14666,6 +14683,20 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
+         if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
+             gen_cache_operation(ctx, rt, rs, imm);
+         }
++#ifndef CONFIG_USER_ONLY
++        /*
++         * An I-cache invalidate makes stores visible to instruction fetch;
++         * ops 1 and 2 are Index Load/Store Tag, which do not.
++         */
++        if (icache_shadow_active() &&
++            ((rt & 3) == 0 || (rt & 3) == 3) &&
++            ((rt >> 2) & 7) != 1 && ((rt >> 2) & 7) != 2) {
++            TCGv ica = tcg_temp_new();
++
++            gen_base_offset_addr(ctx, ica, rs, imm);
++            gen_helper_icache_shadow_flush(tcg_env, ica);
++        }
++#endif
+         /* Treat as NOP. */
+         break;
+     case OPC_PREF:

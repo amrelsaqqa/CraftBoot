@@ -1,0 +1,6 @@
+Patches in this directory apply to every target.
+
+Rule: only move a patch here once
+`make TARGETS="<all targets>" check-patches` passes with it present, i.e. it is
+genuinely shared (the TCG/exec hooks are the likely candidates).  Anything
+touching a single architecture belongs to targets/<arch>/patches/.

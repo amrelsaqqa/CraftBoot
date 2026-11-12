@@ -1,0 +1,31 @@
+From 4392fb2559f87084da9cb05b28deca2c1dd4c94f Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Thu, 12 Nov 2026 02:42:36 +0200
+Subject: [PATCH 3/5] mt7621: NFI 0xEC, default-on CMGCR/CMGIC/RX_LSO, DL +
+ CACHLOG knobs
+
+---
+ target/mips/tcg/system/special_helper.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/target/mips/tcg/system/special_helper.c b/target/mips/tcg/system/special_helper.c
+index bbb6fa5..a4d6faa 100644
+--- a/target/mips/tcg/system/special_helper.c
++++ b/target/mips/tcg/system/special_helper.c
+@@ -156,6 +156,16 @@ void helper_icache_shadow_flush(CPUMIPSState *env, target_ulong addr)
+ 
+ void helper_cache(CPUMIPSState *env, target_ulong addr, uint32_t op)
+ {
++    if (getenv("MT7621_CACHLOG")) {
++        static int budget = 4000;
++
++        if (budget-- > 0) {
++            fprintf(stderr, "cache: type=%u op=%u addr=%08x pc=%08x\n",
++                    (unsigned)extract32(op, 0, 2),
++                    (unsigned)extract32(op, 2, 3), (unsigned)addr,
++                    (unsigned)env->active_tc.PC);
++        }
++    }
+     static const char *const type_name[] = {
+         "Primary Instruction",
+         "Primary Data or Unified Primary",

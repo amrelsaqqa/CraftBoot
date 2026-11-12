@@ -1,0 +1,147 @@
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index ad94f96..ad69844 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -317,6 +317,17 @@ static bool check_for_breakpoints_slow(CPUState *cpu, vaddr pc,
+         if (pc == bp->pc) {
+             bool match_bp = false;
+ 
++            /*
++             * A board-owned breakpoint may handle itself: it changes the CPU
++             * state and returns true, and execution continues from there
++             * instead of raising a debug exception (which would stop the VM
++             * when no debugger is attached).
++             */
++            if ((bp->flags & BP_MACHINE) && cpu_breakpoint_hook &&
++                cpu_breakpoint_hook(cpu, bp)) {
++                return true;
++            }
++
+             if (bp->flags & BP_GDB) {
+                 match_bp = true;
+             } else if (bp->flags & BP_CPU) {
+diff --git a/cpu-common.c b/cpu-common.c
+index 988d057..97cb508 100644
+--- a/cpu-common.c
++++ b/cpu-common.c
+@@ -24,6 +24,9 @@
+ #include "qemu/lockable.h"
+ #include "trace/trace-root.h"
+ 
++/* Set by a board that wants to service its own breakpoints (BP_MACHINE). */
++bool (*cpu_breakpoint_hook)(CPUState *cpu, CPUBreakpoint *bp);
++
+ QemuMutex qemu_cpu_list_lock;
+ static QemuCond exclusive_cond;
+ static QemuCond exclusive_resume;
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 7877506..3b57cef 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -693,3 +693,8 @@ config ARMSSE
+     select UNIMP
+     select SSE_COUNTER
+     select SSE_TIMER
++
++config IPQ4019
++    bool
++    default y
++    depends on TCG && ARM
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index aeaf654..1db12af 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -107,4 +107,5 @@ arm_common_ss.add(when: 'CONFIG_VEXPRESS', if_true: files('vexpress.c'))
+ arm_common_ss.add(files('boot.c'))
+ 
+ hw_arch += {'arm': arm_ss}
++arm_common_ss.add(when: 'CONFIG_IPQ4019', if_true: files('ipq4019.c'))
+ hw_common_arch += {'arm': arm_common_ss}
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+index 9615051..38b9315 100644
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -1138,7 +1138,7 @@ void cpu_single_step(CPUState *cpu, int enabled);
+ #define BP_MEM_WRITE          0x02
+ #define BP_MEM_ACCESS         (BP_MEM_READ | BP_MEM_WRITE)
+ #define BP_STOP_BEFORE_ACCESS 0x04
+-/* 0x08 currently unused */
++#define BP_MACHINE            0x08
+ #define BP_GDB                0x10
+ #define BP_CPU                0x20
+ #define BP_ANY                (BP_GDB | BP_CPU)
+@@ -1147,6 +1147,20 @@ void cpu_single_step(CPUState *cpu, int enabled);
+ #define BP_WATCHPOINT_HIT_WRITE (BP_MEM_WRITE << BP_HIT_SHIFT)
+ #define BP_WATCHPOINT_HIT       (BP_MEM_ACCESS << BP_HIT_SHIFT)
+ 
++/*
++ * Optional machine-level breakpoint hook.
++ *
++ * A breakpoint inserted with BP_MACHINE is offered to this hook before QEMU
++ * raises a debug exception.  If the hook returns true the machine has dealt
++ * with the breakpoint itself -- normally by setting the CPU's state -- and
++ * execution resumes from wherever the hook left the PC.  No debugger needs to
++ * be attached for this, and no guest code is modified, so a board can enforce
++ * a policy at a fixed address across reboots.
++ *
++ * Return false to leave the breakpoint to the normal handling.
++ */
++extern bool (*cpu_breakpoint_hook)(CPUState *cpu, CPUBreakpoint *bp);
++
+ int cpu_breakpoint_insert(CPUState *cpu, vaddr pc, int flags,
+                           CPUBreakpoint **breakpoint);
+ int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags);
+diff --git a/target/arm/tcg/tlb_helper.c b/target/arm/tcg/tlb_helper.c
+index 5c689d3..7becbdb 100644
+--- a/target/arm/tcg/tlb_helper.c
++++ b/target/arm/tcg/tlb_helper.c
+@@ -6,6 +6,7 @@
+  * SPDX-License-Identifier: GPL-2.0-or-later
+  */
+ #include "qemu/osdep.h"
++#include "qemu/log.h"
+ #include "cpu.h"
+ #include "internals.h"
+ #include "cpu-features.h"
+@@ -184,6 +185,21 @@ void arm_deliver_fault(ARMCPU *cpu, vaddr addr,
+     uint32_t exc, fsr, fsc;
+     uint64_t syn;
+ 
++    /*
++     * Fault tracing (QEMU_IPQ_FAULT_LOG=1).  An oops the guest only reports
++     * through a message we cannot read (a suppressed log ring) is still a
++     * fault here, and pc/lr/sp name the code that did it.
++     */
++    if (getenv("QEMU_IPQ_FAULT_LOG")) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "arm: fault %d at 0x%" VADDR_PRIx " (%s) pc 0x%" PRIx32
++                      " lr 0x%" PRIx32 " sp 0x%" PRIx32 " cpsr 0x%" PRIx32
++                      "\n", fi->type, addr,
++                      access_type == MMU_INST_FETCH ? "fetch" : "data",
++                      env->regs[15], env->regs[14], env->regs[13],
++                      cpsr_read(env));
++    }
++
+     /*
+      * We know this must be a data or insn abort, and that
+      * env->exception.syndrome contains the template syndrome set
+@@ -322,6 +338,19 @@ void arm_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
+     ARMCPU *cpu = ARM_CPU(cs);
+     ARMMMUFaultInfo fi = {};
+ 
++    /*
++     * A synchronous external abort is always a modelling gap: the guest hit a
++     * device the machine does not have.  Print both addresses -- the guest's
++     * virtual one (what the driver wrote) and the physical one after the MMU
++     * (which device is missing) -- so the gap can be found from the log.
++     */
++    qemu_log_mask(LOG_GUEST_ERROR,
++                  "arm: external abort at phys 0x%" HWADDR_PRIx
++                  " (vaddr 0x%" VADDR_PRIx ", %u byte %s, pc 0x%" PRIx32 ")\n",
++                  physaddr, addr, size,
++                  access_type == MMU_DATA_STORE ? "write" : "read",
++                  cpu->env.regs[15]);
++
+     /* now we have a real cpu fault */
+     cpu_restore_state(cs, retaddr);
+ 

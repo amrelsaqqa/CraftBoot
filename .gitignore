@@ -1,0 +1,18 @@
+# downloads, build trees, authoring checkouts
+/build/
+/cache/
+/dev/
+
+# large images, dumps and prebuilt payloads (kept outside git)
+/artifacts/
+/test-images/
+*.bin
+*.die
+*.squash
+*.o
+*.ser
+__pycache__/
+
+# generated from the .S sources in tests/arm/ipq4019/payloads
+tests/*/*/payloads/*.o
+tests/*/*/payloads/*.bin

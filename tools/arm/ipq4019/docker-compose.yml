@@ -1,0 +1,109 @@
+# docker-compose.yml -- run this machine against your own flash dumps.
+#
+#   mkdir -p dumps logs
+#   cp ~/dump-708-ipq-openwrt-24.10-32mb.bin  dumps/openwrt.bin
+#   cp ~/mikrotik-dump-latest7.17-32m.bin     dumps/routeros.bin
+#
+#   docker compose up --build -d openwrt      # build once, boot in background
+#   docker compose logs -f openwrt            # what the launcher says
+#   ncat 127.0.0.1 4444                       # UART0 (PuTTY: Raw, same port)
+#   curl http://127.0.0.1:8080/               # LuCI through slirp
+#
+#   docker compose --profile tap up -d openwrt-tap   # real tap, Linux host
+#
+# The dumps are mounted read-only: the launcher uses them as a programming
+# source (`-kernel`), so the die is a RAM store and the image file is never
+# written.  Guest output and the QEMU host log land under ./logs/<service>.
+#
+# Networking defaults to slirp (`NET=user`): it needs no privileges, works on
+# Docker Desktop for Windows/macOS, and reaches the guest only through the
+# HOSTFWD ports published here.  The `tap` profile is the Linux-only mode that
+# puts the guest on a real L2 segment (needs a rootful runtime for --network
+# host + /dev/net/tun).
+#
+# On an SELinux host add `,z` to the dump mount below, e.g.
+#   - ./dumps:/dumps:ro,z
+
+name: ipq4019
+
+x-common: &common
+  build:
+    context: .
+    args:
+      QEMU_VERSION: ${QEMU_VERSION:-10.2.2}
+  image: ipq4019:local
+  stdin_open: true
+  tty: true
+  stop_grace_period: 3s
+  volumes:
+    - ./dumps:/dumps:ro
+
+services:
+  # OpenWrt (or any U-Boot/Caraboot dump) with its lan1 reachable from the
+  # host through slirp.  The guest keeps its static 192.168.1.1; the forwards
+  # are the only way in.
+  openwrt:
+    <<: *common
+    environment:
+      DUMP: /dumps/openwrt.bin
+      SERIAL: tcp              # UART0 on SERIAL_PORT; use stdio with -it
+      SERIAL_PORT: "4444"
+      NET: user                # slirp: no cap_add, no /dev/net/tun
+      LAN_NET: 192.168.1.0/24
+      LAN_HOST: 192.168.1.2
+      GUEST_IP: 192.168.1.1
+      HOSTFWD: "tcp:0.0.0.0:8080-80;tcp:0.0.0.0:8443-443;tcp:0.0.0.0:2222-22"
+    ports:
+      - "127.0.0.1:4444:4444"   # UART0
+      - "127.0.0.1:8080:8080"   # LuCI / http
+      - "127.0.0.1:8443:8443"   # LuCI / https
+      - "127.0.0.1:2222:2222"   # ssh (dropbear)
+    volumes:
+      - ./dumps:/dumps:ro
+      - ./logs/openwrt:/var/log/ipq4019
+
+  # RouterOS.  RouterBOOT may try to netboot against slirp's DHCP server and
+  # reset the board; if it loops, use the tap profile on Linux or NET=none.
+  routeros:
+    <<: *common
+    environment:
+      DUMP: /dumps/routeros.bin
+      SERIAL: tcp
+      SERIAL_PORT: "4444"
+      NET: user
+      LAN_NET: 192.168.88.0/24
+      LAN_HOST: 192.168.88.2
+      GUEST_IP: 192.168.88.1
+      HOSTFWD: "tcp:0.0.0.0:8081-80;tcp:0.0.0.0:8291-8291;tcp:0.0.0.0:2223-22"
+    ports:
+      - "127.0.0.1:4445:4444"   # UART0
+      - "127.0.0.1:8081:8081"   # webfig
+      - "127.0.0.1:8291:8291"   # winbox
+      - "127.0.0.1:2223:2223"   # ssh
+    volumes:
+      - ./dumps:/dumps:ro
+      - ./logs/routeros:/var/log/ipq4019
+
+  # The real thing on a Linux host: the backend becomes a tap in the host's
+  # network namespace, so the host itself is on the guest's LAN (192.168.1.2).
+  # Compose cannot publish ports in this mode -- the host talks to the tap.
+  #   docker compose --profile tap up -d openwrt-tap
+  openwrt-tap:
+    <<: *common
+    profiles: ["tap"]
+    network_mode: host
+    cap_add: ["NET_ADMIN"]
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    environment:
+      DUMP: /dumps/openwrt.bin
+      SERIAL: tcp
+      SERIAL_PORT: "4446"
+      NET: lan
+      TAP: ipqtap0
+      LAN_IP: 192.168.1.2/24
+      DHCP: "1"
+      IPQ_PORT: "5"             # 5 = lan1
+    volumes:
+      - ./dumps:/dumps:ro
+      - ./logs/openwrt-tap:/var/log/ipq4019
