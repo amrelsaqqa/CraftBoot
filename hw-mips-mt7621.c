@@ -4386,16 +4386,21 @@ static void mt7621_reset(void *opaque)
                            s->cfg1_cache_fields;
     }
     /*
-     * The gapm7200 firmware path (Breed 1.1 + OpenWrt) gives up inside its
-     * rt2880-eth init with "unable to allocate fifos" when Config1 reports the
-     * part's real 32-byte data-cache lines (Dl=4); with the earlier, wrong
-     * 8-byte value (Dl=2) it boots all the way to init.  The RouterOS kernels
-     * on the RB750Gr3 need Dl=4 to get past their cache setup, so the field
-     * has to follow the board until the d-cache model itself is understood.
-     * Config1.Dl is bits 12:10.
+     * Debug knob only (the real part is Dl=4, i.e. 32-byte lines): override
+     * Config1.Dl (bits 12:10) to A/B the d-cache line size without rebuilding.
+     * Breed's rt2880-eth init fails at Dl=4 and works at Dl=2, so this is the
+     * handle used while the d-cache model itself is being understood.
      */
     if (s->board == MT7621_BOARD_LG_GAPM7200) {
         env->CP0_Config1 = (env->CP0_Config1 & ~(7u << 10)) | (2u << 10);
+    }
+    {
+        const char *dl = getenv("MT7621_DL");
+
+        if (dl) {
+            env->CP0_Config1 = (env->CP0_Config1 & ~(7u << 10)) |
+                               ((strtoul(dl, NULL, 0) & 7) << 10);
+        }
     }
 
     /* Everything the guest programmed is gone after a real reset. */
