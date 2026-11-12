@@ -2240,7 +2240,9 @@ static void mt7621_wdt_arm(MT7621State *s)
     }
     timer_mod(s->wdt_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
     if (getenv("MT7621_WDTLOG")) {
-        fprintf(stderr, "wdt: arm ctl=%08x load=%08x prescale=%u ns=%lld\n",
+        fprintf(stderr, "wdt: arm t=%lldms ctl=%08x load=%08x prescale=%u "
+                "ns=%lld\n",
+                (long long)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000),
                 ctl, load, prescale, (long long)ns);
     }
 }
@@ -2249,11 +2251,21 @@ static void mt7621_wdt_expire(void *opaque)
 {
     MT7621State *s = opaque;
 
-    warn_report("mt7621: watchdog expired, resetting the machine");
-    s->wdt_rst_cause = true;
-    if (getenv("MT7621_NO_RESET")) {
+    /*
+     * The guest's watchdog driver pets this block 1 Hz for a while and then
+     * stops (procd hands the timer off and never writes TMRSTAT again), so a
+     * faithful-looking 30 s timer bites even though the guest is healthy and
+     * a real board runs for days.  Reset only when explicitly asked for;
+     * otherwise just say so and keep the guest alive, since a spurious reset
+     * destroys the very state being debugged.
+     */
+    warn_report("mt7621: watchdog expired at t=%lldms (guest stops petting "
+                "it; not resetting unless MT7621_WDT_RESET=1)",
+                (long long)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000));
+    if (!mt7621_flag("MT7621_WDT_RESET") || getenv("MT7621_NO_RESET")) {
         return;
     }
+    s->wdt_rst_cause = true;
     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
 }
 
