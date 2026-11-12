@@ -3054,21 +3054,51 @@ static uint64_t mt7621_nfi_read(void *opaque, hwaddr addr, unsigned size)
     if (getenv("MT7621_NFISPIN")) {
         /*
          * Diagnostic: a driver stuck in a poll loop reads the same register
-         * with the same value thousands of times.  Report the first such
-         * loop so the offending register can be modelled.
+         * with the same value thousands of times.  Keep one bucket per
+         * offset so timer reads interleaved with the poll do not reset the
+         * count, and report the first bucket that reaches 5000.
          */
-        static uint32_t last_off = 0xffffffff, last_val;
-        static unsigned spins;
+        typedef struct {
+            uint32_t off;
+            uint32_t val;
+            unsigned count;
+            bool reported;
+        } SpinBucket;
+        static SpinBucket buckets[16];
+        unsigned i;
 
-        if (off == last_off && (uint32_t)val == last_val) {
-            if (++spins == 5000) {
-                fprintf(stderr, "nfi spin: off=%03x val=%08x\n",
-                        (unsigned)off, (uint32_t)val);
+        for (i = 0; i < ARRAY_SIZE(buckets); i++) {
+            if (buckets[i].off == (uint32_t)off &&
+                buckets[i].val == (uint32_t)val) {
+                if (!buckets[i].count) {
+                    buckets[i].off = off;
+                    buckets[i].val = val;
+                }
+                if (++buckets[i].count == 5000 && !buckets[i].reported) {
+                    buckets[i].reported = true;
+                    fprintf(stderr, "nfi spin: off=%03x val=%08x\n",
+                            (unsigned)off, (uint32_t)val);
+                }
+                break;
             }
-        } else {
-            last_off = off;
-            last_val = (uint32_t)val;
-            spins = 0;
+        }
+        if (i == ARRAY_SIZE(buckets)) {
+            /* find a free or least-used bucket */
+            unsigned victim = 0;
+
+            for (i = 0; i < ARRAY_SIZE(buckets); i++) {
+                if (!buckets[i].count) {
+                    victim = i;
+                    break;
+                }
+                if (buckets[i].count < buckets[victim].count) {
+                    victim = i;
+                }
+            }
+            buckets[victim].off = off;
+            buckets[victim].val = (uint32_t)val;
+            buckets[victim].count = 1;
+            buckets[victim].reported = false;
         }
     }
     if (mt7621_trace) {
@@ -4186,7 +4216,21 @@ static void mt7621_dramc_defaults(MT7621State *s)
     memset(s->dramc_regs, 0, sizeof(s->dramc_regs));
     s->dramc_regs[0x604 / 4] = 0x00000000;
     s->dramc_regs[0x618 / 4] = 0x00000190;
-    s->dramc_regs[0x648 / 4] = 0x03800000;
+    /*
+     * MEMC CPU PLL (0x648), decoded by Linux's clk-mt7621 as
+     *   cpu = ((FBDIV + 1) * xtal) >> prediv_tbl[PREDIV], then / ffiv * ffrac
+     * with FBDIV = bits 10:4 and PREDIV = bits 13:12.  The old value
+     * 0x03800000 has both fields zero, so the kernel computed
+     * (0 + 1) * 25 MHz = 25 MHz for the CPU and for the GIC clocksource:
+     * every udelay() came out 35x too long (the NAND bad-block scan took a
+     * minute and tripped the RCU stall detector) and the clock reported in
+     * dmesg was nonsense.
+     *
+     * FBDIV 69 / PREDIV 1 gives (69 + 1) * 25 MHz / 2 = 875 MHz, the clock
+     * the GIC counter is modelled at (mips_gictimer_set_freq) and the value
+     * RouterBOOT reports for the RB750Gr3.
+     */
+    s->dramc_regs[0x648 / 4] = (69 << 4) | (1 << 12);   /* 875 MHz */
     s->dramc_regs[0x3fc / 4] = 0x00000400;
 }
 
