@@ -1273,7 +1273,7 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
                          MEMTXATTRS_UNSPECIFIED, NULL);
     address_space_stl_le(&address_space_memory, desc + 4,
                          RX_DMA_DONE | RX_DMA_PLEN0(flen) |
-                         (getenv("MT7621_RX_LSO") ? (1u << 30) : 0),
+                         (mt7621_flag("MT7621_NO_RX_LSO") ? 0 : (1u << 30)),
                          MEMTXATTRS_UNSPECIFIED, NULL);
 
     s->rx_drx_idx = (idx + 1) % cnt;
@@ -2779,6 +2779,15 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
         mt7621_nfi_fifo_put(s, nand_id, sizeof(nand_id));
         break;
     case 0x30:                          /* read: page data + spare */
+    case 0xec:                          /* cache read (mtk-nandc variant) */
+        /*
+         * 0xEC was missing: the driver issues it (six times during the
+         * bad-block scan) and then polls NFI_PIO_DIRDY, which stayed 0
+         * because nothing had filled the FIFO.  Each miss cost the driver
+         * its full PIO timeout (~6 s), enough to trip the RCU stall detector
+         * and to drag the whole boot out.  It reads the page currently in
+         * the cache, like 0x30.
+         */
         mt7621_nfi_page_read(s);
         break;
     case 0x70:                          /* read status */
@@ -4021,14 +4030,14 @@ static void mt7621_cm_defaults(MT7621State *s)
     s->cm_regs[(MT7621_GCR_OFF + GCR_CPC_STATUS) / 4] = 0x00000001;
 
     /*
-     * MT7621_CMGIC advertises the (legacy) GIC through the CM, which is
-     * what Linux 5.6's mips_cps_init() insists on before it registers its
-     * SMP ops: without CM_GCR_GIC_STATUS.EX it prints "MIPS CPS SMP unable
-     * to proceed without a GIC", leaves mp_ops NULL and dies on the first
-     * indirect call through them.  Off by default because RouterBOOT itself
-     * jumps through a bogus pointer as soon as the GIC is advertised.
+     * The (legacy) GIC is advertised through the CM by default: Linux 5.6's
+     * mips_cps_init() insists on CM_GCR_GIC_STATUS.EX before it registers its
+     * SMP ops, and without it the kernel dies on the first indirect call.
+     * RouterBOOT used to jump through a bogus pointer when this was set, but
+     * that was the missing SMP model, not the advertisement; both boards boot
+     * with it on.  MT7621_NO_CMGIC=1 restores the old behaviour.
      */
-    if (mt7621_flag("MT7621_CMGIC")) {
+    if (!mt7621_flag("MT7621_NO_CMGIC")) {
         s->cm_regs[(MT7621_GCR_OFF + GCR_GIC_STATUS) / 4] = 0x00000001;
         s->cm_regs[(MT7621_GCR_OFF + GCR_GIC_BASE) / 4] =
             (MT7621_GIC_BASE & 0x3fff8000) | 0x1;
@@ -4370,7 +4379,14 @@ static void mt7621_reset(void *opaque)
      * Default to the pre-CPS view and let MT7621_CMGCR=1 (or MT7621_CFG3) opt
      * in - MikroTik's 5.6.3 netinstall kernel needs it to find the CM/GIC.
      */
-    if (!getenv("MT7621_CMGCR") && !getenv("MT7621_CFG3")) {
+    /*
+     * ULRI + CMGCR are part of this part's Config3 and are now on by default:
+     * the netinstall kernel needs the CM to find the GIC, and the LG board
+     * boots identically either way (its earlier "dies as soon as CPS is
+     * visible" was fixed with the SMP model).  MT7621_NO_CMGCR=1 restores the
+     * old pre-CPS view for A/B testing.
+     */
+    if (mt7621_flag("MT7621_NO_CMGCR") && !getenv("MT7621_CFG3")) {
         env->CP0_Config3 &= ~((1u << 13) | (1u << 29));
     }
     if (getenv("MT7621_CFG3")) {
