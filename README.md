@@ -2,16 +2,35 @@
 
 **QEMU anything.**
 
-Run router firmware on your laptop instead of on the router.
+Boot a router's own firmware on your machine — no hardware, no flashing,
+no bricked devices.
 
 This repository holds the **machine models** (emulated SoCs) and the small set
 of patches they need in QEMU, packaged so that a single `make` produces a
 working `qemu-system-*` binary for a given board.  You supply the firmware
 image; the project never ships one.
 
-It is aimed at bring-up and debugging work: watch the boot chain over serial,
-attach a debugger, bridge an Ethernet port to your host, bisect a change
-without bricking hardware, and keep regression tests for all of it.
+## What it is for
+
+- **Trying an upgrade before you flash it.**  Boot the new image against the
+  model of the device it was built for and see whether it comes up, before the
+  vendor's updater gets a chance to leave you with a dead board.
+- **Changing the bootloader without bricking anything.**  U-Boot, RouterBOOT,
+  Breed: iterate on the change, watch it fail, fix it again — the board is a
+  file on your disk, not hardware on your desk.
+- **Debugging the boot chain.**  Attach `gdb` to the emulated CPU, single-step
+  the boot ROM, breakpoint early kernel code, and watch MMIO accesses on the
+  bus.
+- **Seeing what the firmware actually does.**  Dump DRAM at any point, watch
+  registers change, follow the console, and keep the state for later.
+- **Security work on real images.**  Reproduce a CVE against the vendor's
+  firmware, check whether an update really fixed it, fuzz a parser or a
+  bootloader, study a boot ROM — without risking a device.
+- **Regression testing.**  Boot and network checks run in a single command, so
+  a change to a model can be shown not to break the boards it already boots.
+
+Nothing in the image is patched to make this work: the model boots the same
+bytes the device would.
 
 ---
 
