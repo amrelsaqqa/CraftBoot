@@ -15,6 +15,21 @@ without bricking hardware, and keep regression tests for all of it.
 
 ---
 
+## Demo
+
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/cd33f09e-8f5f-465f-92eb-24c49e0d90f4" width="960" controls playsinline></video>
+</p>
+
+The `arm/ipq4019` machine booting OpenWrt 24.10 from a 32 MB NOR dump, with one
+switch port bridged to a host tap: U-Boot, then the kernel bringing up its DSA
+switch on `ipqess-edma`, then userland.  Two minutes, real time, no edits.
+
+If the player does not load,
+[open the recording directly](https://github.com/user-attachments/assets/cd33f09e-8f5f-465f-92eb-24c49e0d90f4).
+
+---
+
 ## What this is
 
 - **Machine models for router SoCs.**  Each model emulates the CPU, DRAM
@@ -213,11 +228,6 @@ build/mipsel/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
 Then ping the guest from the host once its bridge is up.  Which port is
 bridged, and which address the firmware uses, depend on the board preset and
 the firmware; see the machine documentation.
-
----
-
-## Demo
-https://github.com/user-attachments/assets/cd33f09e-8f5f-465f-92eb-24c49e0d90f4
 
 ---
 
