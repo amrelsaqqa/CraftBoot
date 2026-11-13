@@ -216,6 +216,11 @@ the firmware; see the machine documentation.
 
 ---
 
+## Demo
+https://github.com/user-attachments/assets/cd33f09e-8f5f-465f-92eb-24c49e0d90f4
+
+---
+
 ## Housekeeping
 
 ```sh
