@@ -45,7 +45,7 @@
 #
 # The board is a -machine property list, one list per run:
 #
-#   --board=NAME      preset to start from: default, none, mikrotik-952, hap-ac3
+#   --board=NAME      preset to start from: default, none, hap-ac2, hap-ac3
 #   --persist[=/path] the NOR die is that file, so programs and erases in it
 #                     outlive Ctrl-C (default $LOG/flash.bin)
 #   --nor-size=N      NOR die bytes (--flash-size= still works)
@@ -64,7 +64,7 @@
 #   sudo ./lan1-bridge.sh --persist[=/path] [--nor-size=N] [--nor-id=ID]
 #   sudo ./lan1-bridge.sh --persist /tmp/nor/708.bin --nor-size=8388608 \
 #        --nor-id=ef4017 ~/kt708-ipq-openwrt24.10.0-no-wifi.bin
-#   sudo ./lan1-bridge.sh --board=mikrotik-952 ~/mikrotik-dump-latest7.17-32m.bin
+#   sudo ./lan1-bridge.sh --board=hap-ac2 ~/mikrotik-dump-latest7.17-32m.bin
 #
 # A value may be attached with `=` or given as the next argument; with none,
 # --persist uses $LOG/flash.bin and --nand-persist $LOG/nand.bin.  The space

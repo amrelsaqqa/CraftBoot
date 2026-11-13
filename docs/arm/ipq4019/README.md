@@ -14,7 +14,7 @@ Selected with the `board` property:
 |---|---|
 | `default` | 32 MiB SPI NOR, no NAND |
 | `none` | bare SoC, nothing attached |
-| `mikrotik-952` | 32 MiB NOR, 132 MiB SPI NAND on CS1, five copper PHYs |
+| `hap-ac2` | 32 MiB NOR, 132 MiB SPI NAND on CS1, five copper PHYs |
 | `hap-ac3` | 16 MiB NOR and a 128 MiB parallel NAND behind the QPIC controller |
 
 `hap-ac3` is the reference board for the boot chain and installation flows:

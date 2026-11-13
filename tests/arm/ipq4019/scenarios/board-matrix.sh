@@ -595,7 +595,7 @@ PY2
 }
 
 # A preset is a compiled-in board: it fills the same struct an explicit
-# property would, and the properties still win.  `mikrotik-952` is not invented
+# property would, and the properties still win.  `hap-ac2` is not invented
 # -- every fact in it is read from that board's own device tree -- so the case
 # also checks the preset against what tools/dts2xml.py makes of that tree.
 case_preset() {
@@ -603,15 +603,15 @@ case_preset() {
 
     mkdir -p "$dir"
 
-    timeout 25 "$QEMU" -M ipq4019,board=mikrotik-952 -kernel "$NOR" \
+    timeout 25 "$QEMU" -M ipq4019,board=hap-ac2 -kernel "$NOR" \
         -display none -monitor none -serial file:"$dir/console.log" \
         >"$dir/host.log" 2>&1
     wait_for "$dir/console.log" "RouterBOOT" 20 \
-        && pass "board=mikrotik-952 boots the vendor dump to RouterBOOT" \
-        || fail "the mikrotik-952 preset did not reach RouterBOOT"
+        && pass "board=hap-ac2 boots the vendor dump to RouterBOOT" \
+        || fail "the hap-ac2 preset did not reach RouterBOOT"
 
     wait_for "$dir/host.log" \
-        "ipq4019: board mikrotik-952: nor 32 MiB cs gpio 54, nand 132 MiB cs gpio 59, qpic-nand none, boot-device spi-nor" 5 \
+        "ipq4019: board hap-ac2: nor 32 MiB cs gpio 54, nand 132 MiB cs gpio 59, qpic-nand none, boot-device spi-nor" 5 \
         && pass "the preset carries both dies and the boot strap" \
         || fail "the preset's dies are wrong: $(grep -a 'ipq4019: board ' "$dir/host.log" | head -1)"
 
@@ -625,7 +625,7 @@ case_preset() {
         && pass "the preset's switch is the tree's five PHYs plus its PSGMII block" \
         || fail "the preset's MDIO population is wrong"
 
-    timeout 15 "$QEMU" -M 'ipq4019,board=mikrotik-952,leds=only:6,nor=off,boot-device=none' \
+    timeout 15 "$QEMU" -M 'ipq4019,board=hap-ac2,leds=only:6,nor=off,boot-device=none' \
         -display none -monitor none -serial null >"$dir/override.log" 2>&1
     wait_for "$dir/override.log" "ipq4019: leds: only@6" 5 \
         && pass "an explicit leds= replaces the preset's panel" \

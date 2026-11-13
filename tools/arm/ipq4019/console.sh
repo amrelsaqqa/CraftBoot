@@ -5,7 +5,7 @@
 #
 #   ./console.sh [options] [image] [tag]
 #
-#   --board=NAME       start from a board preset: default, none, mikrotik-952
+#   --board=NAME       start from a board preset: default, none, hap-ac2
 #                      (default: the machine's own, i.e. board=default)
 #   --persist[=FILE]   programs and erases go to FILE and survive Ctrl-C
 #                      (default /tmp/<tag>-flash.bin); the file is the part

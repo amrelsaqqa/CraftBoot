@@ -486,7 +486,7 @@ typedef struct IPQBoardPreset {
  * 32 MiB W25Q256 NOR behind chip select 0, no NAND, booting from the NOR.
  * `none` is the bare SoC -- every part has to be named on the command line.
  *
- * `mikrotik-952` is a real board, and every fact in it comes from that board's
+ * `hap-ac2` is a real board, and every fact in it comes from that board's
  * own device tree (the 952G_5HacD2HnD tree inside the MikroTik dump, see
  * tools/dts2xml.py and tests/dts2xml-test.sh): a 32 MiB NOR and a 1 Gbit SPI
  * NAND on chip selects 0 and 1, five copper MDIO PHYs at addresses 0..4, and
@@ -516,7 +516,7 @@ static const IPQBoardPreset ipq_board_presets[] = {
         .nand = false,
         .boot = IPQ_BOOT_NONE,
     } },
-    { "mikrotik-952", {
+    { "hap-ac2", {
         .nor = true,
         .nor_size = 33554432,
         .nor_id = "ef4019",
@@ -11570,7 +11570,7 @@ static void ipq4019_machine_add_props(MachineClass *mc)
     object_class_property_add_str(oc, "board", ipq_prop_board_get,
                                   ipq_prop_board_set);
     object_class_property_set_description(oc, "board",
-        "board preset: default, none, mikrotik-952 (or a command-line "
+        "board preset: default, none, hap-ac2 (or a command-line "
         "property set)");
     /*
      * "boot" already exists on MachineState (the structured -machine boot=
