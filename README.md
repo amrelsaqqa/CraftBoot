@@ -17,16 +17,7 @@ without bricking hardware, and keep regression tests for all of it.
 
 ## Demo
 
-<p align="center">
-  <video src="https://github.com/user-attachments/assets/cd33f09e-8f5f-465f-92eb-24c49e0d90f4" width="960" controls playsinline></video>
-</p>
-
-The `arm/ipq4019` machine booting OpenWrt 24.10 from a 32 MB NOR dump, with one
-switch port bridged to a host tap: U-Boot, then the kernel bringing up its DSA
-switch on `ipqess-edma`, then userland.  Two minutes, real time, no edits.
-
-If the player does not load,
-[open the recording directly](https://github.com/user-attachments/assets/cd33f09e-8f5f-465f-92eb-24c49e0d90f4).
+https://github.com/user-attachments/assets/cd33f09e-8f5f-465f-92eb-24c49e0d90f4
 
 ---
 
