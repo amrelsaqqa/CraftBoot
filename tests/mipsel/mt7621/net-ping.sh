@@ -22,11 +22,12 @@ ip link show "$TAP" >/dev/null 2>&1 || {
     echo "FAIL: tap '$TAP' does not exist; create it or set TAP=<interface>"
     exit 1
 }
-ip -4 -o addr show dev "$TAP" | grep -q 'inet ' || {
-    echo "FAIL: '$TAP' has no IPv4 address; add one in the guest's subnet,"
-    echo "      e.g. sudo ip addr add 192.168.33.2/24 dev $TAP"
+net=${IP%.*}
+if ! ip -4 -o addr show dev "$TAP" | awk '{print $4}' | grep -q "^${net}\."; then
+    echo "FAIL: '$TAP' has no address in ${net}.0/24 (guest is $IP);"
+    echo "      add one, e.g. sudo ip addr add ${net}.2/24 dev $TAP"
     exit 1
-}
+fi
 
 "$BIN" -M mt7621,board=lg-gapm7200 -m 256M -kernel "$IMG" \
     -display none -serial file:"$OUT/serial.log" \
@@ -35,12 +36,12 @@ ip -4 -o addr show dev "$TAP" | grep -q 'inet ' || {
 qpid=$!
 
 for _ in $(seq 1 "$SECS"); do
-    grep -aq "$READY" "$OUT/serial.log" && break
+    grep -aq "$READY" "$OUT/serial.log" 2>/dev/null && break
     sleep 1
 done
 sleep 3
 
-if ! grep -aq "$READY" "$OUT/serial.log"; then
+if ! grep -aq "$READY" "$OUT/serial.log" 2>/dev/null; then
     echo "FAIL: guest network never came up ($READY)"
     sed 's/\r$//' "$OUT/serial.log" | tail -10
     kill "$qpid" 2>/dev/null
