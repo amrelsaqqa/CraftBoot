@@ -324,11 +324,10 @@ can run:
 - a boot regression caught in CI rather than on somebody's router;
 - a release checked against a dozen boards in minutes, without a lab.
 
-That is work the OpenWrt project and the firmware and reverse-engineering
-communities do by hand today, on real hardware.  The more devices the
-community models, the more of that work can be handed to a `make` target — and
-the more the tools around it, OpenWrt's image builder and upgrade paths
-included, can lean on a machine instead of a shelf.
+Today that work happens by hand, on hardware somebody has to buy, power and
+occasionally brick.  Each machine added moves a piece of it into `make`, so
+that OpenWrt's image builder, upgrade paths and release checks can run against
+emulated boards instead of a shelf of routers.
 
 It is also meant to be fun.  Write a model, watch a router you have never
 touched print its own boot log, and leave the next person a test they can run.
