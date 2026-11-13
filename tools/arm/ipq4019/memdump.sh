@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # memdump.sh <dump> <seconds> <addr> <len> <out.bin> [entry]
 # Boot like enter.sh, let RouterBOOT run, then attach with gdb and dump RAM.
 set -u

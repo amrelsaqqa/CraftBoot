@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # lan1-bridge.sh -- the emulated router on a virtual (or real) wire, UART0 on a socket.
 #
 #   sudo ./lan1-bridge.sh                          # default dump, virtual cable

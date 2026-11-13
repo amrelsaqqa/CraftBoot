@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Quick SBL1-only regression test: boots a dump until SBL1 ends or errors and
 # prints the last few UART lines plus a PASS/FAIL verdict.
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Send commands to a guest console exposed as a telnet chardev.
 
 Usage:  guest.py <telnet-port> <logfile> [cmd ...]

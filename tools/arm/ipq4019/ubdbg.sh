@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # ubdbg.sh <dump> <appsbl-entry> [seconds] [-ex gdbcmd]...
 #
 # Boot the dump, divert the SBL1->QSEE handover into APPSBL (see enter.sh),

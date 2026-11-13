@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """mtpersist.py -- prove MikroTik's flash program and erase survive a power cut.
 
 RouterOS boots from a ramdisk (``root=/dev/ram0``) but mounts yaffs on

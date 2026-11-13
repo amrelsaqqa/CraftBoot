@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Convert a NAND image between the two shapes that matter: partition and die.
 
 A NAND die does not store pages back to back.  Every page is `page` bytes of

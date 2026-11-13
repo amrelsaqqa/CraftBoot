@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """rsp_bypass.py -- re-arm the QSEE redirect without needing gdb.
 
 The image's SBL1 hands over to QSEE, which needs the QCOM protection fabric

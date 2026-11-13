@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # ktrace.sh <dump> <appsbl-entry> <marker> <wait-after> <out-prefix> [env...]
 #
 # Boot until the UART log shows <marker>, let it run <wait-after> more seconds

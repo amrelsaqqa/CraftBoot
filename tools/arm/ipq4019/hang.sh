@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # hang.sh <dump> <seconds> <gdb-cmdfile> [entry]
 # Boot like enter.sh, let RouterBOOT run (and hang), then attach with gdb and
 # run whatever is in the command file.  Prints the serial log afterwards.

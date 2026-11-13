@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Minimal GDB remote-serial-protocol client for QEMU (MIPS guests).
 
 Used to read guest registers at chosen PCs without a MIPS-capable gdb:

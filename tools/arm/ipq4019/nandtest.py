@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Drive the SPI NAND on chip select 1 through the QUP, without an image.
 
 No dump in this tree declares a `spi-nand@1` node, so Linux in them never

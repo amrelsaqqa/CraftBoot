@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Patch the catch-all DTB embedded inside MikroTik's netinstall-cli binary.
 
 The binary carries one flat FDT (no appended-DTB ELF here, unlike

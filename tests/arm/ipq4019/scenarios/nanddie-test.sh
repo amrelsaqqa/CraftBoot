@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # tests/nanddie-test.sh -- the dump <-> die converter, checked against itself.
 #
 # nanddie.py claims two things that have to hold byte for byte:

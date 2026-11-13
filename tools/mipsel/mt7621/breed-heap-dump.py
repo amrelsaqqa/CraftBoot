@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Dump Breed's kmalloc window just before the 2nd fifo allocation.
 
     tools/breed-heap-dump.py <port> <out.bin> [addr] [len]

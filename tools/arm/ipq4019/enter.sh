@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # enter.sh <dump> <appsbl-entry> [seconds] [env assignments...]
 #
 # Boot the dump, stop at the SBL1->QSEE handover and enter APPSBL instead.

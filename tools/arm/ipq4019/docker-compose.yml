@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # docker-compose.yml -- run this machine against your own flash dumps.
 #
 #   mkdir -p dumps logs

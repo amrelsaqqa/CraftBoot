@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # QEMU machine ipq4019 -- multi-stage image.
 #
 #   docker build -t ipq4019 .

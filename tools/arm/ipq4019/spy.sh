@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # spy.sh <dump> <cmdfile> [secs]
 # Boot the dump, enter APPSBL, install the gdb script in <cmdfile> (which should
 # end with 'c') and let it run under a timeout.  Serial log afterwards.

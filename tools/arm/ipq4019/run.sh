@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Boot a raw flash dump (SBL1 first) on the ipq4019 machine and print its log.
 #
 #   ./run.sh                     boot the default dump, print the whole UART log

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # norpersist.sh -- write known words to the NOR die from inside OpenWrt, reboot
 # the guest, and check the words are still there afterwards.
 #

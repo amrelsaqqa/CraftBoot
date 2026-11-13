@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Shared build settings.
 #
 # The QEMU source is never stored here: each target pins a tag, downloads it

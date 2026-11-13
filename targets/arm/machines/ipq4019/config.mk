@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Machine: -M ipq4019 (Qualcomm IPQ4019, Cortex-A7).  Not wired up yet.
 ipq4019_MACHINE_DST := hw/arm/ipq4019.c
 ipq4019_BOARDS      := hap-ac3

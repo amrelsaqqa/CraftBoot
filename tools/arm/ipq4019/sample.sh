@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Boot a dump, let it run, then attach and run gdb commands against it.
 #   sample.sh <dump> <seconds> [-ex 'cmd']...
 set -u

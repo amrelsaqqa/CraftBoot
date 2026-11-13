@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # kstop.sh <dump> <appsbl-entry> <marker> <wait-after> <out-prefix> [env...]
 #
 # Start QEMU stopped, let SBL1 run, hand the PC to APPSBL (same trick as

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # boot.sh [dump] [seconds] [appsbl-entry]
 #
 # Boot a raw flash dump past SBL1 and print the whole UART log: SBL1's own

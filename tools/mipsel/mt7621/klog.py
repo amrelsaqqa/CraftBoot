@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 Read a guest kernel's printk ring buffer out of the emulated RAM.
 

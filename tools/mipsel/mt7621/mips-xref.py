@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Find rodata references inside a flat MIPS image (Breed payload).
 
 Linear-sweeps the image with capstone, tracks lui/addiu materialisation of

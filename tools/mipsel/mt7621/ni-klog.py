@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Decode the Linux 5.6 printk ring buffer out of a guest RAM dump.
 
     tools/ni-klog.py run/01/ram.bin               # whole buffer, in order

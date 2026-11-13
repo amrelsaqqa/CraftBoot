@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Rebuild the appended DTB of the MikroTik netinstall kernel.
 
 Deletes the LED node (to free space), enables uartlite@c00, sets stdout-path and

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Boot a flash image with a tap backend and ping the guest from the host.
 #
 #   tests/mipsel/mt7621/net-ping.sh <image> <guest-ip> [ready-regex] [seconds]

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Read and change the RouterBOOT "soft config" block in a MikroTik flash image.
 
 RouterBOOT keeps its settings in a 4096-byte block that starts with the magic

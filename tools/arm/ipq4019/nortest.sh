@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # nortest.sh -- verify the NOR die's program/erase path from inside the guest.
 #
 # Boots the Caraboot dump into U-Boot, stops the autoboot, and drives U-Boot's

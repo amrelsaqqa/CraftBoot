@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Same machine, different dump: the U-Boot + OpenWrt image for the same SoC.
 #
 #   ./run2.sh                print the whole SBL1 boot log for this dump

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # tests/board-matrix.sh -- the regression gate for the SoC/board split.
 #
 # The refactor that turns this machine into "SoC + configured board" rewrites

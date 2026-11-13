@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # console.sh -- boot a dump with UART0 on a pty, so an ordinary terminal
 # program (picocom, minicom, screen, miniterm) can attach and detach like it
 # would to a USB-serial adapter.

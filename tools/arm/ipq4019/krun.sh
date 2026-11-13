@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # krun.sh <dump> <appsbl-entry> <marker> <timeout-seconds> <out-prefix> [env...]
 #
 # Boot a flash dump the usual way -- SBL1 runs first, then the PC is handed to

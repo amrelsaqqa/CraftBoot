@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Find the EIP number RouterOS's crypto driver will accept.
 
     tools/ni-cryptosweep.py                     candidates, 4 guests at a time

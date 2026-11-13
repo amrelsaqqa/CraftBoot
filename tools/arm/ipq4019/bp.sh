@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Start QEMU frozen, attach gdb, run the given -ex commands (typically
 # "b *ADDR" then "c").  Usage: bp.sh <dump> -ex 'b *0x...' -ex 'c' -ex 'info registers'
 set -u

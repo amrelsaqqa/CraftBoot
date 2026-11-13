@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # bypass.sh -- keep the QSEE bypass armed for as long as the machine runs.
 #
 # The image's SBL1 hands over to QSEE, which needs the QCOM protection fabric

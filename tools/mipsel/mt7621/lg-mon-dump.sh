@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Did the guest's driver actually consume the RX descriptors we filled?
 # Reads the live ring base from the model log, so it follows the guest.
 #   tools/lg-mon-dump.sh

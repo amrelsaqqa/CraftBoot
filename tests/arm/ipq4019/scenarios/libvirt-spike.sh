@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # tests/libvirt-spike.sh -- the machine as a libvirt domain, end to end.
 #
 # The point of the SoC/board split was to make this machine describable from

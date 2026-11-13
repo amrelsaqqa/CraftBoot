@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Dump the guest's DSA/switch wiring and any driver RX errors.
 #   tools/lg-dsa-info.sh
 set -u

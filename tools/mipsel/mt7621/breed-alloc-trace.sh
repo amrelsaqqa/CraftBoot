@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Step over software breakpoints and dump registers at the allocator sites.
 cd /home/amrelsaqqa/qemu-mt7621 || exit 1
 pkill qemu-system-mip >/dev/null 2>&1; sleep 1

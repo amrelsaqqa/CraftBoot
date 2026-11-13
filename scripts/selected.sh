@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Resolve a target/machine selection into one line per build group.
 #
 #   scripts/selected.sh "mips"                     all machines of mipsel

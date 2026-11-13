@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # tests/dts2xml-test.sh -- the board-tree converter, checked against a real tree.
 #
 # tools/dts2xml.py claims to read the board out of its device tree.  The proof

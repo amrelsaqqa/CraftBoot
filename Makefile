@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Build recipes for QEMU board emulation.
 #
 #   target  = what builds into one qemu-system-<arch> executable (mips, arm)

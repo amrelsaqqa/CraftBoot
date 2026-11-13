@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # entrypoint.sh -- launcher for the packaged image.
 #
 # Everything image-specific the machine needs is an environment variable, so a

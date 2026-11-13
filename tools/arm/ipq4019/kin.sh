@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # kin.sh <dump> <bypass:entry> <marker> <timeout> <out-prefix> [keys] [wait-for] [wait-timeout]
 #
 # Boot a dump the same way krun.sh does, but with the guest console attached

@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Autonomous netinstall run: fresh guest + fresh installer, end to end.
 #
 #   sudo tools/ni-auto.sh                 one run

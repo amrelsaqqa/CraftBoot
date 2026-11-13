@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Drive the RouterOS console over the serial chardev, prompt by prompt.
 
 Boots nothing itself: it attaches to the telnet chardev of a running VM, follows

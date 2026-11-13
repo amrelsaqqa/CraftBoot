@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 Summarise a MT7621_SPILOG trace: which opcodes the guest uses, how many
 bytes each transfer moves, and how the read addresses advance.

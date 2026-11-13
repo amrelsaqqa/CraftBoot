@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Boot a flash image and check that the expected lines appear on the console.
 #
 #   tests/mipsel/mt7621/boot-smoke.sh <image> [seconds]

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Boot a flash image for a few seconds and dump the guest's kernel log.
 
     tools/ni-bootlog.py                      stock RB750Gr3 image, 14 s

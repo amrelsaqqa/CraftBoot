@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Start the RB750Gr3 MT7621 guest for netinstall work.
 #
 #   tools/ni-vm.sh                 telnet console on 127.0.0.1:4444, logs in run/

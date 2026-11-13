@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Find where Breed's decompressed payload lives in RAM, by reproducing the
 # Dl=4 failure and dumping the two candidate windows.
 #   tools/breed-dump.sh

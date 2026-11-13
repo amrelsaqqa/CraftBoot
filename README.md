@@ -80,6 +80,7 @@ without interfering.
 ## Repository layout
 
 ```
+COPYING                   license: GPL-2.0 (code is GPL-2.0-or-later)
 config.mk                 QEMU repo/tag defaults, cache location, configure args
 Makefile                  fetch / prep / build / check-patches / export-patches / clean
 .config                   which targets and machines are built by default
@@ -318,8 +319,20 @@ persistent flash image).
 
 ## Scope and licensing
 
-The machine models and patches are derived from QEMU and follow its license
-(GPL-2.0-or-later).  Firmware images are **not** part of this repository and
-are never modified by the emulator: you provide an image, the model runs it
-as-is.  Nothing here is affiliated with or endorsed by any hardware vendor, and
-the project is not part of or endorsed by the QEMU project.
+The code you find here is **GPL-2.0-or-later**; the full text is in `COPYING`.
+The patch series is the exception: a patch carries the license of the QEMU file
+it modifies, and QEMU mixes GPL-2.0, GPL-2.0-or-later and LGPL-2.1-or-later code
+that the series touches, so the patches are not stamped with one identifier.
+They are applied to QEMU and distributed as part of it, which makes the
+resulting `qemu-system-*` binary GPLv2.
+
+| part | license |
+|---|---|
+| machine models, tools, tests, build files | `GPL-2.0-or-later` |
+| `targets/*/patches/`, `targets/*/machines/*/patches/` | the license of each modified QEMU file |
+| documentation (`README.md`, `docs/`) | `GPL-2.0-or-later` |
+
+Firmware images are **not** part of this repository and are never modified by
+the emulator: you provide an image, the model runs it as-is.  Nothing here is
+affiliated with or endorsed by any hardware vendor, and the project is not part
+of or endorsed by the QEMU project.

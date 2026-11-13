@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """dhcp_client.py -- a DHCP client small enough to ship with the launcher.
 
 The guest is the DHCP server (it is a router), the host is the client, and the
