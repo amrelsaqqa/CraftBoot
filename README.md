@@ -329,6 +329,14 @@ occasionally brick.  Each machine added moves a piece of it into `make`, so
 that OpenWrt's image builder, upgrade paths and release checks can run against
 emulated boards instead of a shelf of routers.
 
+Two pieces of infrastructure are in the works:
+
+- **A Docker image** for the build environment, so a working toolchain and
+  QEMU's build dependencies arrive with one pull instead of a distro-specific
+  install.
+- **A Windows build pipeline**, producing `qemu-system-*` binaries for people
+  whose desktop is not Linux.
+
 It is also meant to be fun.  Write a model, watch a router you have never
 touched print its own boot log, and leave the next person a test they can run.
 
