@@ -274,6 +274,116 @@ libvirt spike, panel/VNC helpers) with payload sources in `payloads/`.
 
 ---
 
+## Contributing
+
+The most useful contribution is a firmware image this project has never booted.
+Every machine here was written against a handful of dumps; a different build, a
+different board revision or a different vendor is what exposes the register that
+is still missing.
+
+### Test a machine with your own dump
+
+No code required:
+
+```sh
+make TARGET=mipsel/mt7621 build
+tests/mipsel/mt7621/boot-smoke.sh ~/my-dump.bin
+```
+
+Watch it by hand instead, which shows every line the firmware prints:
+
+```sh
+build/mipsel/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
+  -kernel ~/my-dump.bin -display none -serial stdio
+```
+
+and for the ARM machine:
+
+```sh
+make TARGET=arm/ipq4019 build
+build/arm/qemu-system-arm -M ipq4019,board=hap-ac2 -m 256M \
+  -kernel ~/my-dump.bin -display none -serial stdio
+```
+
+A whole-chip dump (bootloader, partition table, everything) is more useful than
+a kernel image: the models start at the boot ROM / bootloader step.
+`docs/mipsel/mt7621/nand-images.md` describes the dump shapes the MT7621 machine
+accepts, and each `docs/<arch>/<soc>/model-quirks.md` lists what that model
+knows it does not implement — worth reading before treating a hang as a bug.
+
+### Report what you see
+
+An issue that can be reproduced gets fixed.  Include:
+
+1. the exact command line, board preset included;
+2. where it stops — the last serial lines, and anything QEMU printed itself (a
+   QEMU-level error usually means the image format was rejected, not that the
+   firmware failed);
+3. what the image is: vendor, model, firmware version, and how it was dumped
+   (whole chip, bootloader only, kernel only);
+4. whether the dump can be shared.  If it cannot be published, attach the
+   console log plus whatever else you can (partition table, `strings` of the
+   bootloader, memory map) and say what is missing.
+
+Dumps are large and vendor-copyrighted: never attach them to the repository —
+link to or describe them in the issue.
+
+### Add a machine or a board
+
+An SoC in an architecture that is already covered is a **machine**, not a new
+target:
+
+```
+targets/<arch>/machines/<soc>/
+  <soc>.c      the model: TypeInfo, memory map, boot path, device wiring
+  config.mk    <soc>_MACHINE_DST (path inside the QEMU tree),
+               <soc>_BOARDS (runtime presets), <soc>_DEV_BRANCH
+  series       machine-only patches, if the SoC needs its own hooks
+```
+
+Add `<soc>` to `<arch>_MACHINES` in `targets/<arch>/config.mk`, then:
+
+```sh
+make TARGET=<arch>/<soc> check-patches prep build
+make list
+```
+
+`check-patches` must pass against the pinned tag before a series is acceptable.
+
+A **board** is a preset of an existing machine (`-M mt7621,board=…`), so it is
+usually an entry in `<soc>_BOARDS` plus whatever differs at reset: flash layout,
+switch port mapping, DRAM size, MAC addresses.
+
+A new **architecture** is a new `targets/<arch>/config.mk` naming
+`<arch>_TARGET_LIST`, `<arch>_BINARIES` and `<arch>_MACHINES` — the only place
+where a new `qemu-system-*` executable appears.
+
+Patch series are generated from a branch, never hand-edited:
+
+```sh
+make TARGET=<arch> export-patches DEV=~/dev/qemu   # format-patch from DEV_BRANCH
+make TARGET=<arch> check-patches                   # must apply to the pinned tag
+```
+
+Keep changes as separate, reviewable commits: they arrive in
+`build/<target>/src` as commits, so `git log` there documents exactly what was
+applied and `git bisect` works.
+
+New machines should come with `docs/<arch>/<soc>/README.md` (what it models,
+which presets exist, known limits) and, where it can run unattended, a check
+under `tests/<arch>/<soc>/`.
+
+### Ground rules
+
+- **Never patch a guest image.**  The models run firmware as it is; a fix that
+  requires modifying the dump is not a fix.
+- **No dumps, images or vendor binaries in the repository** — they are
+  copyrighted by their vendors and are kept out by `.gitignore`.
+- Contributions are accepted under `GPL-2.0-or-later`, as is the rest of the
+  code.
+
+---
+
 ## Configuration reference
 
 | setting | where | meaning |
