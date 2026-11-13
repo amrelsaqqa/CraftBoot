@@ -18,6 +18,10 @@ OUT=$(mktemp -d)
 trap 'pkill -f "$BIN" 2>/dev/null; rm -rf "$OUT"' EXIT
 
 [ -x "$BIN" ] || { echo "missing $BIN (make TARGET=mipsel build)"; exit 1; }
+ip link show "$TAP" >/dev/null 2>&1 || {
+    echo "FAIL: tap '$TAP' does not exist; create it or set TAP=<interface>"
+    exit 1
+}
 
 "$BIN" -M mt7621,board=lg-gapm7200 -m 256M -kernel "$IMG" \
     -display none -serial file:"$OUT/serial.log" \
