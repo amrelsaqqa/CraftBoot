@@ -69,11 +69,15 @@ A **target** builds one executable (`qemu-system-<arch>`); a **machine** is a
 
 | target | machine | boards (`-M <machine>,board=…`) | notes |
 |---|---|---|---|
-| `mips` | `mt7621` | `lg-gapm7200` (default), `rb750gr3` | MIPS 1004Kc, DDR, MT7530 switch |
-| `arm` | `ipq4019` | `hap-ac2` (default) | ARMv7 Cortex-A7, QPIC NAND, ESS switch |
+| `mipsel` | `mt7621` | `lg-gapm7200` (default), `rb750gr3` | MIPS 1004Kc, parallel NAND or SPI NOR, MT7530 switch |
+| `arm` | `ipq4019` | `default` (32 MiB NOR), `hap-ac2`, `hap-ac3` | ARMv7 Cortex-A7, SPI NOR and QPIC NAND, ESS switch |
 
-Adding another SoC of a covered architecture (for example MT7628AN) means
-adding a *machine* to the `mipsel` target — no new target, no new executable.
+Where a SoC lands depends on the executable it needs.  An SoC that fits an
+architecture already covered (MT7628AN on `mipsel`, for example) is a new
+*machine* inside that target.  An architecture that is not covered yet becomes
+a new *target* with its own `qemu-system-*` binary — the selector, the series
+and the tests treat the two cases the same way, so adding one is a question of
+layout, not of build system.
 
 ---
 
@@ -179,6 +183,8 @@ Machines of the same target share one tree and one executable: requesting
 ```sh
 make TARGET=mipsel check-patches
 # series applies cleanly: mipsel (mt7621) on v10.2.2
+make TARGET=arm/ipq4019 check-patches
+# series applies cleanly: arm (ipq4019) on v10.2.2
 ```
 
 This extracts the pinned QEMU tag into a temporary tree, applies every series
@@ -190,18 +196,19 @@ longer matches the pinned release.
 
 ```sh
 make TARGET=mipsel build        # fetch → prep → configure → ninja
+make TARGET=arm/ipq4019 build   # same pipeline for the other executable
 ```
 
-The result is symlinked next to the tree:
+Each target gets its own tree, symlinked next to its sources:
 
 ```
-build/mipsel/qemu-system-mipsel
-build/mipsel/src        # QEMU tag + machine source + your patches, as commits
-build/mipsel/build      # configure/ninja output
+build/mipsel/qemu-system-mipsel     build/arm/qemu-system-arm
+build/mipsel/src                    build/arm/src        # tag + machines + patches
+build/mipsel/build                  build/arm/build      # configure/ninja output
 ```
 
-`build/mipsel/src` is a normal git repository, so you can read `git log` there
-to see exactly what was applied.
+`build/<target>/src` is a normal git repository, so you can read `git log`
+there to see exactly what was applied.
 
 ### 4. Run
 
@@ -212,11 +219,11 @@ build/mipsel/qemu-system-mipsel \
   -display none -serial stdio
 ```
 
-The firmware's own console appears on the serial line.  For the ARM machine:
+The firmware's own console appears on the serial line.  The ARM machine takes
+the same shape, with a board preset that matches the dump:
 
 ```sh
-make TARGET=arm build
-build/arm/qemu-system-arm -M ipq4019,board=hap-ac2 -m 256M \
+build/arm/qemu-system-arm -M ipq4019,board=hap-ac3 -m 256M \
   -kernel ~/my-device-dump.bin -display none -serial stdio
 ```
 
@@ -231,6 +238,10 @@ sudo ip link set tap0 up
 sudo ip addr add 192.168.33.2/24 dev tap0     # match the guest's subnet
 
 build/mipsel/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
+  -kernel ~/my-device-dump.bin -display none -serial stdio \
+  -netdev tap,id=net0,ifname=tap0,script=no,downscript=no
+
+build/arm/qemu-system-arm -M "ipq4019,board=hap-ac3,eth-bridge-port=1" -m 256M \
   -kernel ~/my-device-dump.bin -display none -serial stdio \
   -netdev tap,id=net0,ifname=tap0,script=no,downscript=no
 ```
@@ -265,10 +276,11 @@ stay available:
 
 ```sh
 # in a development checkout of QEMU, on a branch based on the pinned tag
-git commit -am "mt7621: …"
+git commit -am "mt7621: …"                      # or "ipq4019: …"
 
-make TARGET=mipsel export-patches DEV=~/dev/qemu     # rewrite patches/ + series
-make TARGET=mipsel check-patches prep                # validate, rebuild the tree
+make TARGET=mipsel/mt7621 export-patches DEV=~/dev/qemu   # rewrite patches/
+make TARGET=mipsel/mt7621 check-patches prep            # validate, rebuild
+make TARGET=arm/ipq4019   export-patches DEV=~/dev/qemu
 ```
 
 `export-patches` re-generates the target's patches from the branch, refreshes
@@ -276,8 +288,9 @@ the machine source, and rewrites `series`.  `prep` replays the result into
 `build/<target>/src` as commits.
 
 Patch order matters: `patches/generic/` (when it has a `series`) first, then
-`targets/<arch>/series`, then each selected machine's `series`.  A patch belongs in `patches/generic/`
-only if `make TARGETS="…" check-patches` passes for every target.
+`targets/<arch>/series`, then each selected machine's `series`.  A patch
+belongs in `patches/generic/` only if `make TARGETS="…" check-patches` passes
+for every target.
 
 ---
 
@@ -298,6 +311,27 @@ ARM scenario scripts live in `tests/arm/ipq4019/scenarios/` (board matrix,
 libvirt spike, panel/VNC helpers) with payload sources in `payloads/`.
 
 ---
+
+## Where this is going
+
+Every machine here is one more device that can be booted, tested and debugged
+without owning it.  The aim is coverage, because coverage is what turns
+firmware work from something you have to buy hardware for into something you
+can run:
+
+- an upgrade image tried on the model of the devices it targets, before it
+  ships;
+- a boot regression caught in CI rather than on somebody's router;
+- a release checked against a dozen boards in minutes, without a lab.
+
+That is work the OpenWrt project and the firmware and reverse-engineering
+communities do by hand today, on real hardware.  The more devices the
+community models, the more of that work can be handed to a `make` target — and
+the more the tools around it, OpenWrt's image builder and upgrade paths
+included, can lean on a machine instead of a shelf.
+
+It is also meant to be fun.  Write a model, watch a router you have never
+touched print its own boot log, and leave the next person a test they can run.
 
 ## Contributing
 
