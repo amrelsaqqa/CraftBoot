@@ -1,4 +1,6 @@
-# qemu-boards
+# CraftBoot
+
+**QEMU anything.**
 
 Run router firmware on your laptop instead of on the router.
 
@@ -46,7 +48,7 @@ A **target** builds one executable (`qemu-system-<arch>`); a **machine** is a
 | `arm` | `ipq4019` | `hap-ac2` (default) | ARMv7 Cortex-A7, QPIC NAND, ESS switch |
 
 Adding another SoC of a covered architecture (for example MT7628AN) means
-adding a *machine* to the `mips` target — no new target, no new executable.
+adding a *machine* to the `mipsel` target — no new target, no new executable.
 
 ---
 
@@ -81,7 +83,7 @@ without interfering.
 config.mk                 QEMU repo/tag defaults, cache location, configure args
 Makefile                  fetch / prep / build / check-patches / export-patches / clean
 .config                   which targets and machines are built by default
-scripts/selected.sh       resolves "mips/mt7621,arm/*" into build groups
+scripts/selected.sh       resolves "mipsel/mt7621,arm/*" into build groups
 patches/generic/          patches that must apply to every target
 targets/<arch>/
   config.mk               target-list, binaries, machine list
@@ -118,7 +120,7 @@ artifacts/                large dumps and images (gitignored, kept on disk)
 ```sh
 make list
 # [x] arm/ipq4019  (wired)
-# [x] mips/mt7621  (wired)
+# [x] mipsel/mt7621  (wired)
 ```
 
 `x` marks what the current `.config` selects; `wired` means the target has a
@@ -128,7 +130,7 @@ every wired target.
 
 ```
 # .config
-CONFIG_TARGET_mips=y
+CONFIG_TARGET_mipsel=y
 CONFIG_MACHINE_mt7621=y
 CONFIG_TARGET_arm=y
 CONFIG_MACHINE_ipq4019=y
@@ -137,20 +139,20 @@ CONFIG_MACHINE_ipq4019=y
 Command-line selection always wins over `.config`:
 
 ```sh
-make TARGET=mips                      # every machine of mips
-make TARGET=mips/mt7621               # one machine
-make TARGET=mips/mt7621,mips/mt7622   # an explicit set
-make TARGET='mips/*,arm/*'            # whole architectures (quote the *)
+make TARGET=mipsel                      # every machine of mipsel
+make TARGET=mipsel/mt7621               # one machine
+make TARGET=mipsel/mt7621,mipsel/mt7622   # an explicit set
+make TARGET='mipsel/*,arm/*'            # whole architectures (quote the *)
 ```
 
 Machines of the same target share one tree and one executable: requesting
-`mips/mt7621,mips/mt7622` builds a single `qemu-system-mipsel` containing both.
+`mipsel/mt7621,mipsel/mt7622` builds a single `qemu-system-mipsel` containing both.
 
 ### 2. Validate the patches (fast, no build)
 
 ```sh
-make TARGET=mips check-patches
-# series applies cleanly: mips (mt7621) on v10.2.2
+make TARGET=mipsel check-patches
+# series applies cleanly: mipsel (mt7621) on v10.2.2
 ```
 
 This extracts the pinned QEMU tag into a temporary tree, applies every series
@@ -161,24 +163,24 @@ longer matches the pinned release.
 ### 3. Build
 
 ```sh
-make TARGET=mips build        # fetch → prep → configure → ninja
+make TARGET=mipsel build        # fetch → prep → configure → ninja
 ```
 
 The result is symlinked next to the tree:
 
 ```
-build/mips/qemu-system-mipsel
-build/mips/src        # QEMU tag + machine source + your patches, as commits
-build/mips/build      # configure/ninja output
+build/mipsel/qemu-system-mipsel
+build/mipsel/src        # QEMU tag + machine source + your patches, as commits
+build/mipsel/build      # configure/ninja output
 ```
 
-`build/mips/src` is a normal git repository, so you can read `git log` there
+`build/mipsel/src` is a normal git repository, so you can read `git log` there
 to see exactly what was applied.
 
 ### 4. Run
 
 ```sh
-build/mips/qemu-system-mipsel \
+build/mipsel/qemu-system-mipsel \
   -M mt7621,board=lg-gapm7200 -m 256M \
   -kernel ~/my-device-dump.bin \
   -display none -serial stdio
@@ -202,7 +204,7 @@ sudo ip tuntap add dev tap0 mode tap user "$USER"
 sudo ip link set tap0 up
 sudo ip addr add 192.168.33.2/24 dev tap0     # match the guest's subnet
 
-build/mips/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
+build/mipsel/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
   -kernel ~/my-device-dump.bin -display none -serial stdio \
   -netdev tap,id=net0,ifname=tap0,script=no,downscript=no
 ```
@@ -216,7 +218,7 @@ the firmware; see the machine documentation.
 ## Housekeeping
 
 ```sh
-make TARGET=mips clean      # remove build/ for every target
+make TARGET=mipsel clean      # remove build/ for every target
 make distclean              # remove build/ and the QEMU download cache
 ```
 
@@ -237,10 +239,10 @@ stay available:
 
 ```sh
 # in a development checkout of QEMU, on a branch based on the pinned tag
-git commit -am "mips: …"
+git commit -am "mt7621: …"
 
-make TARGET=mips export-patches DEV=~/dev/qemu     # rewrite patches/ + series
-make TARGET=mips check-patches prep                # validate, rebuild the tree
+make TARGET=mipsel export-patches DEV=~/dev/qemu     # rewrite patches/ + series
+make TARGET=mipsel check-patches prep                # validate, rebuild the tree
 ```
 
 `export-patches` re-generates the target's patches from the branch, refreshes
@@ -258,8 +260,8 @@ only if `make TARGETS="…" check-patches` passes for every target.
 Checks live next to the machines and use the built binary:
 
 ```sh
-tests/mips/mt7621/boot-smoke.sh <dump>                 # boot, check expected lines
-tests/mips/mt7621/net-ping.sh <dump> <guest-ip>        # boot with a tap, ping
+tests/mipsel/mt7621/boot-smoke.sh <dump>                 # boot, check expected lines
+tests/mipsel/mt7621/net-ping.sh <dump> <guest-ip>        # boot with a tap, ping
 ```
 
 `boot-smoke.sh` takes the image and a timeout; expected console patterns can be
@@ -299,7 +301,7 @@ persistent flash image).
 | `target … is not wired up` | the target has no `BINARIES`/machines yet — see its `config.mk` |
 | `selected.sh: unknown machine …` | typo, or the machine does not exist under `targets/<arch>/machines/` |
 | fetch fails / stale cache | `make distclean`, then build again |
-| `TARGET=mips/*` behaves oddly | your shell expanded the `*`; quote it: `make TARGET='mips/*'` |
+| `TARGET=mipsel/*` behaves oddly | your shell expanded the `*`; quote it: `make TARGET='mips/*'` |
 | tap test says unreachable | tap down, missing host address, or the guest uses a different subnet — check the machine docs |
 | guest boots but no network | only one switch port is bridged; the active port depends on the board preset |
 
@@ -307,9 +309,9 @@ persistent flash image).
 
 ## Documentation
 
-- `docs/mips/mt7621/README.md` — the MT7621 machine and its presets.
-- `docs/mips/mt7621/model-quirks.md` — where the model deliberately differs.
-- `docs/mips/mt7621/nand-images.md` — flat dumps vs full-die images, persistence.
+- `docs/mipsel/mt7621/README.md` — the MT7621 machine and its presets.
+- `docs/mipsel/mt7621/model-quirks.md` — where the model deliberately differs.
+- `docs/mipsel/mt7621/nand-images.md` — flat dumps vs full-die images, persistence.
 - `docs/arm/ipq4019/README.md` — the IPQ4019 machine and its status.
 
 ---
@@ -319,4 +321,5 @@ persistent flash image).
 The machine models and patches are derived from QEMU and follow its license
 (GPL-2.0-or-later).  Firmware images are **not** part of this repository and
 are never modified by the emulator: you provide an image, the model runs it
-as-is.  Nothing here is affiliated with or endorsed by any hardware vendor.
+as-is.  Nothing here is affiliated with or endorsed by any hardware vendor, and
+the project is not part of or endorsed by the QEMU project.
