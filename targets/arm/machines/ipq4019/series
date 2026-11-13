@@ -1,0 +1,3 @@
+# Machine ipq4019 — applied in this order to the pinned tag.
+# 'make TARGET=arm check-patches' proves they apply to a pristine checkout.
+targets/arm/machines/ipq4019/patches/0001-arm-ipq4019-machine-support-hooks.patch

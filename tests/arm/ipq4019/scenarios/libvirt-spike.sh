@@ -19,7 +19,7 @@
 # device tree, the die is an empty file that the machine programs on first
 # boot, and the console goes to a file this script can read.
 set -u
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "$0")/../../.." || exit 1
 
 DUMP=$HOME/mikrotik-dump-latest7.17-32m.bin
 DTB=
@@ -40,7 +40,7 @@ done
 
 command -v virsh >/dev/null || { echo "libvirt-spike: no virsh" >&2; exit 1; }
 command -v virtqemud >/dev/null || { echo "libvirt-spike: no virtqemud" >&2; exit 1; }
-[ -x ./build/qemu-system-arm ] || { echo "libvirt-spike: no build/qemu-system-arm" >&2; exit 1; }
+[ -x ./build/arm/qemu-system-arm ] || { echo "libvirt-spike: no build/qemu-system-arm" >&2; exit 1; }
 [ -r "$IMAGE" ] || { echo "libvirt-spike: no $IMAGE (use --image=)" >&2; exit 1; }
 
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/libvirt-spike.XXXXXX") || exit 1

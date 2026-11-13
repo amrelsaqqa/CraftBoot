@@ -1,3 +1,17 @@
+From 7865ec1d30cc814e8b75ed820e4e4c16c9f85601 Mon Sep 17 00:00:00 2001
+From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
+Date: Fri, 13 Nov 2026 14:41:01 +0200
+Subject: [PATCH] arm: ipq4019 machine support hooks
+
+---
+ accel/tcg/cpu-exec.c        | 11 +++++++++++
+ cpu-common.c                |  3 +++
+ hw/arm/Kconfig              |  5 +++++
+ hw/arm/meson.build          |  1 +
+ include/hw/core/cpu.h       | 16 +++++++++++++++-
+ target/arm/tcg/tlb_helper.c | 29 +++++++++++++++++++++++++++++
+ 6 files changed, 64 insertions(+), 1 deletion(-)
+
 diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
 index ad94f96..ad69844 100644
 --- a/accel/tcg/cpu-exec.c

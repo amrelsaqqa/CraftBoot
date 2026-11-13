@@ -25,9 +25,9 @@
 # appear before the deadline"; the deadlines exist so a hang fails instead of
 # blocking forever.
 set -u
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "$0")/../../.." || exit 1
 
-QEMU=./build/qemu-system-arm
+QEMU=./build/arm/qemu-system-arm
 NOR=${NOR_DUMP:?set NOR_DUMP to a SPI-NOR dump}
 DIE= OPENWRT= QUICK=0 LIBVIRT=0
 DUMP=${DUMP_DUMP:-$HOME/mikrotik-dump-latest7.17-32m.bin}
@@ -507,7 +507,7 @@ case_ess() {
 # dump -- by tests/dts2xml-test.sh, which needs no QEMU at all.
 case_dts2xml() {
     local out summary
-    out=$(timeout 180 ./tests/dts2xml-test.sh 2>&1)
+    out=$(timeout 180 ./tests/arm/ipq4019/scenarios/dts2xml-test.sh 2>&1)
     summary=$(sed -n 's/^\([0-9]* passed, [0-9]* failed\)$/\1/p' <<<"$out" | tail -1)
     if [ -n "$summary" ] && has_zero_failures "$summary"; then
         pass "dts2xml: $summary against the MikroTik device tree"
