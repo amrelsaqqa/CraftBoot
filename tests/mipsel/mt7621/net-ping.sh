@@ -22,6 +22,11 @@ ip link show "$TAP" >/dev/null 2>&1 || {
     echo "FAIL: tap '$TAP' does not exist; create it or set TAP=<interface>"
     exit 1
 }
+ip -4 -o addr show dev "$TAP" | grep -q 'inet ' || {
+    echo "FAIL: '$TAP' has no IPv4 address; add one in the guest's subnet,"
+    echo "      e.g. sudo ip addr add 192.168.33.2/24 dev $TAP"
+    exit 1
+}
 
 "$BIN" -M mt7621,board=lg-gapm7200 -m 256M -kernel "$IMG" \
     -display none -serial file:"$OUT/serial.log" \
