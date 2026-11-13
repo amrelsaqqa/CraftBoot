@@ -1,11 +1,11 @@
 #!/bin/sh
 # Resolve a target/machine selection into one line per build group.
 #
-#   scripts/selected.sh "mips"                     all machines of mips
-#   scripts/selected.sh "mips/*"                   same
-#   scripts/selected.sh "mips/mt7621"              one machine
-#   scripts/selected.sh "mips/mt7621,mips/mt7622"  explicit list
-#   scripts/selected.sh "mips/*,arm/*"             whole architectures
+#   scripts/selected.sh "mips"                     all machines of mipsel
+#   scripts/selected.sh "mipsel/*"                   same
+#   scripts/selected.sh "mipsel/mt7621"              one machine
+#   scripts/selected.sh "mipsel/mt7621,mips/mt7622"  explicit list
+#   scripts/selected.sh "mipsel/*,arm/*"             whole architectures
 #   scripts/selected.sh ""                         read .config (or everything)
 #
 # Output: one line per architecture, "arch|machine machine ...", so the caller

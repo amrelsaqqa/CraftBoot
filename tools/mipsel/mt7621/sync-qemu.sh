@@ -5,7 +5,7 @@
 # (branch mt7621-model).  The root repo keeps two generated copies so it stays
 # self-contained and reproducible without carrying a full QEMU tree:
 #
-#   hw-mips-mt7621.c    the machine model (qemu/hw/mips/mt7621.c)
+#   hw-mips-mt7621.c    the machine model (qemu/hw/mipsel/mt7621.c)
 #   qemu-mt7621.patch   every other QEMU-side change, diffed against the
 #                       upstream base commit (f8ed816)
 #
@@ -24,7 +24,7 @@ fi
 
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
-git -C qemu diff "$BASE"..HEAD -- . ':(exclude)hw/mips/mt7621.c' \
+git -C qemu diff "$BASE"..HEAD -- . ':(exclude)hw/mipsel/mt7621.c' \
     ':(exclude)build' > "$tmp"
 
 if [ "$CHECK" = "--check" ]; then
@@ -33,7 +33,7 @@ if [ "$CHECK" = "--check" ]; then
         echo "qemu-mt7621.patch is stale (run tools/sync-qemu.sh)"
         rc=1
     fi
-    if ! cmp -s qemu/hw/mips/mt7621.c hw-mips-mt7621.c; then
+    if ! cmp -s qemu/hw/mipsel/mt7621.c hw-mips-mt7621.c; then
         echo "hw-mips-mt7621.c is stale (run tools/sync-qemu.sh)"
         rc=1
     fi
@@ -41,7 +41,7 @@ if [ "$CHECK" = "--check" ]; then
 fi
 
 cp "$tmp" qemu-mt7621.patch
-cp qemu/hw/mips/mt7621.c hw-mips-mt7621.c
+cp qemu/hw/mipsel/mt7621.c hw-mips-mt7621.c
 
 printf 'synced: qemu-mt7621.patch (%d files), hw-mips-mt7621.c (%s lines)\n' \
     "$(grep -c '^diff --git' qemu-mt7621.patch)" \

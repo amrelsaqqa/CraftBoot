@@ -1,7 +1,7 @@
 #!/bin/bash
 # Boot a flash image and check that the expected lines appear on the console.
 #
-#   tests/mips/mt7621/boot-smoke.sh <image> [seconds]
+#   tests/mipsel/mt7621/boot-smoke.sh <image> [seconds]
 #
 # Expected patterns default to the bootloader and kernel banners; override with
 # BOOT_EXPECT (newline-separated regexes).
@@ -9,11 +9,11 @@ set -u
 cd "$(dirname "$0")/../../.." || exit 1
 IMG=${1:?usage: boot-smoke.sh <image> [seconds]}
 SECS=${2:-60}
-BIN=build/mips/qemu-system-mipsel
+BIN=build/mipsel/qemu-system-mipsel
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
-[ -x "$BIN" ] || { echo "missing $BIN (make TARGET=mips build)"; exit 1; }
+[ -x "$BIN" ] || { echo "missing $BIN (make TARGET=mipsel build)"; exit 1; }
 
 timeout "$SECS" "$BIN" -M mt7621,board=lg-gapm7200 -m 256M -kernel "$IMG" \
     -display none -serial file:"$OUT/serial.log" >/dev/null 2>&1

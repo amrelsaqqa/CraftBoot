@@ -18,7 +18,7 @@ Selected with the `board` property:
 ## Running
 
 ```sh
-build/mips/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
+build/mipsel/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
   -kernel <dump> -display none -serial stdio \
   -netdev tap,id=net0,ifname=tap0,script=no,downscript=no
 ```
@@ -30,8 +30,8 @@ it (`MT7621_NAND_IMAGE` gives a persistent copy, see `nand-images.md`).
 ## Tests
 
 ```sh
-tests/mips/mt7621/boot-smoke.sh <dump>
-tests/mips/mt7621/net-ping.sh <dump> <guest-ip>
+tests/mipsel/mt7621/boot-smoke.sh <dump>
+tests/mipsel/mt7621/net-ping.sh <dump> <guest-ip>
 ```
 
 ## Documentation

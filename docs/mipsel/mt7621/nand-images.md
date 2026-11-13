@@ -24,15 +24,15 @@ preserving OOB, not about corrupting reads.
 
 ## Converting
 
-`tools/mips/mt7621/nand-die.py`:
+`tools/mipsel/mt7621/nand-die.py`:
 
 ```sh
-tools/mips/mt7621/nand-die.py info image.bin
+tools/mipsel/mt7621/nand-die.py info image.bin
 #   132.0 MiB, layout: die, 65536 pages, 1024 erase blocks, bad blocks: 0
 
-tools/mips/mt7621/nand-die.py die2dump image.bin data.bin
-tools/mips/mt7621/nand-die.py die2dump image.bin data.bin --oob oob.bin
-tools/mips/mt7621/nand-die.py dump2die data.bin rebuilt.bin --oob-from image.bin
+tools/mipsel/mt7621/nand-die.py die2dump image.bin data.bin
+tools/mipsel/mt7621/nand-die.py die2dump image.bin data.bin --oob oob.bin
+tools/mipsel/mt7621/nand-die.py dump2die data.bin rebuilt.bin --oob-from image.bin
 ```
 
 `dump2die` without `--oob-from` fills the spare area with `0xff` (erased, i.e.

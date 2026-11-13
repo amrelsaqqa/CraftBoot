@@ -1,7 +1,7 @@
 #!/bin/bash
 # Boot a flash image with a tap backend and ping the guest from the host.
 #
-#   tests/mips/mt7621/net-ping.sh <image> <guest-ip> [ready-regex] [seconds]
+#   tests/mipsel/mt7621/net-ping.sh <image> <guest-ip> [ready-regex] [seconds]
 #
 # The default ready-regex matches the standard bridge-up message; override it
 # when testing firmware with a different console.  TAP (default tap0) must
@@ -13,11 +13,11 @@ IP=${2:?}
 READY=${3:-'br-lan.*link becomes ready'}
 SECS=${4:-120}
 TAP=${TAP:-tap0}
-BIN=build/mips/qemu-system-mipsel
+BIN=build/mipsel/qemu-system-mipsel
 OUT=$(mktemp -d)
 trap 'pkill -f "$BIN" 2>/dev/null; rm -rf "$OUT"' EXIT
 
-[ -x "$BIN" ] || { echo "missing $BIN (make TARGET=mips build)"; exit 1; }
+[ -x "$BIN" ] || { echo "missing $BIN (make TARGET=mipsel build)"; exit 1; }
 
 "$BIN" -M mt7621,board=lg-gapm7200 -m 256M -kernel "$IMG" \
     -display none -serial file:"$OUT/serial.log" \

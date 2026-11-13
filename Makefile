@@ -5,10 +5,10 @@
 #   board   = a machine property/preset (-M mt7621,board=lg-gapm7200)
 #
 # Selection (comma-separated; a bare architecture means all its machines):
-#   make TARGET=mips                  all machines of mips
-#   make TARGET=mips/mt7621           one machine
-#   make TARGET=mips/*,arm/*          whole architectures
-#   make TARGET=mips/mt7621,mips/mt7622
+#   make TARGET=mipsel                  all machines of mipsel
+#   make TARGET=mipsel/mt7621           one machine
+#   make TARGET=mipsel/*,arm/*          whole architectures
+#   make TARGET=mipsel/mt7621,mips/mt7622
 #   make                              whatever .config selects
 #
 # Actions: check-patches, prep, build, export-patches, list, defconfig,

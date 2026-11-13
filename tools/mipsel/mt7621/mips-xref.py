@@ -6,7 +6,7 @@ constants per register, and reports every instruction that leaves a register
 pointing into the strings window.  Also dumps the surrounding instructions so
 the caller can be inspected.
 
-    tools/mips-xref.py <image> <base-hex> <target-lo-hex> <target-hi-hex>
+    tools/mipsel/mt7621/mips-xref.py <image> <base-hex> <target-lo-hex> <target-hi-hex>
 """
 import sys
 
