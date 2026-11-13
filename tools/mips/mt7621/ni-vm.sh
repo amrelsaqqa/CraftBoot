@@ -66,7 +66,7 @@ env $KNOBS "$QEMU" \
     -display none \
     -monitor "unix:$OUT/monitor.sock,server=on,wait=off" \
     $SERIAL \
-    -netdev tap,id=net0,ifname=ipqtap0,script=no,downscript=no \
+    -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
     > "$OUT/qemu.out" 2> "$OUT/qemu.err" &
 
 echo $! > "$OUT/qemu.pid"

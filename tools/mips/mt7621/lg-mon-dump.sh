@@ -15,7 +15,7 @@ MT7621_RXDBG=1 MT7621_ETHLOG=1 ./build/qemu-system-mipsel -M mt7621,board=lg-gap
     -chardev socket,id=ser0,host=127.0.0.1,port=$PORT,server=on,wait=off,telnet=on,logfile="$out/serial.log" \
     -serial chardev:ser0 \
     -monitor unix:"$MON",server=on,wait=off \
-    -netdev tap,id=net0,ifname=ipqtap0,script=no,downscript=no \
+    -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
     >/dev/null 2>"$out/eth.log" &
 qpid=$!
 
@@ -48,8 +48,8 @@ BASE=$(grep -a "eth: write 0900 <-" "$out/eth.log" | tail -1 | sed 's/.*<- \([0-
 echo "ring base: ${BASE:-none}"
 echo "=== before ping ==="; dump "${BASE:-0x01660000}"
 
-ip neigh flush dev ipqtap0 2>/dev/null
-ping -c 3 -W 1 -I ipqtap0 192.168.33.251 >/dev/null 2>&1
+ip neigh flush dev tap0 2>/dev/null
+ping -c 3 -W 1 -I tap0 192.168.33.251 >/dev/null 2>&1
 sleep 3
 
 BASE=$(grep -a "eth: write 0900 <-" "$out/eth.log" | tail -1 | sed 's/.*<- \([0-9a-f]*\).*/0x\1/')

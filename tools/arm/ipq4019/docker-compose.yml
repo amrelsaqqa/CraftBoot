@@ -100,7 +100,7 @@ services:
       SERIAL: tcp
       SERIAL_PORT: "4446"
       NET: lan
-      TAP: ipqtap0
+      TAP: tap0
       LAN_IP: 192.168.1.2/24
       DHCP: "1"
       IPQ_PORT: "5"             # 5 = lan1

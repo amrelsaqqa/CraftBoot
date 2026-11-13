@@ -12,7 +12,7 @@ MT7621_ETHLOG=1 ./build/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
     -kernel /home/amrelsaqqa/full.bin -display none -monitor none \
     -chardev socket,id=ser0,host=127.0.0.1,port=$PORT,server=on,wait=off,telnet=on,logfile="$out/serial.log" \
     -serial chardev:ser0 \
-    -netdev tap,id=net0,ifname=ipqtap0,script=no,downscript=no \
+    -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
     >/dev/null 2>"$out/eth.log" &
 qpid=$!
 
@@ -31,7 +31,7 @@ python3 tools/guest.py $PORT "$out/serial.log" \
   'ethtool -S eth0 2>&1 | head -30' \
   'dmesg | grep -i "mtk\|dsa\|switch\|eth" | tail -20' > "$out/info.txt" 2>&1
 
-ping -c 3 -W 1 -I ipqtap0 192.168.33.251 >/dev/null 2>&1
+ping -c 3 -W 1 -I tap0 192.168.33.251 >/dev/null 2>&1
 sleep 2
 python3 tools/guest.py $PORT "$out/serial.log" \
   'dmesg | tail -15' 'cat /proc/net/dev' > "$out/after.txt" 2>&1

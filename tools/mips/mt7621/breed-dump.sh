@@ -13,7 +13,7 @@ MT7621_DL=4 ./build/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
     -kernel /home/amrelsaqqa/full.bin -display none \
     -serial file:"$out/serial.log" \
     -monitor unix:"$MON",server=on,wait=off \
-    -netdev tap,id=net0,ifname=ipqtap0,script=no,downscript=no \
+    -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
     >/dev/null 2>"$out/qemu.log" &
 qpid=$!
 

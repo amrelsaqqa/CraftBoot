@@ -4,7 +4,7 @@
 #   tests/mips/mt7621/net-ping.sh <image> <guest-ip> [ready-regex] [seconds]
 #
 # The default ready-regex matches the standard bridge-up message; override it
-# when testing firmware with a different console.  TAP (default ipqtap0) must
+# when testing firmware with a different console.  TAP (default tap0) must
 # exist and carry an address in the guest's subnet.
 set -u
 cd "$(dirname "$0")/../../.." || exit 1
@@ -12,7 +12,7 @@ IMG=${1:?usage: net-ping.sh <image> <guest-ip> [ready-regex] [seconds]}
 IP=${2:?}
 READY=${3:-'br-lan.*link becomes ready'}
 SECS=${4:-120}
-TAP=${TAP:-ipqtap0}
+TAP=${TAP:-tap0}
 BIN=build/mips/qemu-system-mipsel
 OUT=$(mktemp -d)
 trap 'pkill -f "$BIN" 2>/dev/null; rm -rf "$OUT"' EXIT

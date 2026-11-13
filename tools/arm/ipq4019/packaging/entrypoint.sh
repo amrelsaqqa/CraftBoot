@@ -51,7 +51,7 @@ SERIAL_PORT=${SERIAL_PORT:-4444}
 NET=${NET:-lan}
 IPQ_PORT=${IPQ_PORT:-5}
 DHCP=${DHCP:-1}
-TAP=${TAP:-ipqtap0}
+TAP=${TAP:-tap0}
 
 say() { printf '%s\n' "$*" >&2; }
 die() { say "ipq4019: $*"; exit 2; }

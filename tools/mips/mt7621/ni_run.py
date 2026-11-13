@@ -54,7 +54,7 @@ DEFAULTS = {
     "cli": os.path.join(HOME, "Downloads/netinstall-7.15/netinstall-cli"),
     "package": os.environ.get("NI_PACKAGE", ""),
     "out": os.path.join(REPO, "run"),
-    "iface": "ipqtap0",
+    "iface": "tap0",
     "port": 4444,
 }
 

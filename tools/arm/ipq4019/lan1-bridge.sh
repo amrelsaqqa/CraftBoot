@@ -13,7 +13,7 @@
 #
 #   virtual (default, NIC empty)      real NIC (NIC=enp0s31f6)
 #
-#      host IP ── ipqtap0 ── QEMU       host IP ── ipqbr0 ── ipqtap0 ── QEMU
+#      host IP ── tap0 ── QEMU       host IP ── ipqbr0 ── tap0 ── QEMU
 #                                                     └── enp0s31f6 ── wire
 #
 # The virtual mode needs nothing but /dev/net/tun and NET_ADMIN, and it does
@@ -33,7 +33,7 @@
 # Knobs:
 #   NIC=""            physical port to bridge ("" = virtual cable only)
 #   BR=ipqbr0         bridge name (only used when NIC is set)
-#   TAP=ipqtap0       tap name
+#   TAP=tap0       tap name
 #   IPQ_PORT=5        switch port: 0=cpu 1=ether1/wan 2=lan4 3=lan3 4=lan2 5=lan1
 #   UART_PORT=4444    TCP port for UART0
 #   UART_BIND=127.0.0.1   bind address (0.0.0.0 to reach it from another machine)
@@ -191,7 +191,7 @@ cd "$(dirname "$0")" || exit 1
 
 NIC=${NIC-}
 BR=${BR:-ipqbr0}
-TAP=${TAP:-ipqtap0}
+TAP=${TAP:-tap0}
 IPQ_PORT=${IPQ_PORT:-5}
 UART_PORT=${UART_PORT:-4444}
 UART_BIND=${UART_BIND:-127.0.0.1}

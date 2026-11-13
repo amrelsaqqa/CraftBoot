@@ -7,7 +7,7 @@ that job, but it is one-shot, needs a pid file, and inside a user namespace it
 fails its own capability checks -- none of which matters for a 100 line client
 that speaks the same four messages.
 
-  python3 dhcp_client.py ipqtap0 [deadline-seconds]
+  python3 dhcp_client.py tap0 [deadline-seconds]
 
 On success it prints one line of shell assignments and exits 0:
 
