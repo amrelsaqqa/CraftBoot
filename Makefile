@@ -125,9 +125,11 @@ prep: fetch
 	done
 	@touch "$(SUBDIR)/.prepped"
 
-# ---- build: configure once, then ninja the target's binaries -------------
-build: $(SUBDIR)/.prepped
+# ---- build: prep on demand, configure once, then ninja the binaries ------
+build:
 	@test -n "$(BINARIES)" || { echo "target $(TARGET) is not wired up (no BINARIES)"; exit 1; }
+	@test -f "$(SUBDIR)/.prepped" || \
+	    $(MAKE) --no-print-directory TARGET="$(TARGET)" MACHINES="$(MACHINES)" prep
 	@if [ ! -f "$(OBJ)/build.ninja" ]; then \
 	    mkdir -p "$(OBJ)"; \
 	    echo "configure $(TARGET)"; \
