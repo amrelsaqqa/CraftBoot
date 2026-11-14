@@ -276,9 +276,52 @@ typedef struct IPQBoardPreset {
     IPQBoardConfig cfg;
 } IPQBoardPreset;
 
+/* ipq4019_gpio.c: the pin controller and the board's lamps/keys */
+#define IPQ_TLMM_RESET_VAL   0xffffffffu
+
+/*
+ * The pins.
+ *
+ * A board part either drives a pin or watches one, and both are per-pin lines
+ * here -- the way a qdev GPIO controller exposes them -- so a board device
+ * never has to know about TLMM register layout.  The line's level is the bit
+ * the guest drives (GPIO_IO bit 1, high = 1), and a handler is told about
+ * *every* write to its pin's IO register, not only about changes: gpiolib
+ * takes and releases a chip select around each message, and asserting the same
+ * die twice in a row is two transaction boundaries.
+ */
+#define IPQ_TLMM_NPINS 128
+
+typedef void (*IPQPinHandler)(void *opaque, int level);
+
+struct IPQTLMM {
+    MemoryRegion mr;
+    uint32_t *regs;
+    uint32_t nregs;
+
+    uint8_t out_level[IPQ_TLMM_NPINS];          /* what the guest drives */
+    IPQPinHandler handler[IPQ_TLMM_NPINS];
+    void *handler_opaque[IPQ_TLMM_NPINS];
+
+    /*
+     * Pins the board drives into the SoC (buttons, PHY interrupts): their
+     * level is what a read of the pin reports, instead of the latch the guest
+     * last wrote.
+     */
+    uint8_t in_level[IPQ_TLMM_NPINS];
+    bool in_used[IPQ_TLMM_NPINS];
+};
+
+void add_tlmm(MemoryRegion *parent, hwaddr base, hwaddr size, const char *name);
+void tlmm_dev_reset(IPQTLMM *t);
+void ipq_tlmm_connect(IPQTLMM *t, unsigned pin, IPQPinHandler fn, void *opaque);
+void ipq_board_add_leds(void);
+void ipq_board_add_keys(void);
+
 /* file-scope siblings: one machine per process, so a plain pointer is enough */
 extern IPQ4019State *ipq;
 extern IPQBoardState *ipq_board;
+extern IPQBoardConfig ipq_cfg;   /* the merged board: presets + properties + env */
 
 /* small helpers shared by every block */
 uint32_t env_u32(const char *name, uint32_t def);
