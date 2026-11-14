@@ -165,9 +165,6 @@ uint32_t env_u32(const char *name, uint32_t def)
     return strtoul(s, NULL, 0);
 }
 
-/* A GCC block reset pulse for the QPIC lands here (see stub_write). */
-static void ipq_qpic_bam_reset(void);
-
 bool env_true(const char *name)
 {
     return env_u32(name, 0) != 0;
@@ -3495,33 +3492,6 @@ static void qpic_bam_update_irq(IPQQpicBam *b)
 }
 
 static unsigned qpgm_logs;
-
-/*
- * The booter's exit path pulses the QPIC's block reset in the GCC before it
- * jumps to the kernel -- its last NAND command stays unacknowledged when a
- * part with no kernel made it time out, and the next guest's SPS layer
- * refuses to enable a BAM that still shows a pending source.  The clock
- * controller is a stub, so this is where that pulse has to land.
- */
-static void ipq_qpic_bam_reset(void)
-{
-    IPQQpicBam *b = ipq_qpic_bam;
-    int i;
-
-    if (!b) {
-        return;
-    }
-    for (i = 0; i < QB_PIPES; i++) {
-        memset(&b->pipe[i], 0, sizeof(b->pipe[i]));
-    }
-    b->desc_trshld = 0;
-    b->cfg_bits = 0x0fffffff;
-    b->irq_stts = 0;
-    b->irq_en = 0;
-    b->irq_srcs_msk = 0;
-    b->irq_srcs_msk_ee = 0;
-    qpic_bam_update_irq(b);
-}
 
 static void qpic_bam_data_in(IPQQpic *q, uint32_t addr, uint32_t len)
 {
