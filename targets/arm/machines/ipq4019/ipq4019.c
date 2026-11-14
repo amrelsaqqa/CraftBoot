@@ -2985,6 +2985,19 @@ struct IPQQpic {
     uint8_t tx_stage[QPIC_RD_MAX];  /* program bytes the data pipe delivered */
     uint32_t tx_len;
     uint32_t txn_wr;            /* codeword the next program EXEC lands on */
+    /*
+     * A program EXEC whose payload was still in flight on the data pipe.
+     * The driver rings the data descriptors and the command batch on two
+     * different pipes and a doorbell only drains one of them, so the command
+     * side can reach the EXEC before the bytes are staged.  Programming the
+     * short page was silent corruption (the rest stayed queued and shifted
+     * every later codeword), so the EXEC is held here and completed when the
+     * data arrives.
+     */
+    struct {
+        uint32_t page, at, cw, need;
+    } pgm_pend[8];
+    unsigned pgm_n;
 
     uint8_t rd_stream[QPIC_RD_MAX]; /* bytes a read produced, not yet delivered */
     uint32_t rd_len;
@@ -3255,6 +3268,42 @@ static uint32_t qpic_program_size(IPQQpic *q, uint32_t cw)
            (steps << 2) + ((ecc >> 8) & 0x1f) + ((cfg0 >> 23) & 0xf);
 }
 
+static void qpic_program_do(IPQQpic *q, uint32_t page, uint32_t at,
+                            uint32_t cw, uint32_t need)
+{
+    uint32_t n = MIN(q->tx_len, need);
+
+    if (n) {
+        if (env_true("QEMU_IPQ_QPIC_LOG") ||
+            (env_true("QEMU_IPQ_QPIC_PGM") && cw == 0)) {
+            qpic_log("qpic: prog page=%u cw=%u at=%u n=%u tx=%02x %02x %02x %02x "
+                     "%02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                     page, cw, at, n,
+                     q->tx_stage[0], q->tx_stage[1], q->tx_stage[2],
+                     q->tx_stage[3], q->tx_stage[4], q->tx_stage[5],
+                     q->tx_stage[6], q->tx_stage[7], q->tx_stage[8],
+                     q->tx_stage[9], q->tx_stage[10], q->tx_stage[11],
+                     q->tx_stage[12]);
+        }
+        qpic_die_program(q->die, page, at, q->tx_stage, n);
+        q->tx_len -= n;
+        memmove(q->tx_stage, q->tx_stage + n, q->tx_len);
+        ipq_die_store_sync(&q->die->store);
+    }
+}
+
+/* Complete held EXECs, in the order they were issued, as data arrives. */
+static void qpic_program_pending(IPQQpic *q)
+{
+    while (q->pgm_n && q->tx_len >= q->pgm_pend[0].need) {
+        qpic_program_do(q, q->pgm_pend[0].page, q->pgm_pend[0].at,
+                        q->pgm_pend[0].cw, q->pgm_pend[0].need);
+        memmove(&q->pgm_pend[0], &q->pgm_pend[1],
+                (q->pgm_n - 1) * sizeof(q->pgm_pend[0]));
+        q->pgm_n--;
+    }
+}
+
 static void qpic_exec(IPQQpic *q)
 {
     uint32_t cmd = q->reg[QN_CMD / 4];
@@ -3334,30 +3383,30 @@ static void qpic_exec(IPQQpic *q)
                             MIN(q->txn_wr, steps - 1);
         /* Same rule as the read side: a column is an absolute byte offset. */
         uint32_t at = col ? col : cw * qpic_cw_size(q);
-        uint32_t n = MIN(q->tx_len, qpic_program_size(q, cw));
+        uint32_t need = qpic_program_size(q, cw);
 
         /*
          * Programming a NAND only clears bits, and the page keeps whatever
          * was never written, so the die ANDs the step in place.  The bytes
          * land where the read path will look for them: at the codeword's own
          * window, which is also the byte order the driver queued them in.
+         *
+         * A codeword is programmed only once its whole payload is staged:
+         * consuming a short page would leave the remainder queued and shift
+         * every later codeword into the wrong place.
          */
-        if (n) {
-            if (env_true("QEMU_IPQ_QPIC_LOG") ||
-                (env_true("QEMU_IPQ_QPIC_PGM") && cw == 0)) {
-                qpic_log("qpic: prog page=%u cw=%u at=%u n=%u tx=%02x %02x %02x %02x "
-                         "%02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                         page, cw, at, n,
-                         q->tx_stage[0], q->tx_stage[1], q->tx_stage[2],
-                         q->tx_stage[3], q->tx_stage[4], q->tx_stage[5],
-                         q->tx_stage[6], q->tx_stage[7], q->tx_stage[8],
-                         q->tx_stage[9], q->tx_stage[10], q->tx_stage[11],
-                         q->tx_stage[12]);
+        if (q->tx_len >= need) {
+            qpic_program_do(q, page, at, cw, need);
+        } else if (q->pgm_n < ARRAY_SIZE(q->pgm_pend)) {
+            q->pgm_pend[q->pgm_n].page = page;
+            q->pgm_pend[q->pgm_n].at = at;
+            q->pgm_pend[q->pgm_n].cw = cw;
+            q->pgm_pend[q->pgm_n].need = need;
+            q->pgm_n++;
+            if (env_true("QEMU_IPQ_QPIC_LOG")) {
+                qpic_log("qpic: prog wait page=%u cw=%u need=%u staged=%u\n",
+                         page, cw, need, q->tx_len);
             }
-            qpic_die_program(q->die, page, at, q->tx_stage, n);
-            q->tx_len -= n;
-            memmove(q->tx_stage, q->tx_stage + n, q->tx_len);
-            ipq_die_store_sync(&q->die->store);
         }
         q->last_page = page;
         q->txn_wr = cw + 1;
@@ -3635,6 +3684,7 @@ static void qpic_bam_data_in(IPQQpic *q, uint32_t addr, uint32_t len)
         }
         done += take;
     }
+    qpic_program_pending(q);
 }
 
 /*
@@ -4186,6 +4236,7 @@ static void qpic_dev_reset(void)
     memset(q->buf, 0xff, sizeof(q->buf));
     q->tx_len = 0;
     q->txn_wr = 0;
+    q->pgm_n = 0;
     q->rd_len = 0;
     q->rd_page = UINT32_MAX;
     q->txn_rd = 0;
