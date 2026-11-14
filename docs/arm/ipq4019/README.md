@@ -47,13 +47,13 @@ lists the block files in `meson.build`.
 | `modules/eth.c` | IPQESS, host netdev, MDIO/PHY, board ports |
 | `modules/stub.c` | shadowed stubs, register-file, power-hold, watchdog, memory window, clock rates |
 | `modules/board.c` | board presets, merge order, env shim |
+| `modules/flash.c` | QUP SPI, NOR die, SPI NAND, die store |
 
-Planned, in the order they are being moved: `modules/flash.c` (QUP SPI, NOR
-die, die store, SPI NAND), `modules/qpic.c` + `modules/qpic_bam.c`, then
-`modules/dump.c` for what is left.  `modules/flash.c` is deliberately later: the QUP SPI opcode
-handler sits with the part-building code, so it is a multi-range move; the QPIC
-block will bring its own `qpic.h` for the register and opcode defines instead
-of growing ipq4019.h by several hundred lines.
+Remaining: `modules/qpic.c` + `modules/qpic_bam.c` (the QPIC block brings its
+own `qpic.h` for the register and opcode defines instead of growing
+`ipq4019.h` by several hundred lines), then `modules/dump.c`; the machine file
+keeps init, reset, boot stages, the register-file/gcnt blocks and the `-M`
+properties.
 
 Rules that keep the split useful:
 
