@@ -91,73 +91,86 @@ where a guest's own panic text still lives when its console gives no output.
   understand the vendor's in-band ECC layout will not mount the partition; the
   layout is documented in `boot-and-storage.md`.
 
-## Open: the QPIC NAND install is randomly inconsistent
+## The QPIC NAND install path
 
-Status as of the current session: a netinstall reports `Software installed.`
-and the bootloader then loads the kernel, but the installed system's data is
-sometimes damaged, and the damage moves around (`yaffs: write required N
-attempts`, `yaffs: **>> Block N needs retiring`, `yaffs: marking block 0 bad`,
-`ERROR: could not mount filesystem`).  It is timing-dependent: the same run can
-end with a perfect die and the next one with a die whose main partition has
-data but no yaffs object headers.  Warm reboots sometimes come up, cold boots
-of a damaged die never do.
+A netinstall reports `Software installed.` and the installed system boots,
+warm and cold.  Getting there exposed two independent problems; both are
+recorded here because they look alike from the console.
 
-### What is proven
+### Program window sizing (fixed)
 
-- The die scan is the ground truth: a good install leaves the boot partition's
-  `kernel` object plus a main partition holding the yaffs tree (`boot`, `rw`,
-  `nova`, `etc`, `var`, `pdb`, `store`, ~170 file headers, ~37 dirs); a bad run
-  leaves main-partition data pages with zero object headers.
-- The program path is column-correct: on one page the driver issues four
-  `op=6` EXECs with the page address written once (`addr0` identical, `col=0`)
-  and the model programs `at=0/516/1032/1548` with `n=516/516/516/500`, which
-  tiles the 2048-byte page exactly; the erase carries its row in
-  `ADDR0[15:0]` and decodes to the right block.
-- The store mirror is not the culprit: a traced run's die content matches what
-  the model programmed (the good die above), so `qpic_die_persist` reaches the
-  file.
-- A real race was found and fixed (commit `af4a5f5`): the program payload
-  arrives on the BAM data pipe while the EXEC arrives on the command pipe, and
-  each doorbell drains only its own pipe.  `MIN(staged, codeword)` therefore
-  programmed short pages.  2448 of 5014 programs hit that path in one traced
-  install; the EXEC now waits for its payload (a pending queue, completed in
-  order as data arrives).
-- A column-stride experiment (deriving the codeword from `col/qpic_cw_size`
-  instead of `col/528`) was tried and did **not** help; it is not in the tree.
+An ECC page is four codewords, and the driver's buffer tiles the 2048-byte
+page as 516, 516, 516, 500.  The model used to size the last codeword from
+the physical codeword (500 data + 16 spare + 7 parity + 4 CFG bits = 527),
+which the driver never sends.  Before the held-EXEC queue that was masked by
+`MIN(staged, need)`; once the EXEC waited for its whole payload the last
+window never completed, the *next* page's first 27 bytes completed it, and
+every page after the first was written 27 bytes off -- with the last window
+running past the page into the spare area.  yaffs then reported `write
+required N attempts`, `Block N needs retiring`, `marking block 0 bad` and
+`could not mount filesystem`, and the die scan showed main-partition data
+with no object headers.
 
-### What is still suspected
+`qpic_program_size()` now derives the window from the page tiling
+(`NAND_PAGE - (steps - 1) * cw_size`, i.e. 500 for the traced configuration)
+and `qpic_program_page_bytes()` is the invariant it is checked against.
 
-Both remaining stream mechanisms are shared, order-dependent state:
+### Page-scoped program staging
 
-- `tx_stage`/`tx_len` in `IPQQpic`: data pipe appends, command pipe consumes.
-  Short consumption is prevented now, but the queue is still process-wide and
-  any interleaving between pages leans on the two pipes draining in a
-  favourable order.
-- `rd_stream`/`rd_len` plus the `rx_addr/rx_len/rx_done/rx_n` descriptor ring:
-  the command pipe appends per-codeword windows, the data pipe drains them into
-  the guest's rx buffers.  The stream resets on `cw == 0 || page != rd_page`,
-  which is a codeword counter, not a page event; a drain that lands between the
-  reset decision and the next fill mixes pages.
+The data pipe and the command pipe are rung independently, so either can
+arrive first.  The model now tags every staged window with its page and
+checks the bytes moved per page; a window of a different page arriving while
+one is still waiting drops the staging (loudly) instead of shifting it into
+the next page.  Column-addressed (spare/bad-block) programs move their own
+window, bounded by the row end, rather than a whole codeword.  Read
+transactions are either one page or one column window, never a stream that
+silently carries stale bytes across a page, and no staging/read/rx-ring
+overflow can drop data silently.
 
-The refactor under consideration makes both sides page-scoped and
-order-independent: a `wr_page`/`wr_buf[NAND_STRIDE]` staging page where the
-data pipe writes bytes at their column and a program EXEC commits a codeword
-only when that codeword's bytes are present, and a `rd_page`/`rd_buf` with a
-byte cursor for the read side that resets on a page change rather than on a
-codeword index.  The die model (column-addressed program, block erase, store
-persist) is believed correct and should stay.
+All of these print `qpic: anomaly: ...` (unconditionally, rate-limited) and
+must stay silent on a correct run.
 
-Separately, one observation that may or may not be the same bug: cold-booting
-a die whose yaffs tree is intact still ends at `ERROR: no system package
-found!` about 2 s in, with no `yaffs` mount line in the log at all — the
-installed system's init (the 1620K initramfs) decides the package is absent
-before mounting anything.  A full 256 MB RAM dump at that panic is at
-`/tmp/ram-panic.bin`, and the string sits at `0x809fdcfb`.  If the refactor does
-not change this, it is a second, separate issue.
+### Proven facts from the traces
 
-### Reproducing and testing
+- One install moves exactly 2048 bytes per programmed page: the data pipe
+  delivers 512+4+512+4+512+4+500, the four EXECs consume 516/516/516/500,
+  and every page starts with `in=2048` (7,953 pages in one traced install).
+- The driver writes the page address once per page (`addr0` identical across
+  the four EXECs, `col=0`), so a per-page step counter is correct.
+- Read windows are 516/516/516/500 as well; both yaffs mounts (`mtdblock1`
+  then `mtdblock0`) complete on the installed die.
+- The die scan is the oracle: a good install leaves the boot partition's
+  kernel object plus the main tree (`bin`, `boot`, `rw`, `nova`, `etc`,
+  `var`, `pdb`, `store`, the `system`/`option` images; ~170 objects).
+- The store mirror is not the culprit, and the column-stride experiment
+  (`col/qpic_cw_size` instead of `col/528`) did not help; neither is in the
+  tree.
+- A real race was found and fixed earlier (`af4a5f5`): the program payload
+  arrives on the BAM data pipe while the EXEC arrives on the command pipe,
+  and each doorbell drains only its own pipe.  `MIN(staged, codeword)`
+  programmed short pages (2448 of 5014 programs in one traced install); the
+  EXEC now waits for its payload.
 
-Build (see the model iteration note in the README — `sync` is seconds):
+### The boot failure was a partition-offset mismatch
+
+The console the init prints (`opendir: No such file or directory` twice, then
+`ERROR: no system package found!`) is not a NAND failure.  The installed
+kernel's command line carries `boot_part_size=8388608`, so its table is
+`Boot 0x0-0x800000`, `Main 0x800000-0x8000000` -- the same values a real
+RouterOS 7.x device reports.  A netinstall image from a matching build writes
+the rootfs at 8 MB, the kernel mounts `mtdblock1` and `mtdblock0`, and the
+system boots, warm and cold.
+
+An older netinstall image defaults to a 6 MB boot partition, writes the tree
+at 6 MB, and the installed kernel then finds the parent directories on one
+side of the 8 MB boundary and their children on the other: the yaffs scan
+succeeds, the package is unreachable, and init panics.  Using a netinstall
+image from the same generation as the installed system fixes it; the model
+needed no change.
+
+### Reproducing
+
+Build (see the model iteration note in the README -- `sync` is seconds):
 
 ```sh
 make TARGET=arm/ipq4019 sync
@@ -167,7 +180,7 @@ Run the board with a *copy* of a die and the console on a socket:
 
 ```sh
 cp ~/nand-test-ac3.bin /tmp/die.bin
-QEMU_IPQ_QPIC_LOG=1 QEMU_IPQ_QPIC_PGM=1 \
+QEMU_IPQ_QPIC_LOG=1 \
 build/arm/qemu-system-arm \
   -M "ipq4019,board=hap-ac3,qpic-nand=on,eth-bridge-port=1,qpic-nand-file=/tmp/die.bin" \
   -kernel ~/ac3-nor-7.17.bin -display none -monitor none \
@@ -176,22 +189,12 @@ build/arm/qemu-system-arm \
   -netdev tap,id=net0,ifname=ipqtap0,script=no,downscript=no
 ```
 
-`telnet 127.0.0.1 4444` is the board console; netinstall needs character mode or
-`^E` is eaten.  dnsmasq must be stopped (it owns the tap).  At the banner `^E`
-(etherboot), or `g` in the router's setup menu, then run `netinstall-cli` with
-the system and option packages.  The QPIC trace with `QEMU_IPQ_QPIC_LOG=1` to
-stderr is the record to analyse; without it every conclusion is a guess.
+`telnet 127.0.0.1 4444` is the board console; netinstall needs character mode
+or `^E` is eaten.  dnsmasq must be stopped (it owns the tap).  At the banner
+`^E` (etherboot), or `g` in the router's setup menu, then run
+`netinstall-cli` with the system and option packages.
 
-Acceptance criteria before any refactor is committed:
-
-1. five installs in a row (each starting from a fresh copy of the same die),
-   each followed by a cold boot, all reaching the installed system;
-2. five warm reboots (`/system reboot`) of one install, all coming back;
-3. three cold boots of one good die, all identical;
-4. in every case the console shows `0 blocks to be sorted`, no
-   `needs retiring`, no `write required N attempts`, no `marking block bad`,
-   and the die scan shows the yaffs tree in the main partition.
-
-Deferred until all of the above: the debug hooks (`QEMU_IPQ_QPIC_PGM` and the
-`pc/lr` in the QPIC log lines) can stay, they are only active when the env
-variables are set.
+Acceptance: no `qpic: anomaly:` lines; the console shows `0 blocks to be
+sorted`, no `needs retiring`, no `write required N attempts`, no `marking
+block bad`; the die scan shows the tree; warm and cold boots both reach the
+system.

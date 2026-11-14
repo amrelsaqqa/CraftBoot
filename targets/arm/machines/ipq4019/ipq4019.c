@@ -2971,7 +2971,8 @@ typedef struct IPQParNand {
 #define QPIC_ECC_STEP   512u
 #define QPIC_CW_STEPS   (NAND_PAGE / QPIC_ECC_STEP)
 #define QPIC_CW_SIZE    (NAND_STRIDE / QPIC_CW_STEPS)
-#define QPIC_RD_MAX     4096u       /* page + spare, with room to spare */
+#define QPIC_IO_MAX     (NAND_STRIDE * 2u)  /* a page, plus one in flight */
+#define QPIC_RX_DECS    32u                 /* queued rx descriptors */
 
 struct IPQQpic {
     MemoryRegion mr;
@@ -2982,9 +2983,14 @@ struct IPQQpic {
     uint8_t buf[NAND_STRIDE];   /* one codeword window, at BUF_ACC offset 0 */
     bool loc_last;              /* the EXEC uses the LAST_CW read locations */
 
-    uint8_t tx_stage[QPIC_RD_MAX];  /* program bytes the data pipe delivered */
+    uint8_t tx_stage[QPIC_IO_MAX];  /* program bytes the data pipe delivered */
     uint32_t tx_len;
     uint32_t txn_wr;            /* codeword the next program EXEC lands on */
+    uint32_t tx_page;           /* page the staged bytes are consumed for */
+    bool tx_page_set;
+    bool tx_seq;                /* tx_page has seen a page-sequence window */
+    uint32_t tx_used;           /* page-sequence bytes of tx_page programmed */
+    bool tx_lost;               /* a staging overflow was reported */
     /*
      * A program EXEC whose payload was still in flight on the data pipe.
      * The driver rings the data descriptors and the command batch on two
@@ -2993,16 +2999,23 @@ struct IPQQpic {
      * short page was silent corruption (the rest stayed queued and shifted
      * every later codeword), so the EXEC is held here and completed when the
      * data arrives.
+     *
+     * The entries belong to one page.  A window of a different page arriving
+     * while one is still waiting means the staged bytes can no longer be
+     * attributed to either page; the staging is dropped (loudly) rather than
+     * shifted into the new page, because a shift corrupts every page after it.
      */
     struct {
         uint32_t page, at, cw, need;
+        bool spare;
     } pgm_pend[8];
     unsigned pgm_n;
 
-    uint8_t rd_stream[QPIC_RD_MAX]; /* bytes a read produced, not yet delivered */
+    uint8_t rd_stream[QPIC_IO_MAX]; /* bytes a read produced, not yet delivered */
     uint32_t rd_len;
     uint32_t rd_page;           /* page rd_stream is collecting */
     uint32_t txn_rd;            /* codeword the next read EXEC lands on */
+    bool rd_lost;               /* a read overflow was reported */
 
     /*
      * A read puts its window into rd_stream and the BAM hands it to the rx
@@ -3016,15 +3029,39 @@ struct IPQQpic {
      * page's bytes in order.  The stream is dropped when an EXEC addresses the
      * first codeword, or a different page: that is where a page read starts.
      */
-    uint32_t rx_addr[16];
-    uint32_t rx_len[16];
-    uint32_t rx_done[16];
+    uint32_t rx_addr[QPIC_RX_DECS];
+    uint32_t rx_len[QPIC_RX_DECS];
+    uint32_t rx_done[QPIC_RX_DECS];
     uint32_t rx_n;
 
     uint32_t last_page;         /* page the window belongs to (logging) */
 };
 
 static bool ipq_qpic_store_loaded;
+
+/*
+ * Protocol violations always print.  Each one means the model misread the
+ * controller's stream, and every one of them costs correctness, so they are
+ * reported without needing an environment variable; they are capped so a
+ * systematic mismatch cannot flood the console.
+ */
+static void qpic_warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void qpic_warn(const char *fmt, ...)
+{
+    static unsigned n;
+    va_list ap;
+
+    if (++n > 40) {
+        if (n == 41) {
+            fprintf(stderr, "qpic: anomaly: further reports suppressed\n");
+        }
+        return;
+    }
+    fprintf(stderr, "qpic: anomaly: ");
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
 
 /* ---- the die ---------------------------------------------------------- */
 
@@ -3171,13 +3208,21 @@ static void qpic_read_window(IPQQpic *q, uint32_t page, uint32_t op,
     int i;
 
     /*
-     * A page read walks the codewords one EXEC at a time and the data pipe
-     * may drain each window in pieces, so the windows belong to one stream
-     * that only restarts where a page read starts.
+     * A read transaction is one page (the four codeword EXECs of a page
+     * read) or one column-addressed window (the bad-block helpers address the
+     * spare area that way and the pipe only ever sees those four bytes).
+     * Anything still in the stream when a new transaction starts was never
+     * collected by the data pipe, so a descriptor the guest queued will never
+     * be filled; say so instead of silently prepending stale bytes.
      */
-    if (cw == 0 || page != q->rd_page) {
+    if (cw == 0 || col != 0 || page != q->rd_page) {
+        if (q->rd_len) {
+            qpic_warn("read page %u starts with %u byte(s) uncollected\n",
+                      page, q->rd_len);
+        }
         q->rd_len = 0;
         q->rd_page = page;
+        q->rd_lost = false;
     }
 
     for (i = 0; i < 4; i++) {
@@ -3195,8 +3240,12 @@ static void qpic_read_window(IPQQpic *q, uint32_t page, uint32_t op,
             uint8_t b = (die && d < NAND_STRIDE) ? die[d] : 0xff;
 
             q->buf[off + k] = b;
-            if (q->rd_len < QPIC_RD_MAX) {
+            if (q->rd_len < QPIC_IO_MAX) {
                 q->rd_stream[q->rd_len++] = b;
+            } else if (!q->rd_lost) {
+                q->rd_lost = true;
+                qpic_warn("read page %u: window overflow at %u byte(s)\n",
+                          page, q->rd_len);
             }
         }
         if (v & (1u << 31)) {
@@ -3233,46 +3282,49 @@ static void qpic_read_window(IPQQpic *q, uint32_t page, uint32_t op,
  * How many bytes one program EXEC takes out of the data pipe.
  *
  * Linux queues the whole page before the first EXEC (516, 516, 516, then the
- * last codeword's 500 data bytes plus its 27 spare bytes), while MikroTik's
- * older driver fed one 528-byte codeword per EXEC.  Both are the CFG0/ECC
- * description of a step, so the size comes from those registers rather than
- * from how the driver happened to split its transfers.
+ * last codeword's 500 bytes), while MikroTik's older driver fed one codeword
+ * per EXEC.  The windows tile the 2048-byte page exactly, so the size comes
+ * from that tiling and from the CFG0 step size the driver framed the buffer
+ * with -- not from the physical codeword, which also counts the ECC parity
+ * and spare bytes the driver never sends.
+ *
+ * The last step is where this matters: for an ECC page it carries the rest of
+ * the page (2048 - 3 * 516 = 500).  Sizing it as data + spare + parity + cfg
+ * bits (527 for the traced configuration) made the held EXEC wait for bytes
+ * that never arrive, and the next page's bytes then completed it: the stream
+ * shifted by 27 bytes per page, the last-window write ran past the page into
+ * the spare area, and every later page was written at the wrong offset.
  */
 static uint32_t qpic_program_size(IPQQpic *q, uint32_t cw)
 {
     uint32_t cfg0 = q->reg[QN_DEV0_CFG0 / 4];
     uint32_t ecc = q->reg[QN_DEV0_ECC_CFG / 4];
     uint32_t steps = qpic_cw_steps(q);
-    uint32_t ud = (cfg0 >> 9) & 0x3ff;
-    uint32_t n = ud ? ud : QPIC_CW_SIZE;
+    uint32_t n = qpic_cw_size(q);
 
-    if (ecc & 1) {
-        return n;               /* ECC off: the step is the raw codeword */
+    if ((ecc & 1) || steps <= 1) {
+        return n;               /* ECC off: the step is one raw window */
     }
-    if (cw != steps - 1) {
-        return n;               /* 516: 512 data bytes + 4 spare bytes */
+    if (cw + 1 == steps && (steps - 1) * n < NAND_PAGE) {
+        return NAND_PAGE - (steps - 1) * n;
     }
-    if (ud == 512) {
-        /*
-         * Boot-partition layout (qcom,boot-partitions): the last step keeps
-         * its full 512 data bytes and carries a whole codeword of spare.
-         */
-        return QPIC_CW_SIZE;
+    return n;
+}
+
+/* Bytes one complete program transaction moves for the configured layout. */
+static uint32_t qpic_program_page_bytes(IPQQpic *q)
+{
+    uint32_t steps = qpic_cw_steps(q);
+
+    if ((q->reg[QN_DEV0_ECC_CFG / 4] & 1) || steps <= 1) {
+        return qpic_cw_size(q);
     }
-    /*
-     * Last step of a normal page: 500 data bytes (the twelve spare bytes of
-     * the earlier steps were already protected with their data) followed by
-     * the sixteen free spare bytes plus this step's parity and spare.
-     */
-    return (QPIC_ECC_STEP - ((steps - 1) << 2)) +
-           (steps << 2) + ((ecc >> 8) & 0x1f) + ((cfg0 >> 23) & 0xf);
+    return MIN((uint32_t)NAND_PAGE, steps * qpic_cw_size(q));
 }
 
 static void qpic_program_do(IPQQpic *q, uint32_t page, uint32_t at,
-                            uint32_t cw, uint32_t need)
+                            uint32_t cw, uint32_t n)
 {
-    uint32_t n = MIN(q->tx_len, need);
-
     if (n) {
         if (env_true("QEMU_IPQ_QPIC_LOG") ||
             (env_true("QEMU_IPQ_QPIC_PGM") && cw == 0)) {
@@ -3296,8 +3348,16 @@ static void qpic_program_do(IPQQpic *q, uint32_t page, uint32_t at,
 static void qpic_program_pending(IPQQpic *q)
 {
     while (q->pgm_n && q->tx_len >= q->pgm_pend[0].need) {
-        qpic_program_do(q, q->pgm_pend[0].page, q->pgm_pend[0].at,
-                        q->pgm_pend[0].cw, q->pgm_pend[0].need);
+        uint32_t page = q->pgm_pend[0].page;
+        uint32_t at = q->pgm_pend[0].at;
+        uint32_t cw = q->pgm_pend[0].cw;
+        uint32_t need = q->pgm_pend[0].need;
+        bool spare = q->pgm_pend[0].spare;
+
+        qpic_program_do(q, page, at, cw, need);
+        if (!spare) {
+            q->tx_used += need;
+        }
         memmove(&q->pgm_pend[0], &q->pgm_pend[1],
                 (q->pgm_n - 1) * sizeof(q->pgm_pend[0]));
         q->pgm_n--;
@@ -3384,6 +3444,53 @@ static void qpic_exec(IPQQpic *q)
         /* Same rule as the read side: a column is an absolute byte offset. */
         uint32_t at = col ? col : cw * qpic_cw_size(q);
         uint32_t need = qpic_program_size(q, cw);
+        /*
+         * A column-addressed program is a window of its own (spare bytes, the
+         * bad-block marker): it is not a step of the four-codeword page
+         * sequence, so it carries exactly what the pipe delivered for it,
+         * bounded by the rest of the row.
+         */
+        bool spare = col != 0;
+        uint32_t n;
+
+        if (spare && at < NAND_STRIDE) {
+            need = MIN(need, NAND_STRIDE - at);
+        }
+
+        /*
+         * The staged bytes belong to one page.  A window of a different page
+         * arriving while one is still waiting for its payload means the two
+         * can no longer be told apart (the driver has moved on), so the
+         * staging is dropped instead of shifted into the new page.
+         */
+        if (q->pgm_n && q->tx_page_set && page != q->tx_page) {
+            qpic_warn("program page %u supersedes page %u with %u window(s) "
+                      "still waiting (%u staged, %u used); dropping them\n",
+                      page, q->tx_page, q->pgm_n, q->tx_len, q->tx_used);
+            q->pgm_n = 0;
+            q->tx_len = 0;
+        }
+        if (!q->tx_page_set || page != q->tx_page) {
+            /*
+             * A page whose windows did not add up to one transaction is the
+             * other way the stream loses its alignment; the next page would
+             * then be written shifted.
+             */
+            if (q->tx_page_set && q->tx_seq &&
+                q->tx_used != qpic_program_page_bytes(q)) {
+                qpic_warn("program page %u moved %u byte(s), expected %u\n",
+                          q->tx_page, q->tx_used,
+                          qpic_program_page_bytes(q));
+            }
+            q->tx_page = page;
+            q->tx_page_set = true;
+            q->tx_used = 0;
+            q->tx_seq = false;
+        }
+        q->tx_lost = false;
+        if (!spare) {
+            q->tx_seq = true;
+        }
 
         /*
          * Programming a NAND only clears bits, and the page keeps whatever
@@ -3395,18 +3502,26 @@ static void qpic_exec(IPQQpic *q)
          * consuming a short page would leave the remainder queued and shift
          * every later codeword into the wrong place.
          */
-        if (q->tx_len >= need) {
-            qpic_program_do(q, page, at, cw, need);
+        n = spare ? MIN(q->tx_len, need) : need;
+        if (n && q->tx_len >= n) {
+            qpic_program_do(q, page, at, cw, n);
+            if (!spare) {
+                q->tx_used += n;
+            }
         } else if (q->pgm_n < ARRAY_SIZE(q->pgm_pend)) {
             q->pgm_pend[q->pgm_n].page = page;
             q->pgm_pend[q->pgm_n].at = at;
             q->pgm_pend[q->pgm_n].cw = cw;
-            q->pgm_pend[q->pgm_n].need = need;
+            q->pgm_pend[q->pgm_n].need = n ? n : need;
+            q->pgm_pend[q->pgm_n].spare = spare;
             q->pgm_n++;
             if (env_true("QEMU_IPQ_QPIC_LOG")) {
                 qpic_log("qpic: prog wait page=%u cw=%u need=%u staged=%u\n",
                          page, cw, need, q->tx_len);
             }
+        } else {
+            qpic_warn("program page %u cw=%u need=%u: wait queue full, "
+                      "window dropped\n", page, cw, need);
         }
         q->last_page = page;
         q->txn_wr = cw + 1;
@@ -3678,9 +3793,12 @@ static void qpic_bam_data_in(IPQQpic *q, uint32_t addr, uint32_t len)
          * EXEC they belong to, because the whole page arrives before the
          * first codeword is programmed.
          */
-        if (q->tx_len + take <= QPIC_RD_MAX) {
+        if (q->tx_len + take <= QPIC_IO_MAX) {
             memcpy(q->tx_stage + q->tx_len, chunk, take);
             q->tx_len += take;
+        } else if (!q->tx_lost) {
+            q->tx_lost = true;
+            qpic_warn("program staging overflow: %u byte(s) dropped\n", take);
         }
         done += take;
     }
@@ -3906,6 +4024,9 @@ static void qpic_bam_run(IPQQpicBam *b, int n, uint32_t doorbell)
                         q->rx_len[q->rx_n] = d[1] & 0xffff;
                         q->rx_done[q->rx_n] = 0;
                         q->rx_n++;
+                    } else {
+                        qpic_warn("rx descriptor ring full: %08x len %u "
+                                  "dropped\n", d[0], d[1] & 0xffff);
                     }
                 } else {
                     if (env_true("QEMU_IPQ_QPIC_LOG")) {
@@ -4236,8 +4357,14 @@ static void qpic_dev_reset(void)
     memset(q->buf, 0xff, sizeof(q->buf));
     q->tx_len = 0;
     q->txn_wr = 0;
+    q->tx_page = UINT32_MAX;
+    q->tx_page_set = false;
+    q->tx_seq = false;
+    q->tx_used = 0;
+    q->tx_lost = false;
     q->pgm_n = 0;
     q->rd_len = 0;
+    q->rd_lost = false;
     q->rd_page = UINT32_MAX;
     q->txn_rd = 0;
     q->rx_n = 0;
