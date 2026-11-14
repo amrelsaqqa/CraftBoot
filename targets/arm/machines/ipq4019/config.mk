@@ -14,6 +14,8 @@ ipq4019_MACHINE_SRCS := \
     modules/eth.c:hw/arm/ipq4019/eth.c \
     modules/stub.c:hw/arm/ipq4019/stub.c \
     modules/board.c:hw/arm/ipq4019/board.c \
-    modules/flash.c:hw/arm/ipq4019/flash.c
+    modules/flash.c:hw/arm/ipq4019/flash.c \
+    modules/qpic.c:hw/arm/ipq4019/qpic.c \
+    modules/qpic.h:hw/arm/ipq4019/qpic.h
 ipq4019_BOARDS       := hap-ac2 hap-ac3
 ipq4019_DEV_BRANCH   := ipq4019-model
