@@ -201,7 +201,6 @@ static uint8_t qup_bam_rx(IPQQupl *q)
     return (uint8_t)qup_in_word(q);
 }
 
-void bam_update_irq(IPQBam *b);
 static bool bam_uart_rx_move(IPQBam *b, int n);
 
 static bool bam_pipe_lookup(hwaddr off, int *n, hwaddr *roff)

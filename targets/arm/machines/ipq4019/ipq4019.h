@@ -36,6 +36,7 @@
 #include "qemu/timer.h"
 #include "chardev/char-fe.h"
 #include "hw/irq.h"
+#include "net/net.h"
 
 #define IPQ_ROM_BASE      0x00000000u
 #define IPQ_ROM_SIZE      0x00040000u
@@ -407,6 +408,7 @@ void state_note_tx(const uint8_t *buf, unsigned n);
 
 /* helpers shared by the blocks (defined where their state lives) */
 const char *trace_pc(void);
+const char *trace_ms(void);
 void die_dbg_ser(uint8_t c);
 void bam_uart_rx_idle(void);
 void bam_uart_rx_kick(void);
@@ -530,6 +532,91 @@ uint32_t qup_in_word(IPQQupl *q);
 bool die_dbg_on(void);
 void die_dbg_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 uint32_t die_dbg_pc(void);
+
+/* sizes the Ethernet state uses */
+#define IPQ_EDMA_QUEUES  16
+#define IPQ_MDIO_MAX_PHYS 8
+#define PHY_MMD_SLOTS    32
+
+/* the Ethernet state read by the dump and reset */
+struct IPQEdma {
+    MemoryRegion mr;
+    uint32_t *regs;                 /* plain register file for everything else */
+    uint32_t nregs;
+    uint32_t tx_pkt[IPQ_EDMA_QUEUES];
+    uint32_t tx_byte[IPQ_EDMA_QUEUES];
+    qemu_irq irq_tx[IPQ_EDMA_QUEUES];
+    qemu_irq irq_rx[IPQ_EDMA_QUEUES];
+    int tx_level[IPQ_EDMA_QUEUES];
+    int rx_level[IPQ_EDMA_QUEUES];
+
+    /* Host backend and the switch port it is wired to. */
+    NetClientState *nc;
+    NICConf nic;
+    MemReentrancyGuard rx_guard;
+    int bridge_port;                /* switch port index, 1..5 */
+    int host_link;
+    uint8_t *txbuf;                 /* one assembled TX frame */
+    uint8_t *segbuf;                /* one segment of a TSO super-packet */
+    uint64_t tx_host;               /* frames handed to the netdev */
+    uint64_t tx_drop_noport;        /* frame's port bitmap lacks bridge_port */
+    uint64_t tx_drop_nolink;        /* netdev client down / detached */
+    uint64_t rx_host;               /* frames taken from the netdev */
+    uint64_t rx_dropped;
+    /*
+     * Receive buffers the driver has published and the engine has not
+     * consumed yet.  It cannot be derived from the index register: prod and
+     * cons are both modulo the ring, so once the engine catches up with a
+     * driver that stopped publishing (RouterBOOT hands over to Linux and its
+     * ring goes quiet), `(prod - cons) & (ring - 1)` reads as "almost empty"
+     * and the engine would keep writing frames into buffers that are no
+     * longer part of any ring -- that is live kernel memory, and it wedged
+     * the guest inside msm_nand probe.  Counting publications keeps the
+     * engine stopped at zero instead.
+     */
+};
+
+typedef struct IPQPhy {
+    int present;
+    int addr;
+    int link;
+    int speed;                  /* Mbit/s */
+    int full_duplex;
+    uint32_t id;
+    uint16_t reg[32];           /* everything else latches */
+
+    /*
+     * Clause 22 indirect registers: reg 0x0d selects the MMD device and
+     * switches between "address" and "data" mode (bit 14 = no post
+     * increment), reg 0x0e carries the register number or the data.  The
+     * space is sparse, so keep a tiny associative map instead of 8 x 64 KiB.
+     */
+    uint16_t mmd_dev;
+    uint16_t mmd_reg;
+    int mmd_data_mode;
+    uint32_t mmd_key[PHY_MMD_SLOTS];
+    uint16_t mmd_val[PHY_MMD_SLOTS];
+    int nmmd;
+} IPQPhy;
+
+struct IPQMdio {
+    MemoryRegion mr;
+    uint32_t mode;
+    uint32_t addr;
+    uint32_t wdata;
+    uint32_t rdata;
+    uint32_t cmd;
+    int nphy;
+    IPQPhy phy[IPQ_MDIO_MAX_PHYS];
+};
+/* modules/eth.c */
+IPQEdma *add_edma(MemoryRegion *parent, hwaddr base, hwaddr size);
+void edma_connect_netdev(IPQEdma *e);
+void edma_wire_irqs(DeviceState *gicdev);
+IPQMdio *add_mdio(MemoryRegion *parent, const char *dtb_path);
+void mdio_add_from_dtb(IPQMdio *m, const char *path);
+void phy_reset_regs(IPQPhy *p);
+const char *ipq_machine_dtb(MachineState *machine);
 
 /* file-scope siblings: one machine per process, so a plain pointer is enough */
 extern IPQ4019State *ipq;
