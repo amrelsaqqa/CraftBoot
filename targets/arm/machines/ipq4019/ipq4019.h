@@ -34,6 +34,7 @@
 #include "system/memory.h"
 #include "hw/qdev-core.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "chardev/char-fe.h"
 #include "hw/irq.h"
 #include "net/net.h"
@@ -704,6 +705,17 @@ void wdt_disarm(IPQWdt *w);
 void ipq_poweroff_start(void);
 void ipq_reset_dump(void *opaque);
 void ipq_state_dump(const char *tag);
+
+#define IPQ_FLASH_TYPE_NONE   0
+#define IPQ_FLASH_TYPE_NAND   2
+#define IPQ_FLASH_TYPE_SPI    6
+
+/* modules/board.c: the merge state the -M property setters record into */
+extern IPQBoardConfig ipq_cfg_pending;
+extern uint32_t ipq_cfg_set;
+extern const char *ipq_cfg_board;
+void ipq_board_config_resolve(MachineState *machine);
+int ipq_parse_hex_bytes(const char *s, uint8_t *out, int max, const char *what);
 
 /* file-scope siblings: one machine per process, so a plain pointer is enough */
 extern IPQ4019State *ipq;
