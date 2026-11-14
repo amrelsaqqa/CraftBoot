@@ -784,6 +784,34 @@ bool ipq_die_store_blank(const void *buf, uint64_t len);
 uint64_t ipq_die_store_bind(IPQDieStore *s, const char *path, const char *node,
                             uint64_t want, bool exact);
 
+/* the register-file block (read by the dump and the reset) */
+struct IPQRegFile {
+    MemoryRegion mr;
+    uint32_t *regs;
+    uint32_t nregs;
+    unsigned dbg;                   /* log accesses when QEMU_IPQ_ESS_LOG is set */
+    /*
+     * Registers holding a "busy" bit that hardware clears as soon as the
+     * operation the write started has finished.  Software sets the bit and
+     * then polls for it to read back 0; storing it verbatim makes every such
+     * poll time out (the switch's MIB flush and ATU/VTU lookups do this).
+     */
+    struct {
+        hwaddr off;
+        uint32_t mask;
+    } clr[8];
+    int nclr;
+    /*
+     * The contents at the end of machine init, i.e. what the hardware reads
+     * after power-on.  A system reset drops whatever the previous OS left
+     * behind and restores this, not zeroes: registers whose value is
+     * configuration (the switch's device id) have already been programmed by
+     * the time the guest runs, and the reset it gets before its first
+     * instruction must not wipe them.
+     */
+    uint32_t *por;
+};
+
 /* file-scope siblings: one machine per process, so a plain pointer is enough */
 extern IPQ4019State *ipq;
 extern IPQBoardState *ipq_board;
