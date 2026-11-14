@@ -115,7 +115,8 @@ prep: fetch
 	@cd "$(SRC)" && git init -q && git add -A && \
 	    git -c user.email=build@local -c user.name=build commit -q \
 	        -m "qemu $(TAG) baseline"
-	@set -e; $(foreach m,$(MACHINES),echo "  machine $(m)"; cp "$(TDIR)/machines/$(m)/$(m).c" "$(SRC)/$($(m)_MACHINE_DST)";)
+	@set -e; $(foreach m,$(MACHINES),echo "  machine $(m)"; \
+	    $(foreach f,$($(m)_MACHINE_SRCS),cp "$(TDIR)/machines/$(m)/$(f)" "$(SRC)/$(dir $($(m)_MACHINE_DST))$(f)"; ))
 	@set -e; for s in $(SERIES); do \
 	    while read -r p; do \
 	        [ -z "$$p" ] && continue; \
@@ -136,7 +137,7 @@ build:
 	@test -n "$(BINARIES)" || { echo "target $(TARGET) is not wired up (no BINARIES)"; exit 1; }
 	@test -f "$(SUBDIR)/.prepped" || \
 	    $(MAKE) --no-print-directory TARGET="$(TARGET)" MACHINES="$(MACHINES)" prep
-	@set -e; $(foreach m,$(MACHINES),cmp -s "$(TDIR)/machines/$(m)/$(m).c" "$(SRC)/$($(m)_MACHINE_DST)" || { echo "  sync machine $(m)"; cp "$(TDIR)/machines/$(m)/$(m).c" "$(SRC)/$($(m)_MACHINE_DST)"; };)
+	@set -e; $(foreach m,$(MACHINES),$(foreach f,$($(m)_MACHINE_SRCS),cmp -s "$(TDIR)/machines/$(m)/$(f)" "$(SRC)/$(dir $($(m)_MACHINE_DST))$(f)" || { echo "  sync $(m)/$(f)"; cp "$(TDIR)/machines/$(m)/$(f)" "$(SRC)/$(dir $($(m)_MACHINE_DST))$(f)"; };))
 	@if [ ! -f "$(OBJ)/build.ninja" ]; then \
 	    mkdir -p "$(OBJ)"; \
 	    echo "configure $(TARGET)"; \
@@ -155,7 +156,7 @@ sync:
 	@test -f "$(SUBDIR)/.prepped" || { \
 	    echo "no tree for $(TARGET): run make TARGET=$(TARGET) prep first"; \
 	    exit 1; }
-	@set -e; $(foreach m,$(MACHINES),cmp -s "$(TDIR)/machines/$(m)/$(m).c" "$(SRC)/$($(m)_MACHINE_DST)" || { echo "  sync machine $(m)"; cp "$(TDIR)/machines/$(m)/$(m).c" "$(SRC)/$($(m)_MACHINE_DST)"; };)
+	@set -e; $(foreach m,$(MACHINES),$(foreach f,$($(m)_MACHINE_SRCS),cmp -s "$(TDIR)/machines/$(m)/$(f)" "$(SRC)/$(dir $($(m)_MACHINE_DST))$(f)" || { echo "  sync $(m)/$(f)"; cp "$(TDIR)/machines/$(m)/$(f)" "$(SRC)/$(dir $($(m)_MACHINE_DST))$(f)"; };))
 	ninja -C "$(OBJ)" $(BINARIES)
 	@for b in $(BINARIES); do ln -sf "$(PWD)/$(OBJ)/$$b" "$(SUBDIR)/$$b"; done
 	@echo "synced $(SUBDIR): $(BINARIES)"
@@ -167,8 +168,9 @@ export-patches:
 	@mkdir -p "$(TDIR)/patches"; rm -f "$(TDIR)"/patches/*.patch
 	git -C "$(DEV)" format-patch --no-signature $(TAG)..$(DEV_BRANCH) \
 	    -o "$(PWD)/$(TDIR)/patches" -- . \
-	    $(foreach m,$(MACHINES),':(exclude)'$($(m)_MACHINE_DST))
-	@set -e; $(foreach m,$(MACHINES),cp "$(DEV)/$($(m)_MACHINE_DST)" "$(TDIR)/machines/$(m)/$(m).c";)
+	    $(foreach m,$(MACHINES),$(foreach f,$($(m)_MACHINE_SRCS),':(exclude)'$(dir $($(m)_MACHINE_DST))$(f)) \
+	    )
+	@set -e; $(foreach m,$(MACHINES),$(foreach f,$($(m)_MACHINE_SRCS),cp "$(DEV)/$(dir $($(m)_MACHINE_DST))$(f)" "$(TDIR)/machines/$(m)/$(f)";))
 	@{ echo "# Target $(TARGET) — applied in this order to $(TAG)."; \
 	   echo "# 'make TARGET=$(TARGET) check-patches' proves they apply cleanly."; \
 	   ls "$(TDIR)"/patches/*.patch; } > "$(TDIR)/series"
