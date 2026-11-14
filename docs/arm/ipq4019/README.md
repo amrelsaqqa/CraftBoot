@@ -27,6 +27,46 @@ ipq4019: qpic-nand 132 MiB, id c2 f1 80 1d, 65536 pages of 2048+64, 1024 blocks 
 By default a NAND is RAM only (a board that has never been installed).  Add
 `qpic-nand-file=<die>` to make programming survive the machine exiting.
 
+## Source layout
+
+The machine is split by controller.  `ipq4019.c` is the machine itself
+(memory map, reset, boot stages, `-M` properties, state dump); each block owns
+its register file, its `MemoryRegionOps`, its state and one init entry point.
+The sources are *copied* (they are not patched): `config.mk` maps each one to
+the QEMU tree, the machine file to `hw/arm/ipq4019.c` and the blocks to
+`hw/arm/ipq4019/`, so a block includes `"ipq4019.h"` and the hook series only
+lists the block files in `meson.build`.
+
+| file | owns |
+|---|---|
+| `ipq4019_internal.h` | SoC/board state, base addresses, the interface between blocks |
+| `ipq4019.c` | machine init, memory map, reset, boot stages, properties, state dump |
+| `modules/gpio.c` | TLMM pin controller, LED panel, keys |
+| `modules/uart.c` | BLSP UARTDM console |
+| `modules/bam.c` | BLSP1 BAM (the QUP FIFOs' DMA engine) |
+| `modules/eth.c` | IPQESS, host netdev, MDIO/PHY, board ports |
+| `modules/stub.c` | shadowed stubs, register-file, power-hold, watchdog, memory window, clock rates |
+| `modules/board.c` | board presets, merge order, env shim |
+| `modules/flash.c` | QUP SPI, NOR die, SPI NAND, die store |
+| `modules/qpic.c` | QPIC parallel NAND: die, controller, its BAM (`qpic.h` private) |
+| `modules/dump.c` | whole-machine state dump and console watcher |
+
+`ipq4019.c` keeps what is the machine rather than a block: init, memory map,
+reset, boot stages, the register-file and gcnt blocks, and the `-M`
+properties.  Every controller is a module; the ones with a large private
+interface (`qpic`) carry their own header.
+
+Rules that keep the split useful:
+
+- a block's state struct lives in `ipq4019_internal.h` and its code in the
+  block's file -- the state dump reads every block, so hiding the structs
+  would only move the coupling;
+- anything another file needs is a prototype in the header; nothing else
+  crosses a file boundary, and the header stays small;
+- adding a block is a `config.mk` entry (`ipq4019_MACHINE_SRCS`), a file in
+  the machine patch's `meson.build` hunk, and a line in the header -- nothing
+  else.
+
 ## Building
 
 The machine is built with the `arm` target, which produces
