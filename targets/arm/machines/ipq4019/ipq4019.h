@@ -618,6 +618,93 @@ void mdio_add_from_dtb(IPQMdio *m, const char *path);
 void phy_reset_regs(IPQPhy *p);
 const char *ipq_machine_dtb(MachineState *machine);
 
+struct IPQStub {
+    MemoryRegion mr;
+    const char *name;
+    uint32_t *shadow;
+    uint8_t *valid;
+    uint32_t nregs;
+    /* Bits that do not read back as written (write-only fields). */
+    uint32_t read_mask;
+    /*
+     * Value returned for registers that were never written.  A real Qualcomm
+     * register decoder answers 0 for an unimplemented offset and most registers
+     * reset to 0, so 0 is the faithful default.  Poles (PLL lock, "block
+     * ready") are the exception: software polls them and needs the bit set, so
+     * a few blocks keep the ~0 default.
+     */
+    uint32_t def_read;
+    /*
+     * Clock/reset blocks: bit 0 of the command registers is a "start the
+     * update" trigger.  Software sets it and then polls until it reads 0.
+     *
+     * It cannot be modelled by masking bit 0 of every read-back: the data
+     * registers of those same blocks keep bit 0 as real data (CFG_RCGR, whose
+     * bit 0 is the LSB of the divider).  Nor can a write of exactly 1 be
+     * treated as the trigger: SBL1's RCG helper does a read-modify-write and
+     * issues 0xffffffff (bit 0 set) on registers it never wrote before.
+     *
+     * So the write lands as written, and a tight poll loop is taken as proof
+     * that the bit is a trigger rather than data: after IPQ_SPIN_LIMIT
+     * consecutive reads of the same freshly-written register with bit 0 still
+     * set, the operation is declared complete and bit 0 reads back 0.
+     */
+    bool trig_bit0;
+    uint32_t spin_idx;
+    uint32_t spin;
+    /*
+     * GCC/APCS branch (CBCR) registers: bit 0 is the branch enable and bit 31
+     * is its read-only CLK_OFF status, which is the complement of the enable.
+     * The kernel's clk_branch2_check_halt() waits for CLK_OFF to *set* when it
+     * disables a branch and warns "status stuck at 'on'" if it never does, so
+     * an unwritten or masked bit 31 stalls every unused-clock disable.
+     */
+    bool cbc_status;
+    /*
+     * Status registers whose value is reported rather than stored: things the
+     * guest waits for that this machine completes instantly (a PLL locking, a
+     * block leaving reset).  Reads always return the pinned value, writes are
+     * ignored -- exactly what hardware does for a read-only status field.
+     */
+    struct {
+        uint32_t off;
+        uint32_t val;
+    } pin[8];
+    int npin;
+};
+struct IPQPsHold {
+    uint32_t val;
+};
+struct IPQWdt {
+    MemoryRegion mr;
+    uint32_t regs[0x1000 / 4];
+    QEMUTimer *bark;
+    QEMUTimer *bite;
+};
+struct IPQMem {
+    MemoryRegion mr;
+    const char *name;
+    uint8_t *data;
+    uint64_t size;
+};
+/* clock rates the stub blocks report and gcnt is built from */
+extern uint32_t gcnt_hz, qtimer_hz, xo_hz, tsc_hz;
+extern uint64_t ipq_counter_epoch_ns;
+extern uint64_t ipq_dram_size;
+
+/* modules/stub.c */
+void add_stub(MemoryRegion *parent, hwaddr base, hwaddr size, const char *name);
+IPQStub *add_stub_ex(MemoryRegion *parent, hwaddr base, hwaddr size,
+                     const char *name, uint32_t def_read);
+IPQPsHold *add_pshold(MemoryRegion *sysmem);
+IPQWdt *add_wdt(MemoryRegion *sysmem);
+IPQMem *add_mem(MemoryRegion *parent, hwaddr base, uint64_t size, const char *name);
+void stub_pin(IPQStub *s, uint32_t off, uint32_t val);
+void wdt_disarm(IPQWdt *w);
+void ipq_poweroff_start(void);
+void ipq_reset_dump(void *opaque);
+void ipq_state_dump(const char *tag);
+
 /* file-scope siblings: one machine per process, so a plain pointer is enough */
 extern IPQ4019State *ipq;
 extern IPQBoardState *ipq_board;
