@@ -80,11 +80,61 @@ arm: external abort at phys 0xa04f014 (vaddr 0x9104f014, 4 byte write, pc 0x7f64
 `QEMU_IPQ_RESET_DUMP=<file>` writes DRAM out as the machine resets, which is
 where a guest's own panic text still lives when its console gives no output.
 
+## The Ethernet model is a one-port bridge, not a switch
+
+The ESS/EDMA model moves frames between the guest's rings and **one** QEMU
+netdev.  There is no switch behind it:
+
+- a frame the guest transmits is accepted only if the DSA tag's port bitmap
+  contains `eth-bridge-port`; anything else is dropped (and
+  `QEMU_IPQ_EDMA_LOG=1` says which bitmap did it);
+- a frame from the host is tagged as arriving on `eth-bridge-port`.
+
+The port names are the reference design's, not the guest's device tree:
+
+| switch port | PHY (MDIO) | reference name |
+|---|---|---|
+| 0 | - | cpu |
+| 1 | 0 | wan |
+| 2 | 1 | lan4 |
+| 3 | 2 | lan3 |
+| 4 | 3 | lan2 |
+| 5 | 4 | lan1 |
+
+Consequences, all observed:
+
+- **RouterBOOT netinstall** transfers over port 1 because its own ESS port map
+  steers the frames there.  On hardware the same firmware emits from the
+  physical port it boots from, which is why the cable has to go into that
+  socket; the model has no port-map registers to disagree with, so the bridged
+  port is RouterBOOT's port.
+- **OpenWrt/RouterOS LAN**: the address lives on the guest's bridge
+  (`br-lan`), whose members are lan1..lan4 = ports 5..2.  Bridging port 1
+  (wan) gives link-up and DHCP-client behaviour but never 192.168.1.1;
+  bridging 2..5 works (verified with a ping over lan1).
+- A guest whose device tree describes a different switch does not line up with
+  the reference names (the 708 OpenWrt image declares a QCA8337, 8 ports);
+  use the guest's `br-lan` membership, not the label.
+
+This is a gap, not a regression: connectivity works, only the topology is
+fixed.  A real switch would be, in order:
+
+1. one `-netdev` per front-panel port, per-port carrier, and the EDMA port-map
+   registers (3-5 days) -- removes `eth-bridge-port` and the port guessing;
+2. a QCA8075/QCA8337 register model over MDIO: port enable/state, PVID, VLAN
+   table, egress masks (1.5-2 weeks);
+3. FDB and the forwarding engine: unknown/unicast/multicast flooding, CPU-port
+   trapping, inter-port forwarding (1-1.5 weeks);
+4. counters/MIB, STP, QoS and per-chip profiles (2-4 weeks, optional).
+
+Scope 1 is the useful 80/20; scopes 2-3 are what make bridge/VLAN offload and
+multi-port topologies real.
+
 ## What is still missing
 
 - The trusted-execution image is skipped, not run (see above).
-- The switch forwards a single front-panel port to a host netdev; traffic
-  between the other ports is not forwarded.
+- The switch is a one-port bridge to a host netdev; traffic between the other
+  ports is not forwarded (see the section above).
 - There is no WLAN radio behind the register windows: drivers give up cleanly
   instead of panicking, and wireless never comes up.
 - The QPIC NAND is fully modelled, but a guest whose own driver does not

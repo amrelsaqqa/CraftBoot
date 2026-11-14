@@ -100,9 +100,11 @@ All images are supplied by the user; the machine never modifies the file named
 by `-kernel`.  A die named with `qpic-nand-file=` (or `nor-file=`) is the part
 itself: creation is once, then every program and erase is written through.
 
-The tap is only needed for the networking flows (`eth-bridge-port` selects
-which switch port is wired to it, see the ESS section in `model-quirks.md`);
-serial-only bring-up runs without `-netdev`.
+The tap is only needed for the networking flows.  `eth-bridge-port` selects
+which switch port the host sits on: `1` is the reference `wan` (RouterBOOT's
+netinstall port), `2..5` are `lan4..lan1` (use one of those for an
+OpenWrt/RouterOS LAN address).  The Ethernet model is a one-port bridge, not a
+switch -- see `model-quirks.md`; serial-only bring-up runs without `-netdev`.
 
 ## Documentation
 
