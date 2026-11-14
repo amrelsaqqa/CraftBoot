@@ -48,12 +48,13 @@ lists the block files in `meson.build`.
 | `modules/stub.c` | shadowed stubs, register-file, power-hold, watchdog, memory window, clock rates |
 | `modules/board.c` | board presets, merge order, env shim |
 | `modules/flash.c` | QUP SPI, NOR die, SPI NAND, die store |
+| `modules/qpic.c` | QPIC parallel NAND: die, controller, its BAM (`qpic.h` private) |
+| `modules/dump.c` | whole-machine state dump and console watcher |
 
-Remaining: `modules/qpic.c` + `modules/qpic_bam.c` (the QPIC block brings its
-own `qpic.h` for the register and opcode defines instead of growing
-`ipq4019.h` by several hundred lines), then `modules/dump.c`; the machine file
-keeps init, reset, boot stages, the register-file/gcnt blocks and the `-M`
-properties.
+`ipq4019.c` keeps what is the machine rather than a block: init, memory map,
+reset, boot stages, the register-file and gcnt blocks, and the `-M`
+properties.  Every controller is a module; the ones with a large private
+interface (`qpic`) carry their own header.
 
 Rules that keep the split useful:
 
