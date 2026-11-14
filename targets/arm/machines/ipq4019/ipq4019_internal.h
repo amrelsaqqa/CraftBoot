@@ -31,6 +31,8 @@
 #include "system/memory.h"
 #include "hw/qdev-core.h"
 #include "qemu/timer.h"
+#include "chardev/char-fe.h"
+#include "hw/irq.h"
 
 #define IPQ_ROM_BASE      0x00000000u
 #define IPQ_ROM_SIZE      0x00040000u
@@ -317,6 +319,94 @@ void tlmm_dev_reset(IPQTLMM *t);
 void ipq_tlmm_connect(IPQTLMM *t, unsigned pin, IPQPinHandler fn, void *opaque);
 void ipq_board_add_leds(void);
 void ipq_board_add_keys(void);
+
+struct IPQUart {
+    MemoryRegion mr;
+    CharFrontend chr;
+    const char *name;
+    qemu_irq irq;
+
+    uint32_t mr1;
+    uint32_t mr2;
+    uint32_t imr;               /* written at 0x14 */
+    uint32_t cr;                /* last command written at 0x10 */
+    uint32_t tfwr;
+    uint32_t rfwr;
+    uint32_t dmrx;
+    uint32_t dmen;
+    uint32_t ncf_tx;
+
+    uint8_t rxbuf[64];
+    unsigned rx_head;
+    unsigned rx_count;
+    /*
+     * Bytes the chardev has handed us but that have not reached the receive
+     * FIFO yet.  A chardev write is a burst -- a pasted line, a whole pty
+     * read -- while the die delivers one byte at a time at the baud rate, so
+     * queueing here is what keeps a burst longer than the 64-byte FIFO from
+     * being silently truncated at the FIFO boundary.
+     */
+    uint8_t rxq[512];
+    unsigned rxq_head;
+    unsigned rxq_count;
+    bool in_fill;
+    bool rx_again;
+    /*
+     * RX_TOTAL_SNAP counts the bytes the BAM receiver has written into the
+     * guest's DMA buffer since the buffer was posted, not the bytes sitting
+     * in the FIFO: msm_complete_rx_dma() takes `snap - old_snap_state` and
+     * feeds exactly that many bytes of the buffer to the tty.  Counting
+     * arrived-but-not-moved bytes makes it hand the tty stale bytes and drop
+     * the ones that arrive next (visible as characters vanishing out of the
+     * middle of a typed line).
+     */
+    uint32_t rx_total;          /* bytes moved to DRAM since DMRX/read */
+    /*
+     * Set the first time software turns on the BAM receiver on this port, and
+     * cleared only by a device reset.  This is what tells a PIO reader (the
+     * bootloaders, which poll MISR bit 3 and take bytes out of the FIFO word)
+     * from a DMA reader (msm_serial), and it has to be remembered because the
+     * kernel drops RX_BAM_ENABLE in the very read that asks for the snapshot.
+     */
+    bool rx_dma_seen;
+    bool rx_stale;              /* partial word waiting for the timeout */
+    QEMUTimer *stale_timer;
+};
+
+
+/* ipq4019_uart.c */
+void add_uart(MemoryRegion *parent, hwaddr base, const char *name,
+              Chardev *chr, qemu_irq irq);
+void uart_update_irq(IPQUart *u);
+bool uart_bam_rx_armed(void);
+void uart_bam_write(const uint8_t *buf, size_t n);
+void uart_bam_rx_account(size_t n);
+void bam_uart_rx_input_ready(void);
+void uart_rx_idle_arm(void);
+size_t uart_bam_rx_pending(void);
+size_t uart_bam_rx_pull(uint8_t *buf, size_t n);
+
+/* ipq4019_dump.c: the console watcher lives with the dump */
+void state_note_tx(const uint8_t *buf, unsigned n);
+
+/*
+ * Console input debugging.  Keystrokes only reach a shell prompt if the whole
+ * chain works -- chardev -> model FIFO -> GIC -> msm_serial interrupt handler
+ * -> tty flip buffer -> procd -- and when a byte disappears there is no trace
+ * of it anywhere.  QEMU_IPQ_UART_RX_LOG=1 prints every step.
+ */
+#define UART_RX_LOG(...)                                                  \
+    do {                                                                  \
+        if (env_true("QEMU_IPQ_UART_RX_LOG")) {                           \
+            fprintf(stderr, "uart-rx: " __VA_ARGS__);                     \
+        }                                                                 \
+    } while (0)
+
+/* helpers shared by the blocks (defined where their state lives) */
+const char *trace_pc(void);
+void die_dbg_ser(uint8_t c);
+void bam_uart_rx_idle(void);
+void bam_uart_rx_kick(void);
 
 /* file-scope siblings: one machine per process, so a plain pointer is enough */
 extern IPQ4019State *ipq;

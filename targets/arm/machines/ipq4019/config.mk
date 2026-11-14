@@ -6,6 +6,6 @@
 # means adding its file here, to the hook patch's meson list, and to
 # ipq4019_internal.h if it is visible outside its own file.
 ipq4019_MACHINE_DST  := hw/arm/ipq4019.c
-ipq4019_MACHINE_SRCS := ipq4019.c ipq4019_gpio.c ipq4019_internal.h
+ipq4019_MACHINE_SRCS := ipq4019.c ipq4019_gpio.c ipq4019_uart.c ipq4019_internal.h
 ipq4019_BOARDS       := hap-ac2 hap-ac3
 ipq4019_DEV_BRANCH   := ipq4019-model
