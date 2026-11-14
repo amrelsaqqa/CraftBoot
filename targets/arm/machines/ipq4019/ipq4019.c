@@ -146,7 +146,7 @@
 #include "net/eth.h"
 #include <libfdt.h>
 #include <sys/stat.h>
-#include "ipq4019_internal.h"
+#include "ipq4019/ipq4019.h"
 
 /* the machine owns one SoC and one board */
 IPQ4019State *ipq;

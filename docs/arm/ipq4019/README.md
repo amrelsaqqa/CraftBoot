@@ -32,21 +32,23 @@ By default a NAND is RAM only (a board that has never been installed).  Add
 The machine is split by controller.  `ipq4019.c` is the machine itself
 (memory map, reset, boot stages, `-M` properties, state dump); each block owns
 its register file, its `MemoryRegionOps`, its state and one init entry point.
-The sources are *copied* into `hw/arm/` under their own names (they are not
-patched; the hook series only lists them in `meson.build`).
+The sources are *copied* (they are not patched): `config.mk` maps each one to
+the QEMU tree, the machine file to `hw/arm/ipq4019.c` and the blocks to
+`hw/arm/ipq4019/`, so a block includes `"ipq4019.h"` and the hook series only
+lists the block files in `meson.build`.
 
 | file | owns |
 |---|---|
 | `ipq4019_internal.h` | SoC/board state, base addresses, the interface between blocks |
 | `ipq4019.c` | machine init, memory map, reset, boot stages, properties, state dump |
-| `ipq4019_gpio.c` | TLMM pin controller, LED panel, keys |
-| `ipq4019_uart.c` | BLSP UARTDM console |
+| `modules/gpio.c` | TLMM pin controller, LED panel, keys |
+| `modules/uart.c` | BLSP UARTDM console |
 
-Planned, in the order they are being moved: `ipq4019_flash.c` (flash window,
-QUP SPI, NOR die, die store, SPI NAND), `ipq4019_eth.c` (IPQESS, host net,
-MDIO/PHY, board ports), `ipq4019_bam.c`, `ipq4019_qpic.c` +
-`ipq4019_qpic_bam.c`, `ipq4019_board.c` (presets, config merge, env shim), then
-`ipq4019_stub.c` and `ipq4019_dump.c` for what is left.
+Planned, in the order they are being moved: `modules/flash.c` (flash window,
+QUP SPI, NOR die, die store, SPI NAND), `modules/eth.c` (IPQESS, host net,
+MDIO/PHY, board ports), `modules/bam.c`, `modules/qpic.c` +
+`modules/qpic_bam.c`, `modules/board.c` (presets, config merge, env shim), then
+`modules/stub.c` and `modules/dump.c` for what is left.
 
 Rules that keep the split useful:
 

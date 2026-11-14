@@ -8,18 +8,18 @@
  *
  * present:
  *   ipq4019.c          machine init, memory map, reset, -M properties, dump
- *   ipq4019_gpio.c     TLMM, LEDs, keys
- *   ipq4019_uart.c     BLSP UARTDM
+ *   modules/gpio.c     TLMM, LEDs, keys
+ *   modules/uart.c     BLSP UARTDM
  *
  * planned (moved in this order):
- *   ipq4019_flash.c    flash window, QUP SPI, NOR die, die store, SPI NAND
- *   ipq4019_eth.c      IPQESS, host net backend, MDIO/PHY, board ports
- *   ipq4019_bam.c      BLSP1 BAM (QUP side)
- *   ipq4019_qpic.c     parallel NAND die and QPIC controller
- *   ipq4019_qpic_bam.c QPIC BAM pipes and command elements
- *   ipq4019_board.c    board presets, config merge, env shim
- *   ipq4019_stub.c     shadowed stubs, register-file block, gcnt
- *   ipq4019_dump.c     whole-machine state dump and diagnostics
+ *   modules/flash.c    flash window, QUP SPI, NOR die, die store, SPI NAND
+ *   modules/eth.c      IPQESS, host net backend, MDIO/PHY, board ports
+ *   modules/bam.c      BLSP1 BAM (QUP side)
+ *   modules/qpic.c     parallel NAND die and QPIC controller
+ *   modules/qpic_bam.c QPIC BAM pipes and command elements
+ *   modules/board.c    board presets, config merge, env shim
+ *   modules/stub.c     shadowed stubs, register-file block, gcnt
+ *   modules/dump.c     whole-machine state dump and diagnostics
  *
  * A block owns its register offsets, its MemoryRegionOps, its state and one
  * ipq4019_<block>_init(IPQ4019State *).  Anything another file needs is
@@ -28,8 +28,8 @@
  *
  * Every source includes "qemu/osdep.h" first, then this header.
  */
-#ifndef HW_ARM_IPQ4019_INTERNAL_H
-#define HW_ARM_IPQ4019_INTERNAL_H
+#ifndef HW_ARM_IPQ4019_H
+#define HW_ARM_IPQ4019_H
 
 #include "system/memory.h"
 #include "hw/qdev-core.h"
@@ -422,4 +422,4 @@ bool env_true(const char *name);
 void qpic_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void qpic_warn(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-#endif /* HW_ARM_IPQ4019_INTERNAL_H */
+#endif /* HW_ARM_IPQ4019_H */

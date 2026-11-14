@@ -17,7 +17,7 @@
 #include "hw/sysbus.h"
 #include "chardev/char-fe.h"
 #include "system/memory.h"
-#include "ipq4019_internal.h"
+#include "ipq4019.h"
 
 /* ------------------------------------------------------------------ */
 /* BLSP UARTDM                                                         */
