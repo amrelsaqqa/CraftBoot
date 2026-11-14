@@ -717,6 +717,73 @@ extern const char *ipq_cfg_board;
 void ipq_board_config_resolve(MachineState *machine);
 int ipq_parse_hex_bytes(const char *s, uint8_t *out, int max, const char *what);
 
+typedef struct IPQDieStore {
+    int fd;                     /* nor-file= / nand-file=, -1 if absent */
+    BlockBackend *blk;          /* nor-drive= / nand-drive=, NULL if absent */
+    bool ro;                    /* the guest may not change this die */
+    const char *what;           /* "nor" / "nand", for messages */
+} IPQDieStore;
+
+struct IPQNand {
+    uint8_t *data;              /* the die: NAND_STRIDE bytes per page */
+    uint32_t bytes;             /* size of that array */
+    uint32_t pages;             /* pages in the part (bytes / stride) */
+    uint8_t id[2];              /* manufacturer, device */
+    int id_len;
+
+    uint8_t status;             /* 0xc0: OIP/WEL/E_FAIL/P_FAIL/ECC */
+    uint8_t cfg;                /* 0xb0: QE, ECC enable, OTP */
+    uint8_t lock;               /* 0xa0: block lock bits */
+    int oip;                    /* busy for exactly one status read */
+    int ecc;                    /* ECC bits reported by that same read */
+
+    uint32_t page;              /* row latched by PAGE READ / PROG EXECUTE */
+    uint32_t col;               /* column inside the page cache */
+    uint8_t cache[NAND_STRIDE]; /* the die's internal page cache */
+    int cache_valid;
+
+    int wr_kind;                /* NAND_WR_*: what the data phase does */
+    uint8_t wr_feature;         /* feature register a SET_FEATURE targets */
+
+    IPQDieStore store;          /* nand-file= / nand-drive=, closed when RAM only */
+};
+
+/* SPI NAND chip selects and the cache-write kinds (the QPIC shares the layout) */
+#define NAND_CS_NOR   0
+#define NAND_CS_NAND  1
+enum {
+    NAND_WR_NONE = 0,
+    NAND_WR_LOAD,
+    NAND_WR_SET_FEATURE,
+};
+
+/* modules/flash.c */
+extern bool ipq_nor_store_loaded;
+extern bool ipq_nand_store_loaded;
+extern uint32_t ipq_flash_die_size;
+extern uint8_t ipq_flash_jedec[4];
+extern int ipq_flash_jedec_len;
+extern uint8_t ipq_flash_uid[8];
+extern int ipq_flash_uid_len;
+
+void die_dbg_note(uint8_t v);
+void ipq_die_program_image(uint8_t *data, uint32_t bytes,
+                           const char *path, const char *what);
+void ipq_board_add_nor(MemoryRegion *sysmem);
+void ipq_board_add_nand(void);
+void ipq_cs_line(void *opaque, int level);
+void nand_fill_erased(uint8_t *p, uint32_t len);
+IPQQupl *add_qupl(MemoryRegion *parent, hwaddr base, hwaddr size, const char *name);
+
+bool ipq_die_store_open(IPQDieStore *s);
+bool ipq_die_store_writable(IPQDieStore *s);
+bool ipq_die_store_pread(IPQDieStore *s, void *dst, uint64_t len, uint64_t off);
+void ipq_die_store_pwrite(IPQDieStore *s, const void *src, uint32_t len, uint32_t off);
+void ipq_die_store_sync(IPQDieStore *s);
+bool ipq_die_store_blank(const void *buf, uint64_t len);
+uint64_t ipq_die_store_bind(IPQDieStore *s, const char *path, const char *node,
+                            uint64_t want, bool exact);
+
 /* file-scope siblings: one machine per process, so a plain pointer is enough */
 extern IPQ4019State *ipq;
 extern IPQBoardState *ipq_board;
