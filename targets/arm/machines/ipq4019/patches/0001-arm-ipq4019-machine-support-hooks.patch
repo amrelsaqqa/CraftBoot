@@ -69,7 +69,7 @@ index aeaf654..1db12af 100644
  arm_common_ss.add(files('boot.c'))
  
  hw_arch += {'arm': arm_ss}
-+arm_common_ss.add(when: 'CONFIG_IPQ4019', if_true: files('ipq4019.c', 'ipq4019/gpio.c', 'ipq4019/uart.c'))
++arm_common_ss.add(when: 'CONFIG_IPQ4019', if_true: files('ipq4019.c', 'ipq4019/gpio.c', 'ipq4019/uart.c', 'ipq4019/bam.c'))
  hw_common_arch += {'arm': arm_common_ss}
 diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
 index 9615051..38b9315 100644

@@ -411,6 +411,126 @@ void die_dbg_ser(uint8_t c);
 void bam_uart_rx_idle(void);
 void bam_uart_rx_kick(void);
 
+/* the BAM types (the state dump reads the pipes) */
+#define BAM_PIPE_COUNT 16
+
+typedef enum {
+    BAM_CLIENT_NONE,            /* no data source: leave the ring alone */
+    BAM_CLIENT_SPI,             /* talk to the QUP SPI (the NOR die) */
+    BAM_CLIENT_UART_TX,         /* push bytes to the serial backend */
+    BAM_CLIENT_UART_RX,         /* wait for console input */
+} BAMClient;
+
+typedef struct IPQBamPipe {
+    BAMClient client;
+    uint32_t ctrl;
+    uint32_t event;
+    uint32_t irq_stts;          /* BAM_P_IRQ_STTSn */
+    uint32_t irq_en;            /* BAM_P_IRQ_ENn   */
+    uint32_t limit;
+    uint32_t ring_base;
+    uint32_t ring_size;
+    uint32_t prod;
+    uint32_t cons;
+    uint64_t bytes;             /* total moved, for the SPI log */
+    /*
+     * The receive descriptor the engine is filling right now.  Real hardware
+     * keeps writing into the posted buffer as bytes arrive and only retires
+     * it when the buffer fills or the UART goes idle (the stale timeout), so
+     * one burst of console input completes one descriptor -- not one per
+     * chardev read.
+     */
+    uint32_t rx_desc_addr;
+    uint16_t rx_desc_len;
+    uint16_t rx_desc_got;
+    bool rx_desc_open;
+} IPQBamPipe;
+
+struct IPQBam {
+    MemoryRegion mr;
+    uint32_t *shadow;           /* everything not explicitly modelled */
+    uint8_t *valid;
+    uint32_t nregs;
+    uint32_t irq_srcs_msk;      /* BAM_IRQ_SRCS_MSK of EE0 */
+    qemu_irq irq;               /* SPI 238, level high */
+    IPQBamPipe pipe[BAM_PIPE_COUNT];
+};
+
+/* modules/bam.c */
+IPQBam *add_bam(MemoryRegion *parent, hwaddr base, hwaddr size, const char *name);
+void bam_wire_pipes(IPQBam *b);
+void bam_seed_id(IPQBam *b);
+void bam_update_irq(IPQBam *b);
+
+struct IPQQupl {
+    MemoryRegion mr;
+    uint32_t shadow[0x1000 / 4];
+
+    /* SPI slave state machine (driven by every byte clocked out) */
+    int phase;              /* 0 opcode, 1 address, 2 dummy, 3 data */
+    uint8_t opcode;
+    uint32_t addr;
+    int addr_left;
+    int dummy_left;
+    int cs;                 /* a die is selected (FORCE_CS or a cs-gpio) */
+    int cs_force;           /* QUP_IO_CONTROL FORCE_CS (QCA boot drivers) */
+    int cs_owner;           /* CS_OWNER_*: what selected the current die */
+    int cs_gpio_die;        /* die held by a cs-gpio (CS_OWNER_GPIO) */
+    int target;             /* which die the pins selected: NAND_CS_* */
+    int nand_read;          /* stream the NAND page cache (READ FROM CACHE) */
+    int read_data;          /* stream data out of the flash */
+    uint32_t rx_off;        /* next flash offset of the data stream */
+    uint8_t rx_buf[16];     /* short replies: JEDEC id, unique id, status */
+    int rx_len;
+    int rx_pos;
+    int rx_wrap;            /* the reply repeats instead of ending (RDID) */
+    uint8_t status;         /* SR1: bit0 busy, bit1 WEL, 2-4 BP, 5 TB, 6 SEC */
+    uint8_t status2;        /* SR2: bit5 E_FAIL, bit6 P_FAIL (W25Q style) */
+    int write_sr;           /* status bytes still expected (0 = not WRSR) */
+    uint32_t pgm_addr;      /* next die offset a PP data byte programs */
+    uint32_t pgm_left;      /* bytes left before the page boundary */
+    int wip_pending;        /* the die still owes one "busy" status read */
+    int wr_kind;            /* NOR_WR_*: what the latched command will write */
+    uint32_t data_bytes;    /* bytes shifted out of this command's reply */
+    uint32_t last_addr;     /* decoded address of the previous command */
+    /*
+     * Die state, not controller state: once 0xB7 (Enter 4-Byte Address Mode)
+     * has been accepted the flash keeps using four address bytes for the
+     * standard opcodes until 0xE9, even across chip-select edges.  Linux's
+     * spi-nor does exactly this on a >16 MiB die and then issues plain 0x03
+     * with a 32-bit address, so decoding that as three bytes silently shifts
+     * every read by one byte (0x00180000 became 0x00001800).
+     */
+    int addr4;
+
+    /* MISO queue: one entry per byte clocked out, popped by FIFO reads */
+    uint8_t *resp;
+    int resp_head;
+    int resp_len;
+    uint32_t resp_cap;
+    uint64_t clocked;
+
+    /*
+     * QUP transfer engine, as the Linux driver drives it: MX_*_CNT programs
+     * how many SPI words this transfer carries, the state machine runs it,
+     * and QUP_OPERATIONAL reports the FIFO/done flags the ISR polls.
+     */
+    uint32_t state;             /* QUP_STATE_RESET/RUN/PAUSE */
+    uint32_t op_mask;           /* QUP_OPERATIONAL_MASK */
+    uint32_t tx_bytes;          /* bytes written to the output FIFO */
+    uint32_t rx_bytes;          /* bytes read from the input FIFO */
+    uint32_t clocks;            /* bytes clocked out in this transfer */
+    uint32_t max_in_done;       /* sticky MAX_INPUT_DONE */
+    uint32_t max_out_done;      /* sticky MAX_OUTPUT_DONE */
+    qemu_irq irq;               /* SPI 95, level high */
+};
+/* QUP helpers used by the BAM and the flash/SPI code */
+void qup_clock(IPQQupl *q, uint8_t mosi);
+uint32_t qup_in_word(IPQQupl *q);
+bool die_dbg_on(void);
+void die_dbg_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+uint32_t die_dbg_pc(void);
+
 /* file-scope siblings: one machine per process, so a plain pointer is enough */
 extern IPQ4019State *ipq;
 extern IPQBoardState *ipq_board;

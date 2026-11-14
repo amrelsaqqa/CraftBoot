@@ -9,6 +9,7 @@ ipq4019_MACHINE_SRCS := \
     ipq4019.c:hw/arm/ipq4019.c \
     ipq4019.h:hw/arm/ipq4019/ipq4019.h \
     modules/gpio.c:hw/arm/ipq4019/gpio.c \
-    modules/uart.c:hw/arm/ipq4019/uart.c
+    modules/uart.c:hw/arm/ipq4019/uart.c \
+    modules/bam.c:hw/arm/ipq4019/bam.c
 ipq4019_BOARDS       := hap-ac2 hap-ac3
 ipq4019_DEV_BRANCH   := ipq4019-model
