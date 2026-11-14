@@ -12,10 +12,12 @@
 #   make TARGET=mipsel/mt7621,mips/mt7622
 #   make                              whatever .config selects
 #
-# Actions: check-patches, prep, build, export-patches, list, defconfig,
-# clean (build/), distclean (build/ + cache).  `make TARGET=… build` implies
-# prep.  The QEMU tree is never committed: it is downloaded into a shared
-# cache, patched in a throw-away tree, and built.
+# Actions: check-patches, prep, build, sync, export-patches, list, defconfig,
+# clean (build/), distclean (build/ + cache).  `build` implies prep when the
+# tree does not exist yet; once it does, `build` and `sync` are incremental
+# (machine sources are re-copied, ninja rebuilds what changed).  The QEMU tree
+# is never committed: it is downloaded into a shared cache, patched in a
+# throw-away tree, and built.
 
 SHELL := /bin/bash
 include config.mk
@@ -43,7 +45,7 @@ DEV_BRANCH ?= $($(T)_DEV_BRANCH)
 SERIES   = $(wildcard patches/generic/series) $(TDIR)/series \
            $(wildcard $(foreach m,$(MACHINES),$(TDIR)/machines/$(m)/series))
 
-.PHONY: all list defconfig fetch prep build check-patches export-patches \
+.PHONY: all list defconfig fetch prep build sync check-patches export-patches \
         clean distclean
 
 DIRECT := $(wildcard targets/$(TARGET)/config.mk)
@@ -53,7 +55,7 @@ DIRECT := $(wildcard targets/$(TARGET)/config.mk)
 # =========================================================================
 ifeq ($(DIRECT),)
 
-ACTIONS = prep build check-patches export-patches
+ACTIONS = prep build sync check-patches export-patches
 
 all: build
 
@@ -127,10 +129,14 @@ prep: fetch
 	@touch "$(SUBDIR)/.prepped"
 
 # ---- build: prep on demand, configure once, then ninja the binaries ------
+# Machine sources are re-copied on every build so editing <soc>.c is an
+# incremental rebuild: only that file recompiles.  `prep` is the only thing
+# that throws the tree away (needed when the pinned tag or a series changes).
 build:
 	@test -n "$(BINARIES)" || { echo "target $(TARGET) is not wired up (no BINARIES)"; exit 1; }
 	@test -f "$(SUBDIR)/.prepped" || \
 	    $(MAKE) --no-print-directory TARGET="$(TARGET)" MACHINES="$(MACHINES)" prep
+	@set -e; $(foreach m,$(MACHINES),cmp -s "$(TDIR)/machines/$(m)/$(m).c" "$(SRC)/$($(m)_MACHINE_DST)" || { echo "  sync machine $(m)"; cp "$(TDIR)/machines/$(m)/$(m).c" "$(SRC)/$($(m)_MACHINE_DST)"; };)
 	@if [ ! -f "$(OBJ)/build.ninja" ]; then \
 	    mkdir -p "$(OBJ)"; \
 	    echo "configure $(TARGET)"; \
@@ -141,6 +147,18 @@ build:
 	ninja -C "$(OBJ)" $(BINARIES)
 	@for b in $(BINARIES); do ln -sf "$(PWD)/$(OBJ)/$$b" "$(SUBDIR)/$$b"; done
 	@echo "built in $(SUBDIR): $(BINARIES)"
+
+# ---- sync: the fast path — machine sources in, ninja out -----------------
+# For iterating on <soc>.c: no prep, no configure, no fetch.  The machine
+# source is copied over the one in the tree and ninja rebuilds just that.
+sync:
+	@test -f "$(SUBDIR)/.prepped" || { \
+	    echo "no tree for $(TARGET): run make TARGET=$(TARGET) prep first"; \
+	    exit 1; }
+	@set -e; $(foreach m,$(MACHINES),cmp -s "$(TDIR)/machines/$(m)/$(m).c" "$(SRC)/$($(m)_MACHINE_DST)" || { echo "  sync machine $(m)"; cp "$(TDIR)/machines/$(m)/$(m).c" "$(SRC)/$($(m)_MACHINE_DST)"; };)
+	ninja -C "$(OBJ)" $(BINARIES)
+	@for b in $(BINARIES); do ln -sf "$(PWD)/$(OBJ)/$$b" "$(SUBDIR)/$$b"; done
+	@echo "synced $(SUBDIR): $(BINARIES)"
 
 # ---- export-patches: dev branch -> target patches + machine sources ------
 export-patches:

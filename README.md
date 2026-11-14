@@ -210,6 +210,19 @@ build/mipsel/build                  build/arm/build      # configure/ninja outpu
 `build/<target>/src` is a normal git repository, so you can read `git log`
 there to see exactly what was applied.
 
+Once the tree exists, `build` is incremental (it re-copies the machine source
+and runs ninja).  For a quick model iteration there is a shorter alias:
+
+```sh
+make TARGET=arm/ipq4019 sync    # machine source in → ninja → binary, no prep
+```
+
+`sync` never fetches, never extracts and never configures: it copies
+`machines/<soc>/<soc>.c` over the one in `build/<target>/src` and lets ninja
+recompile just that file, so editing a model costs seconds.  `prep` is the
+only step that throws the tree away, and it is only needed when the pinned tag
+or a patch series changes.
+
 ### 4. Run
 
 ```sh
@@ -270,6 +283,16 @@ guaranteed reset.
 Machine sources are **copied** into the build tree, not patched: they change
 wholesale and would bury the hook differences.  Everything else (the few
 hundred lines of core changes) is an ordered patch series.
+
+That copy is what makes model work fast — edit `<soc>.c`, then:
+
+```sh
+make TARGET=arm/ipq4019 sync     # copy the machine source, ninja the delta
+```
+
+Only the changed file recompiles and the binary is relinked; no prep, no
+configure, no fetch.  When the edit lands, commit it under
+`targets/<arch>/machines/<soc>/`.
 
 The series is generated from a normal git branch, so history and `git bisect`
 stay available:
