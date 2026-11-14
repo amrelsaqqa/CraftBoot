@@ -27,6 +27,38 @@ ipq4019: qpic-nand 132 MiB, id c2 f1 80 1d, 65536 pages of 2048+64, 1024 blocks 
 By default a NAND is RAM only (a board that has never been installed).  Add
 `qpic-nand-file=<die>` to make programming survive the machine exiting.
 
+## Source layout
+
+The machine is split by controller.  `ipq4019.c` is the machine itself
+(memory map, reset, boot stages, `-M` properties, state dump); each block owns
+its register file, its `MemoryRegionOps`, its state and one init entry point.
+The sources are *copied* into `hw/arm/` under their own names (they are not
+patched; the hook series only lists them in `meson.build`).
+
+| file | owns |
+|---|---|
+| `ipq4019_internal.h` | SoC/board state, base addresses, the interface between blocks |
+| `ipq4019.c` | machine init, memory map, reset, boot stages, properties, state dump |
+| `ipq4019_gpio.c` | TLMM pin controller, LED panel, keys |
+| `ipq4019_uart.c` | BLSP UARTDM console |
+
+Planned, in the order they are being moved: `ipq4019_flash.c` (flash window,
+QUP SPI, NOR die, die store, SPI NAND), `ipq4019_eth.c` (IPQESS, host net,
+MDIO/PHY, board ports), `ipq4019_bam.c`, `ipq4019_qpic.c` +
+`ipq4019_qpic_bam.c`, `ipq4019_board.c` (presets, config merge, env shim), then
+`ipq4019_stub.c` and `ipq4019_dump.c` for what is left.
+
+Rules that keep the split useful:
+
+- a block's state struct lives in `ipq4019_internal.h` and its code in the
+  block's file -- the state dump reads every block, so hiding the structs
+  would only move the coupling;
+- anything another file needs is a prototype in the header; nothing else
+  crosses a file boundary, and the header stays small;
+- adding a block is a `config.mk` entry (`ipq4019_MACHINE_SRCS`), a file in
+  the machine patch's `meson.build` hunk, and a line in the header -- nothing
+  else.
+
 ## Building
 
 The machine is built with the `arm` target, which produces
