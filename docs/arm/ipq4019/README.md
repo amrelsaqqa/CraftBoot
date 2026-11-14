@@ -43,12 +43,15 @@ lists the block files in `meson.build`.
 | `ipq4019.c` | machine init, memory map, reset, boot stages, properties, state dump |
 | `modules/gpio.c` | TLMM pin controller, LED panel, keys |
 | `modules/uart.c` | BLSP UARTDM console |
+| `modules/bam.c` | BLSP1 BAM (the QUP FIFOs' DMA engine) |
+| `modules/eth.c` | IPQESS, host netdev, MDIO/PHY, board ports |
 
-Planned, in the order they are being moved: `modules/flash.c` (flash window,
-QUP SPI, NOR die, die store, SPI NAND), `modules/eth.c` (IPQESS, host net,
-MDIO/PHY, board ports), `modules/bam.c`, `modules/qpic.c` +
-`modules/qpic_bam.c`, `modules/board.c` (presets, config merge, env shim), then
-`modules/stub.c` and `modules/dump.c` for what is left.
+Planned, in the order they are being moved: `modules/stub.c` (shadowed
+stubs, power-hold, watchdog, memory window, gcnt), `modules/flash.c` (QUP SPI,
+NOR die, die store, SPI NAND), `modules/qpic.c` + `modules/qpic_bam.c`,
+`modules/board.c` (presets, config merge, env shim), then `modules/dump.c` for
+what is left.  `modules/flash.c` is deliberately later: the QUP SPI opcode
+handler sits with the part-building code, so it is a multi-range move.
 
 Rules that keep the split useful:
 
